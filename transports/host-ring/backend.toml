@@ -1,0 +1,6 @@
+schema = 1
+kind = "transport"
+id = "host-ring-import"
+state = "planned"
+apis = ["vulkan", "d3d12"]
+multi_gpu = true

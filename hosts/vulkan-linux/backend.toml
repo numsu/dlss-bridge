@@ -1,0 +1,7 @@
+schema = 1
+kind = "host"
+id = "vulkan-linux"
+state = "planned"
+platforms = ["linux"]
+apis = ["vulkan"]
+requires = ["native-linux-neural-executor"]

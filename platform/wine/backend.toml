@@ -1,0 +1,5 @@
+schema = 1
+kind = "platform"
+id = "wine-proton"
+state = "integrated"
+launch_frontend = "launchers/steam-proton/run.sh"

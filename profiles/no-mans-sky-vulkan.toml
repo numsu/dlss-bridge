@@ -1,0 +1,22 @@
+schema = 1
+
+[match]
+executable = "NMS.exe"
+graphics_api = "vulkan"
+
+[capture]
+adapter = "ngx_vulkan"
+
+[feature]
+kind = "neural_rendering"
+
+[execution]
+mode = "secondary_gpu"
+compute_adapter = "index:1"
+require_neural_result = true
+
+[transport]
+output_format = "native"
+neural_queue = "split"
+ring_slots = 3
+latency_budget_ms = 16

@@ -1,0 +1,7 @@
+schema = 1
+kind = "executor"
+id = "ngx-d3d12"
+state = "integrated"
+platforms = ["windows", "proton"]
+features = ["super_resolution", "neural_rendering"]
+implementation = "bridge/dlss5-vk-bridge/src/d3d12_session.inc"

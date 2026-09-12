@@ -1,0 +1,5 @@
+schema = 1
+kind = "platform"
+id = "windows"
+state = "integrated"
+launch_frontend = "launchers/windows/run.ps1"

@@ -1,0 +1,7 @@
+schema = 1
+kind = "capture"
+id = "ngx-vulkan"
+state = "integrated"
+apis = ["vulkan"]
+features = ["super_resolution", "neural_rendering"]
+implementation = "bridge/dlss5-vk-bridge/src/vk_interop.inc"

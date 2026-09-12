@@ -1,0 +1,7 @@
+schema = 1
+kind = "host"
+id = "vulkan-windows"
+state = "integrated"
+platforms = ["windows", "proton"]
+apis = ["vulkan"]
+implementation = "bridge/dlss5-vk-bridge/src/vk_layer.inc"

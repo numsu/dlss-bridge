@@ -1,0 +1,7 @@
+schema = 1
+kind = "capture"
+id = "final-frame"
+state = "planned"
+apis = ["vulkan", "d3d11", "d3d12"]
+features = ["final_frame"]
+temporal_equivalent = false

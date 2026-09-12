@@ -1,0 +1,6 @@
+schema = 1
+kind = "transport"
+id = "same-adapter-external-image"
+state = "integrated"
+apis = ["vulkan-d3d12"]
+implementation = "bridge/dlss5-vk-bridge/src/d3d12_session.inc"

@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!runtime/
+!runtime/nvidia-compat32/
+!runtime/nvidia-compat32/**

@@ -1,0 +1,6 @@
+schema = 1
+kind = "capture"
+id = "d3d11"
+state = "planned"
+apis = ["d3d11"]
+features = ["super_resolution", "neural_rendering"]

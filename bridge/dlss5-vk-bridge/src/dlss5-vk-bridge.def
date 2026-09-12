@@ -1,0 +1,10 @@
+; Exported entry points for the Vulkan loader.
+; The loader finds an implicit layer through vkNegotiateLoaderLayerInterfaceVersion
+; (interface v2), which hands back the two GetProcAddr entry points named in the
+; layer manifest (dlss5-vk-bridge.json). Everything else is reached through the
+; dispatch chain and must NOT be exported.
+LIBRARY dlss5-vk-bridge
+EXPORTS
+    vkNegotiateLoaderLayerInterfaceVersion
+    dlss5vk_GetInstanceProcAddr
+    dlss5vk_GetDeviceProcAddr

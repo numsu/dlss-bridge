@@ -1,0 +1,21 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_dlss5_vk_bridge",
+        "type": "GLOBAL",
+        "library_path": ".\\dlss5-vk-bridge.dll",
+        "api_version": "1.3.280",
+        "implementation_version": "1",
+        "description": "Lets a D3D12-only DLSS 5 Neural Rendering add-on run in a Vulkan game.",
+        "functions": {
+            "vkGetInstanceProcAddr": "dlss5vk_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "dlss5vk_GetDeviceProcAddr"
+        },
+        "enable_environment": {
+            "ENABLE_DLSS5_VK_BRIDGE": "1"
+        },
+        "disable_environment": {
+            "DISABLE_DLSS5_VK_BRIDGE": "1"
+        }
+    }
+}

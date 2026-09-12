@@ -1,0 +1,19 @@
+schema = 1
+
+[feature]
+kind = "neural_rendering"
+
+[execution]
+mode = "auto"
+compute_adapter = "auto"
+require_neural_result = true
+
+[transport]
+output_format = "native"
+neural_queue = "split"
+ring_slots = 3
+latency_budget_ms = 16
+
+[telemetry]
+level = "summary"
+gpu_timestamps = true

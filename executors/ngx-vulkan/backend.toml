@@ -1,0 +1,6 @@
+schema = 1
+kind = "executor"
+id = "ngx-vulkan"
+state = "planned"
+platforms = ["linux", "windows", "proton"]
+features = ["super_resolution", "neural_rendering"]
