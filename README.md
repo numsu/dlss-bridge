@@ -44,6 +44,12 @@ Portable policy is TOML. Resolve it to the flat in-process format with:
 Important settings:
 
 ```toml
+[feature]
+placement = "before_sr"      # after_sr | before_sr | deferred_dlss
+working_scale = 1.0          # model raster scale; display resolution is unchanged
+passes = 1                   # 1..3 sequential neural passes
+runtime_variant = "presr-v0.7.7" # explicitly staged and hash checked
+
 [execution]
 mode = "auto"                 # auto | same_gpu | secondary_gpu
 compute_adapter = "auto"      # auto | game | index:N | luid:HIGH:LOW
@@ -91,4 +97,4 @@ gcc -std=c11 -Wall -Wextra -Werror -Iinclude tests/unit/abi_c_test.c -o /tmp/dls
 - `scripts/neural-mgpu.sh`: synthetic two-GPU D3D12 route.
 - `scripts/build-vk-bridge.sh`: all bridge host builds.
 
-The current cross-adapter transport is functional but still uses a GPU 0 D3D12 helper on the return path. GPU timestamp instrumentation and direct Vulkan import of the directional host ring remain the next performance backend milestone.
+The current cross-adapter transport imports directional host allocations directly into Vulkan on the game GPU and D3D12 on the neural GPU. GPU timestamp instrumentation and per-slot allocation remain the next performance backend milestones.

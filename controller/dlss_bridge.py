@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -51,10 +52,23 @@ def bool_int(value: Any) -> int:
 
 
 def resolved_runtime(data: dict[str, Any]) -> dict[str, str | int]:
+    feature = data.get("feature", {})
     execution = data.get("execution", {})
     transport = data.get("transport", {})
     timing = data.get("timing", {})
     bridge = data.get("bridge", {})
+    placement = str(feature.get("placement", "after_sr"))
+    if placement not in ("after_sr", "before_sr", "deferred_dlss"):
+        raise SystemExit(f"invalid feature.placement: {placement}")
+    working_scale = float(feature.get("working_scale", 1.0))
+    if not math.isfinite(working_scale) or not 0.25 <= working_scale <= 2.0:
+        raise SystemExit("feature.working_scale must be between 0.25 and 2.0")
+    passes = int(feature.get("passes", 1))
+    if not 1 <= passes <= 3:
+        raise SystemExit("feature.passes must be between 1 and 3")
+    runtime_variant = str(feature.get("runtime_variant", "stable"))
+    if not runtime_variant or any(not (c.isalnum() or c in "_.-") for c in runtime_variant):
+        raise SystemExit(f"invalid feature.runtime_variant: {runtime_variant}")
     mode = execution.get("mode", "auto")
     if mode not in ("auto", "same_gpu", "secondary_gpu"):
         raise SystemExit(f"invalid execution.mode: {mode}")
@@ -89,6 +103,10 @@ def resolved_runtime(data: dict[str, Any]) -> dict[str, str | int]:
         "latency_budget_ms": budget,
         "output_transport": output_transport,
         "neural_queue_mode": neural_queue_mode,
+        "neural_placement": placement,
+        "neural_working_scale": format(working_scale, ".6g"),
+        "neural_passes": passes,
+        "neural_runtime_variant": runtime_variant,
     }
 
 

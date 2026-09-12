@@ -140,7 +140,9 @@ static void LoadConfig()
                   "mode = 0\nflags = -1\nsubrects = 1\nverbose = 0\nsync = 1\n"
                   "execution_mode = auto\ncompute_adapter = auto\n"
                   "require_neural_result = 1\nring_slots = 3\nlatency_budget_ms = 16\n"
-                  "output_transport = native\nneural_queue_mode = split\n", f);
+                  "output_transport = native\nneural_queue_mode = split\n"
+                  "neural_placement = after_sr\nneural_working_scale = 1.0\n"
+                  "neural_passes = 1\nneural_runtime_variant = stable\n", f);
             fclose(f);
         }
         return;
@@ -161,12 +163,15 @@ static void LoadConfig()
     fclose(f);
     Log("[cfg] mode=%d flags=%d subrects=%d verbose=%d sync=%d execution_mode=%s "
         "compute_adapter=%s require_neural_result=%d ring_slots=%d latency_budget_ms=%d "
-        "output_transport=%s neural_queue_mode=%s",
+        "output_transport=%s neural_queue_mode=%s neural_placement=%s "
+        "neural_working_scale=%.3f neural_passes=%d neural_runtime_variant=%s",
         g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.verbose, g_cfg.sync,
         dlss_bridge::ExecutionModeName(g_cfg.execution_mode), g_cfg.compute_adapter.text,
         g_cfg.require_neural_result, g_cfg.ring_slots, g_cfg.latency_budget_ms,
         dlss_bridge::OutputTransportName(g_cfg.output_transport),
-        dlss_bridge::NeuralQueueModeName(g_cfg.neural_queue_mode));
+        dlss_bridge::NeuralQueueModeName(g_cfg.neural_queue_mode),
+        dlss_bridge::NeuralPlacementName(g_cfg.neural_placement),
+        g_cfg.neural_working_scale, g_cfg.neural_passes, g_cfg.neural_runtime_variant);
     if (g_cfg.ring_slots != Bridge::kFrames)
         Warn("[cfg] ring_slots=%d requested; working Vulkan backend currently provides %d",
              g_cfg.ring_slots, Bridge::kFrames);

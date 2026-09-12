@@ -5,10 +5,12 @@ import hashlib
 import pathlib
 import sys
 
-SOURCE_SHA256 = "8f526752d82c9cba99bf747a216a8caccd59a585d9ed0e217a8d47ab3c7c4998"
-PATCHES = {
-    0x2C063A: bytes.fromhex("e82170fcff"),
-    0x2C09BF: bytes.fromhex("e89c6cfcff"),
+VARIANTS = {
+    # wilsjo2 v0.7.7: pre- and post-SR Vulkan calls to EvaluateAtSeamVk.
+    "5d05d560bd27eee4aba24f8fab5d118f916550d8b65a98b60d4a855275223b3c": {
+        0x2E61C5: bytes.fromhex("e8e6b2fbff"),
+        0x2E63AA: bytes.fromhex("e801b1fbff"),
+    },
 }
 
 def main() -> int:
@@ -17,9 +19,10 @@ def main() -> int:
     source, dest = map(pathlib.Path, sys.argv[1:])
     data = bytearray(source.read_bytes())
     digest = hashlib.sha256(data).hexdigest()
-    if digest != SOURCE_SHA256:
+    patches = VARIANTS.get(digest)
+    if patches is None:
         raise SystemExit(f"refusing unfamiliar OptiScaler.dll: sha256={digest}")
-    for offset, expected in PATCHES.items():
+    for offset, expected in patches.items():
         actual = bytes(data[offset:offset + len(expected)])
         if actual != expected:
             raise SystemExit(f"refusing offset {offset:#x}: expected {expected.hex()}, got {actual.hex()}")

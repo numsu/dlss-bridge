@@ -447,9 +447,9 @@ A backend is production-eligible only after the synthetic suite completes withou
 
 ## 13. Implementation sequence
 
-Completed phases retain runnable reference artifacts; unfinished backends remain explicitly unavailable.
+The accepted pre-SR path is the runnable reference; superseded runtime builds are removed once the replacement passes an in-game trial. Unfinished backends remain explicitly unavailable.
 
-1. **Freeze the reference behavior.** Preserve the current No Man's Sky build, configuration, known-good DLL, logs, and hashes. Add structured timestamps without changing synchronization.
+1. **Freeze the reference behavior.** Preserve the accepted No Man's Sky pre-SR build, configuration, known-good DLL, and hashes. Add structured timestamps without changing synchronization.
 2. **Extract portable data and policy.** Introduce adapter identity, frame contract, capability report, configuration schema, telemetry records, and a tested scheduler state machine beside the monolith.
 3. **Unify hosts.** Make Vulkan layer, ReShade add-on, and proxy hosts implement `HostServicesV1`; remove their duplicated device/submit/module bookkeeping only after parity tests.
 4. **Wrap current graphics code as backends.** Treat the existing Vulkan capture, D3D12 NGX session, same-adapter shared images, and current multi-GPU staging as interface implementations with unchanged behavior.

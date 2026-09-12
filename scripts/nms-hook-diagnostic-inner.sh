@@ -36,40 +36,91 @@ rm -f "$RUN/Binaries/winhttp.dll" "$RUN/Binaries/XINPUT9_1_0.dll"
 install -m 0644 /work/runtime/nms-test/winmm.dll "$RUN/Binaries/winmm.dll"
 install -m 0644 /work/runtime/nms-test/vulkan-1.dll "$RUN/Binaries/vulkan-1.dll"
 install -m 0644 /work/runtime/GE-Proton11-6-x86_64/files/lib/wine/x86_64-windows/vulkan-1.dll "$RUN/Binaries/vulkan-1-real.dll"
-install -m 0644 /work/runtime/nms-test/dlss5-vk-bridge.cfg "$RUN/Binaries/dlss5-vk-bridge.cfg"
-bridge_latency_budget_ms="${NMS_BRIDGE_LATENCY_BUDGET_MS:-16}"
-case "$bridge_latency_budget_ms" in
-    ''|*[!0-9]*) echo "Invalid NMS_BRIDGE_LATENCY_BUDGET_MS=$bridge_latency_budget_ms"; exit 2 ;;
-esac
+bridge_config_source=${NMS_BRIDGE_CONFIG_SOURCE:-/work/runtime/resolved/nms-sunshine.cfg}
+test -s "$bridge_config_source" || { echo "Missing resolved config: $bridge_config_source"; exit 2; }
+install -m 0644 "$bridge_config_source" "$RUN/Binaries/dlss5-vk-bridge.cfg"
+
+cfg_value() {
+    awk -F= -v wanted="$1" '$1 == wanted { sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit }' "$bridge_config_source"
+}
+profile_placement=$(cfg_value neural_placement)
+profile_working_scale=$(cfg_value neural_working_scale)
+profile_passes=$(cfg_value neural_passes)
+profile_runtime_variant=$(cfg_value neural_runtime_variant)
+profile_latency_budget_ms=$(cfg_value latency_budget_ms)
+neural_placement=${NMS_NEURAL_PLACEMENT:-$profile_placement}
+dlssnr_working_scale=${NMS_DLSSNR_WORKING_SCALE:-$profile_working_scale}
+neural_passes=${NMS_NEURAL_PASSES:-$profile_passes}
+neural_runtime_variant=${NMS_NEURAL_RUNTIME_VARIANT:-$profile_runtime_variant}
+bridge_latency_budget_ms=${NMS_BRIDGE_LATENCY_BUDGET_MS:-$profile_latency_budget_ms}
+
+case "$neural_placement" in after_sr|before_sr|deferred_dlss) ;; *) echo "Invalid neural placement: $neural_placement"; exit 2;; esac
+case "$neural_passes" in 1|2|3) ;; *) echo "Neural passes must be 1, 2, or 3"; exit 2;; esac
+case "$bridge_latency_budget_ms" in ''|*[!0-9]*) echo "Invalid latency budget: $bridge_latency_budget_ms"; exit 2;; esac
 if [ "$bridge_latency_budget_ms" -lt 8 ] || [ "$bridge_latency_budget_ms" -gt 125 ]; then
-    echo "NMS_BRIDGE_LATENCY_BUDGET_MS must be between 8 and 125"
-    exit 2
+    echo "Latency budget must be between 8 and 125 ms"; exit 2
 fi
-sed -i "s/^latency_budget_ms=.*/latency_budget_ms=$bridge_latency_budget_ms/" "$RUN/Binaries/dlss5-vk-bridge.cfg"
-echo "bridge_latency_budget_ms=$bridge_latency_budget_ms"
-python3 /work/scripts/patch-optiscaler-vulkan-nr.py \
-    /work/runtime/optiscaler-full/OptiScaler.dll "$RUN/Binaries/OptiScaler.dll"
+python3 - "$dlssnr_working_scale" <<'PY_SCALE'
+import math, sys
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit("Neural working scale must be numeric")
+if not math.isfinite(value) or not 0.25 <= value <= 2.0:
+    raise SystemExit("Neural working scale must be between 0.25 and 2.0")
+PY_SCALE
+
+case "$neural_runtime_variant" in
+    presr-v0.7.7)
+        optiscaler_root=/work/runtime/optiscaler-presr-v0.7.7
+        expected_optiscaler_sha=5d05d560bd27eee4aba24f8fab5d118f916550d8b65a98b60d4a855275223b3c
+        expected_forwarder_sha=de80593c5404c0909526b6f3d4c966ccfdf26cac8286fbe088ea9883eafcb21d
+        test "$(sha256sum "$optiscaler_root/OptiScaler.dll" | awk '{print $1}')" = "$expected_optiscaler_sha" || { echo "Pre-SR OptiScaler hash mismatch"; exit 2; }
+        test "$(sha256sum "$optiscaler_root/nvngx.dll_dlssnr.dll" | awk '{print $1}')" = "$expected_forwarder_sha" || { echo "Pre-SR forwarder hash mismatch"; exit 2; }
+        ;;
+    *) echo "Unsupported neural runtime: $neural_runtime_variant"; exit 2 ;;
+esac
+for required in OptiScaler.dll OptiScaler.ini nvngx.dll_dlssnr.dll; do
+    test -s "$optiscaler_root/$required" || { echo "Missing runtime component: $required"; exit 2; }
+done
+test -d "$optiscaler_root/OptiScaler" || { echo "Missing OptiScaler backend directory"; exit 2; }
+
+for pair in     "latency_budget_ms=$bridge_latency_budget_ms"     "neural_placement=$neural_placement"     "neural_working_scale=$dlssnr_working_scale"     "neural_passes=$neural_passes"     "neural_runtime_variant=$neural_runtime_variant"; do
+    key=${pair%%=*}
+    sed -i "s/^$key=.*/$pair/" "$RUN/Binaries/dlss5-vk-bridge.cfg"
+done
+
+python3 /work/scripts/patch-optiscaler-vulkan-nr.py "$optiscaler_root/OptiScaler.dll" "$RUN/Binaries/OptiScaler.dll"
 chmod 0644 "$RUN/Binaries/OptiScaler.dll"
-install -m 0644 /work/runtime/optiscaler-full/OptiScaler.ini "$RUN/Binaries/OptiScaler.ini"
-cp -a /work/runtime/optiscaler-full/OptiScaler "$RUN/Binaries/"
-install -m 0644 /work/runtime/optiscaler-full/nvngx.dll_dlssnr.dll "$RUN/Binaries/nvngx.dll_dlssnr.dll"
+install -m 0644 "$optiscaler_root/OptiScaler.ini" "$RUN/Binaries/OptiScaler.ini"
+rm -rf "$RUN/Binaries/OptiScaler"
+cp -a "$optiscaler_root/OptiScaler" "$RUN/Binaries/"
+install -m 0644 "$optiscaler_root/nvngx.dll_dlssnr.dll" "$RUN/Binaries/nvngx.dll_dlssnr.dll"
 install -m 0644 /work/runtime/neural/nvngx_dlssnr.dll "$RUN/Binaries/nvngx_dlssnr.dll"
-# OptiScaler drives the neural snippet through NVIDIA's driver NGX core. Keep
-# both core filenames beside the isolated executable so Wine does not depend on
-# a system32 layout that varies between Proton prefixes.
 install -m 0644 /work/runtime/neural/_nvngx.dll "$RUN/Binaries/_nvngx.dll"
 install -m 0644 /work/runtime/neural/nvngx.dll "$RUN/Binaries/nvngx.dll"
+
 sed -i 's/^VulkanUpscaler=.*/VulkanUpscaler=dlss/' "$RUN/Binaries/OptiScaler.ini"
-sed -i '/^\[Log\]/,/^\[/ s/^LogToFile=.*/LogToFile=false/' "$RUN/Binaries/OptiScaler.ini"
-sed -i '/^\[fakenvapi\]/,/^\[/ s/^ForceReflex=.*/ForceReflex=1/' "$RUN/Binaries/OptiScaler.ini"
-sed -i '/^\[DlssNr\]/,/^\[/ s/^Enabled=.*/Enabled=true/' "$RUN/Binaries/OptiScaler.ini"
-dlssnr_working_scale="${NMS_DLSSNR_WORKING_SCALE:-1.0}"
-case "$dlssnr_working_scale" in
-    0.25|0.50|0.5|0.75|1.0) ;;
-    *) echo "Unsupported NMS_DLSSNR_WORKING_SCALE=$dlssnr_working_scale"; exit 2 ;;
+sed -i '/^\[Log\]/,/^\[/ s/^LogToFile=.*/LogToFile=false/; /^\[Log\]/,/^\[/ s/^LogLevel=.*/LogLevel=2/' "$RUN/Binaries/OptiScaler.ini"
+sed -i '/^\[fakenvapi\]/,/^\[/ s/^ForceReflex=.*/ForceReflex=0/' "$RUN/Binaries/OptiScaler.ini"
+sed -i '/^\[DlssNr\]/,/^\[/ s/^Enabled=.*/Enabled=true/; /^\[DlssNr\]/,/^\[/ s/^Passes=.*/Passes='"$neural_passes"'/; /^\[DlssNr\]/,/^\[/ s/^WorkingScale=.*/WorkingScale='"$dlssnr_working_scale"'/; /^\[DlssNr\]/,/^\[/ s/^FinishedPicture=.*/FinishedPicture=false/; /^\[DlssNr\]/,/^\[/ s/^ResidualAcrossRR=.*/ResidualAcrossRR=false/; /^\[DlssNr\]/,/^\[/ s/^ResidualFG=.*/ResidualFG=false/; /^\[DlssNr\]/,/^\[/ s/^AutoCapture=.*/AutoCapture=false/' "$RUN/Binaries/OptiScaler.ini"
+case "$neural_placement" in
+    before_sr) run_before_sr=true; deferred_dlss=false ;;
+    deferred_dlss) run_before_sr=false; deferred_dlss=true ;;
+    *) run_before_sr=false; deferred_dlss=false ;;
 esac
-sed -i "/^\[DlssNr\]/,/^\[/ s/^WorkingScale=.*/WorkingScale=$dlssnr_working_scale/" "$RUN/Binaries/OptiScaler.ini"
-echo "dlssnr_working_scale=$dlssnr_working_scale"
+sed -i '/^\[DlssNr\]/,/^\[/ s/^RunBeforeSR=.*/RunBeforeSR='"$run_before_sr"'/; /^\[DlssNr\]/,/^\[/ s/^DeferredDLSS=.*/DeferredDLSS='"$deferred_dlss"'/' "$RUN/Binaries/OptiScaler.ini"
+
+echo "bridge_config_source=$bridge_config_source"
+echo "bridge_latency_budget_ms=$bridge_latency_budget_ms"
+echo "neural_placement=$neural_placement"
+echo "neural_working_scale=$dlssnr_working_scale"
+echo "neural_passes=$neural_passes"
+echo "neural_runtime_variant=$neural_runtime_variant"
+echo "optiscaler_source_sha256=$(sha256sum "$optiscaler_root/OptiScaler.dll" | awk '{print $1}')"
+echo "optiscaler_staged_sha256=$(sha256sum "$RUN/Binaries/OptiScaler.dll" | awk '{print $1}')"
+echo "neural_model_sha256=$(sha256sum "$RUN/Binaries/nvngx_dlssnr.dll" | awk '{print $1}')"
+rm -f "$RUN/Binaries/OptiScaler.log"
 echo 275850 > "$RUN/Binaries/steam_appid.txt"
 chown -R gamer:gamer "$RUN/Binaries"
 : > "$BRIDGE_LOG"

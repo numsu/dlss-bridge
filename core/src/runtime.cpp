@@ -1,6 +1,7 @@
 #include "dlss_bridge/runtime.hpp"
 
 #include <ctype.h>
+#include <cmath>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,9 +55,11 @@ RuntimeConfig::RuntimeConfig()
       neural_adapter(-1), require_neural_result(1), ring_slots(3),
       latency_budget_ms(16), execution_mode(ExecutionMode::Auto),
       output_transport(OutputTransport::Native), neural_queue_mode(NeuralQueueMode::Split),
-      compute_adapter{}
+      neural_placement(NeuralPlacement::AfterSr), neural_working_scale(1.0f), neural_passes(1),
+      neural_runtime_variant{}, compute_adapter{}
 {
     ParseAdapterSelector("auto", &compute_adapter);
+    CopyText(neural_runtime_variant, sizeof(neural_runtime_variant), "stable");
 }
 
 bool RuntimeConfig::Apply(const char *key, const char *value)
@@ -96,6 +99,28 @@ bool RuntimeConfig::Apply(const char *key, const char *value)
         else if (EqualNoCase(value, "unified")) neural_queue_mode = NeuralQueueMode::Unified;
         else return false;
     }
+    else if (EqualNoCase(key, "neural_placement")) {
+        if (EqualNoCase(value, "after_sr")) neural_placement = NeuralPlacement::AfterSr;
+        else if (EqualNoCase(value, "before_sr")) neural_placement = NeuralPlacement::BeforeSr;
+        else if (EqualNoCase(value, "deferred_dlss")) neural_placement = NeuralPlacement::DeferredDlss;
+        else return false;
+    }
+    else if (EqualNoCase(key, "neural_working_scale")) {
+        char *end = nullptr;
+        const float scale = strtof(value, &end);
+        if (end == value || *end != 0 || !std::isfinite(scale) || scale < 0.25f || scale > 2.0f) return false;
+        neural_working_scale = scale;
+    }
+    else if (EqualNoCase(key, "neural_passes")) {
+        if (n < 1 || n > 3) return false;
+        neural_passes = n;
+    }
+    else if (EqualNoCase(key, "neural_runtime_variant")) {
+        if (!*value || strlen(value) >= sizeof(neural_runtime_variant)) return false;
+        for (const char *p = value; *p; ++p)
+            if (!(isalnum((unsigned char)*p) || *p == '_' || *p == '-' || *p == '.')) return false;
+        CopyText(neural_runtime_variant, sizeof(neural_runtime_variant), value);
+    }
     else if (EqualNoCase(key, "compute_adapter")) return ParseAdapterSelector(value, &compute_adapter);
     else return false;
     return true;
@@ -118,6 +143,15 @@ const char *OutputTransportName(OutputTransport format)
 const char *NeuralQueueModeName(NeuralQueueMode mode)
 {
     return mode == NeuralQueueMode::Unified ? "unified" : "split";
+}
+
+const char *NeuralPlacementName(NeuralPlacement placement)
+{
+    switch (placement) {
+    case NeuralPlacement::BeforeSr: return "before_sr";
+    case NeuralPlacement::DeferredDlss: return "deferred_dlss";
+    default: return "after_sr";
+    }
 }
 
 bool IsStrictNeural(const RuntimeConfig &cfg)

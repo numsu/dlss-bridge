@@ -9,6 +9,10 @@ adapter = "ngx_vulkan"
 
 [feature]
 kind = "neural_rendering"
+placement = "before_sr"
+working_scale = 1.0
+passes = 1
+runtime_variant = "presr-v0.7.7"
 
 [execution]
 mode = "secondary_gpu"
@@ -20,3 +24,7 @@ output_format = "native"
 neural_queue = "split"
 ring_slots = 3
 latency_budget_ms = 16
+
+[bridge]
+verbose = true
+subrects = true

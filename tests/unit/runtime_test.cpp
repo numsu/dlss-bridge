@@ -23,6 +23,19 @@ int main()
     assert(cfg.Apply("neural_queue_mode", "unified"));
     assert(cfg.neural_queue_mode == NeuralQueueMode::Unified);
     assert(!cfg.Apply("neural_queue_mode", "unknown"));
+    assert(cfg.neural_placement == NeuralPlacement::AfterSr);
+    assert(cfg.Apply("neural_placement", "before_sr"));
+    assert(cfg.neural_placement == NeuralPlacement::BeforeSr);
+    assert(cfg.Apply("neural_working_scale", "0.75"));
+    assert(cfg.neural_working_scale == 0.75f);
+    assert(!cfg.Apply("neural_working_scale", "0.1"));
+    assert(!cfg.Apply("neural_working_scale", "nan"));
+    assert(!cfg.Apply("neural_working_scale", "inf"));
+    assert(cfg.Apply("neural_passes", "1"));
+    assert(!cfg.Apply("neural_passes", "4"));
+    assert(cfg.Apply("neural_runtime_variant", "presr-v0.7.7"));
+    assert(!strcmp(cfg.neural_runtime_variant, "presr-v0.7.7"));
+    assert(!cfg.Apply("neural_runtime_variant", "../unsafe"));
 
     FrameSlot slots[3];
     Scheduler scheduler(slots, 3);

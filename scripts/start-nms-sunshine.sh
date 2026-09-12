@@ -13,10 +13,15 @@ shader_cache="$library_root/steamapps/shadercache/275850"
 
 test -d "$nms_root/Binaries"
 test -d "$shader_cache"
-mkdir -p runtime/steam-profile/htmlcache runtime/nms-run/Binaries runtime/sunshine-interactive reports
+mkdir -p runtime/steam-profile/htmlcache runtime/nms-run/Binaries runtime/sunshine-interactive runtime/resolved reports
 chmod 0775 runtime/steam-profile runtime/steam-profile/htmlcache runtime/nms-run runtime/nms-run/Binaries
 
 test -s runtime/sunshine-interactive/sunshine_state.json
+
+python3 controller/dlss_bridge.py resolve \
+    --config profiles/default.toml \
+    --profile profiles/no-mans-sky-vulkan.toml \
+    --output runtime/resolved/nms-sunshine.cfg >/dev/null
 
 host_ip=$(hostname -I | awk '{print $1}')
 python3 - "$project_dir/runtime/sunshine-interactive/sunshine.conf" "$host_ip" <<'PY'
@@ -64,8 +69,12 @@ docker run -d --name "$container_name" \
     -e NVIDIA_DRIVER_CAPABILITIES=all \
     -e NMS_INTERACTIVE=1 \
     -e NMS_INTERACTIVE_SECONDS="${NMS_INTERACTIVE_SECONDS:-1800}" \
-    -e NMS_DLSSNR_WORKING_SCALE="${NMS_DLSSNR_WORKING_SCALE:-1.0}" \
-    -e NMS_BRIDGE_LATENCY_BUDGET_MS="${NMS_BRIDGE_LATENCY_BUDGET_MS:-16}" \
+    -e NMS_BRIDGE_CONFIG_SOURCE=/work/runtime/resolved/nms-sunshine.cfg \
+    -e NMS_DLSSNR_WORKING_SCALE="${NMS_DLSSNR_WORKING_SCALE:-}" \
+    -e NMS_BRIDGE_LATENCY_BUDGET_MS="${NMS_BRIDGE_LATENCY_BUDGET_MS:-}" \
+    -e NMS_NEURAL_PLACEMENT="${NMS_NEURAL_PLACEMENT:-}" \
+    -e NMS_NEURAL_PASSES="${NMS_NEURAL_PASSES:-}" \
+    -e NMS_NEURAL_RUNTIME_VARIANT="${NMS_NEURAL_RUNTIME_VARIANT:-}" \
     -e SUNSHINE_CORS_ORIGIN="https://127.0.0.1:47990" \
     -v "$project_dir:/work" \
     -v "$steam_root:/home/gamer/.steam" \
