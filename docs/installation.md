@@ -93,6 +93,31 @@ NVIDIA runtime. Use of the runtime is governed by the
 The DLL is downloaded during setup and is not included in DLSS Bridge release
 artifacts.
 
+## Configure Steam from the command line
+
+Exit Steam completely before changing launch options. Configure a game by its
+Steam AppID:
+
+```bash
+dlss-bridge steam configure APPID --profile same-gpu
+```
+
+Omit `--profile` to use the default automatic GPU policy. The command locates
+the current Steam user, creates a one-time backup of `localconfig.vdf`, and
+remembers the previous launch option. If more than one Steam account is present,
+select one with `--user STEAMID`. Unusual installations can be selected with
+`--steam-root PATH`.
+
+To restore exactly the launch option that existed before configuration, exit
+Steam and run:
+
+```bash
+dlss-bridge steam remove APPID
+```
+
+Removal refuses to overwrite the setting if another program or the user changed
+it after DLSS Bridge configured it.
+
 ## Enable a Steam game
 
 Open the game's **Properties**, find **Launch Options**, and enter:

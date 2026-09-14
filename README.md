@@ -45,6 +45,15 @@ The launcher attaches DLSS Bridge from an isolated user-state session and
 removes that session when the game exits. The game directory and Wine prefix
 remain untouched. Omit the prefix to launch normally.
 
+You can configure the same option without opening Steam's Properties dialog.
+Exit Steam first, then run:
+
+```bash
+dlss-bridge steam configure APPID --profile same-gpu
+```
+
+Restore the previous setting with `dlss-bridge steam remove APPID`.
+
 Both installers download and checksum-verify the pinned NVIDIA neural runtime;
 installation fails if it is unavailable or invalid. The runtime is not bundled
 in this project’s release artifacts. Rerun the Linux installer or run a newer

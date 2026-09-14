@@ -35,7 +35,7 @@ rm -f "$output/payload/optiscaler/setup_linux.sh" \
       "$output/payload/optiscaler/SHA256SUMS.txt"
 install -m0644 "$root/runtime/build-vk-bridge/dlss-bridge-launcher.exe" "$output/payload/bridge/"
 install -m0644 "$root/runtime/build-vk-bridge/dlss5-vk-hook.dll" "$output/payload/bridge/"
-install -m0644 "$root/controller/dlss_bridge.py" "$root/controller/runtime_setup.py" "$root/controller/session.py" "$output/controller/"
+install -m0644 "$root/controller/dlss_bridge.py" "$root/controller/runtime_setup.py" "$root/controller/session.py" "$root/controller/steam_config.py" "$output/controller/"
 install -m0644 "$root/runtime-sources.json" "$output/runtime-sources.json"
 cp -a "$root/profiles/." "$output/profiles/"
 for group in hosts capture executors transports platform; do

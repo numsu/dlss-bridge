@@ -20,8 +20,10 @@ from typing import Any
 _controller_dir = str(Path(__file__).resolve().parent)
 if _controller_dir not in sys.path:
     sys.path.insert(0, _controller_dir)
-from runtime_setup import acquire_model, import_model, model_path, validate_model
+from runtime_setup import acquire_model, import_model, model_path, state_root, validate_model
 from session import close_session, prepare_session
+from steam_config import (bridge_command, configure as configure_steam,
+                          remove as remove_steam, select_localconfig, steam_running)
 
 ROOT = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
         else Path(__file__).resolve().parent.parent)
@@ -307,6 +309,44 @@ def cmd_acquire_runtime(args: argparse.Namespace) -> int:
     return 0
 
 
+def steam_appid(value: str) -> str:
+    if not value.isdecimal() or int(value) <= 0:
+        raise argparse.ArgumentTypeError("AppID must be a positive integer")
+    return str(int(value))
+
+
+def steam_config_path(args: argparse.Namespace) -> Path:
+    root = Path(args.steam_root) if args.steam_root else None
+    return select_localconfig(root, args.user)
+
+
+def require_steam_stopped() -> None:
+    if steam_running():
+        raise SystemExit("Steam is running. Exit Steam completely, then run this command again.")
+
+
+def cmd_steam_configure(args: argparse.Namespace) -> int:
+    require_steam_stopped()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.profile):
+        raise SystemExit("Steam configuration requires a bundled profile name")
+    if args.profile != "default":
+        profile_path(args.profile)
+    config = steam_config_path(args)
+    option = bridge_command(ROOT, args.profile)
+    result = configure_steam(config, args.appid, option, state_root())
+    verb = "Already configured" if result == "unchanged" else "Configured"
+    print(f"{verb} Steam AppID {args.appid}: {option}")
+    return 0
+
+
+def cmd_steam_remove(args: argparse.Namespace) -> int:
+    require_steam_stopped()
+    config = steam_config_path(args)
+    remove_steam(config, args.appid, state_root())
+    print(f"Restored the previous launch options for Steam AppID {args.appid}.")
+    return 0
+
+
 def cmd_launch(args: argparse.Namespace) -> int:
     if not args.command:
         raise SystemExit("launch requires a command after --")
@@ -351,6 +391,24 @@ def parser() -> argparse.ArgumentParser:
                          help="replace an existing user-supplied runtime")
     acquire.add_argument("--json", action="store_true", help="print a machine-readable result")
     acquire.set_defaults(func=cmd_acquire_runtime)
+
+    steam = commands.add_parser("steam", help="manage Steam launch options")
+    steam_commands = steam.add_subparsers(dest="steam_command", required=True)
+    steam_configure = steam_commands.add_parser(
+        "configure", help="attach DLSS Bridge to a Steam game"
+    )
+    steam_configure.add_argument("appid", type=steam_appid)
+    steam_configure.add_argument("--profile", default="default")
+    steam_configure.add_argument("--steam-root")
+    steam_configure.add_argument("--user")
+    steam_configure.set_defaults(func=cmd_steam_configure)
+    steam_remove = steam_commands.add_parser(
+        "remove", help="restore a game's previous Steam launch options"
+    )
+    steam_remove.add_argument("appid", type=steam_appid)
+    steam_remove.add_argument("--steam-root")
+    steam_remove.add_argument("--user")
+    steam_remove.set_defaults(func=cmd_steam_remove)
 
     launch = commands.add_parser("launch", aliases=["run"])
     launch.add_argument("--config", default=str(ROOT / "profiles" / "default.toml"))
