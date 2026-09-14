@@ -12,7 +12,7 @@
 // signal a semaphore at submit granularity, so the handoff is split across the
 // evaluate hook and the following vkQueueSubmit. See vk_interop.inc.
 //
-//   evaluate hook  : forward the game's evaluate (or, with game_eval=0, stand
+//   evaluate hook  : forward the game's evaluate during bootstrap, then stand
 //                    in for it), then record INTO the game's own command buffer
 //                    -- the one handed to EvaluateFeature -- the input copies
 //                    (game images -> shared images), a SetEvent(ev_inputs), a
@@ -22,9 +22,6 @@
 //   vkQueueSubmit  : hand the submitted frame to a worker thread that releases
 //                    the private D3D12 evaluate once ev_inputs fires on the GPU
 //                    and host-sets ev_output once the result is written back.
-//                    (sync=0 keeps the older fence-chained async copy-back,
-//                    which lands only after the game has already consumed its
-//                    output -- diagnostic use.)
 //
 // The shared textures are created on the D3D12 side (HEAP_FLAG_SHARED +
 // ALLOW_SIMULTANEOUS_ACCESS) and imported into Vulkan as VkImages backed by
@@ -36,6 +33,7 @@
 
 enum { SLOT_COLOR = 0, SLOT_OUTPUT, SLOT_DEPTH, SLOT_MV, SLOT_COUNT };
 enum { CROSS_UPLOAD = 0, CROSS_DOWNLOAD, CROSS_COUNT };
+enum { MAX_FRAME_SLOTS = 8 };
 
 static const char *kSlotKey[SLOT_COUNT]  = { "Color", "Output", "Depth", "MotionVectors" };
 static const char *kSlotName[SLOT_COUNT] = { "Color", "Output", "Depth", "MV" };
@@ -77,17 +75,52 @@ struct CrossPlane
     DXGI_FORMAT format;
 };
 
+// One transport generation. A frame never aliases another frame's upload or
+// download allocation. output_valid becomes true only after the D3D12 download
+// fence completes, so a missed evaluation can safely reuse this slot's prior
+// completed neural image.
+struct CrossFrameTransport
+{
+    ID3D12Heap *game_heap[CROSS_COUNT];
+    ID3D12Heap *neural_heap[CROSS_COUNT];
+    ID3D12Resource *game_buffer[CROSS_COUNT];
+    ID3D12Resource *neural_buffer[CROSS_COUNT];
+    // Ordinary neural-device staging resources used by the direct Vulkan
+    // route. Keeping D3D12 away from host-backed cross-adapter heaps avoids
+    // opaque residency work in the neural queue's critical path.
+    ID3D12Resource *neural_staging[CROSS_COUNT];
+    void *neural_staging_mapped[CROSS_COUNT];
+    void *host_memory[CROSS_COUNT];
+    void *vulkan_input_memory;  // coherent Vulkan producer, never opened by D3D12
+    void *vulkan_output_memory; // immutable Vulkan consumer, never opened by D3D12
+    VkBuffer cross_vk[CROSS_COUNT];
+    VkDeviceMemory cross_vk_memory[CROSS_COUNT];
+    UINT64 generation;
+    UINT64 upload_fence;
+    UINT64 output_fence;
+    UINT64 output_timeline;
+    bool output_valid;
+    // Ordered NGX producer state. The readback remains immutable until it has
+    // been presented into a later Vulkan consumer allocation.
+    UINT64 producer_fence;
+    UINT64 producer_timeline;
+    UINT64 producer_sequence;
+    int producer_timing_slot;
+    bool producer_valid;
+    bool producer_presented;
+};
+
 // The Vulkan-importable textures and fences must stay on the game adapter.
 // When multi-GPU mode is enabled, NGX and its GPU-local textures live on a
-// second adapter and this state owns the serialized cross-adapter staging path.
+// second adapter and this state owns the ordered cross-adapter transport ring.
 struct MultiGpuState
 {
     bool active;
     UINT game_index, neural_index;
     ID3D12Device3 *game_dev;
     ID3D12CommandQueue *game_queue;
-    ID3D12CommandAllocator *game_alloc;
-    ID3D12GraphicsCommandList *game_list;
+    ID3D12CommandAllocator *game_alloc[MAX_FRAME_SLOTS];
+    ID3D12GraphicsCommandList *game_list[MAX_FRAME_SLOTS];
     ID3D12Fence *game_fence;
     HANDLE game_event;
     UINT64 game_value;
@@ -95,28 +128,22 @@ struct MultiGpuState
     // Cross-adapter transfers run on the neural adapter's copy engine. NGX
     // evaluation remains on Bridge::queue, which must be a DIRECT queue.
     ID3D12CommandQueue *neural_copy_queue;
-    ID3D12CommandAllocator *neural_copy_alloc;
-    ID3D12GraphicsCommandList *neural_copy_list;
-    ID3D12CommandAllocator *neural_download_alloc;
-    ID3D12GraphicsCommandList *neural_download_list;
+    ID3D12CommandAllocator *neural_copy_alloc[MAX_FRAME_SLOTS];
+    ID3D12GraphicsCommandList *neural_copy_list[MAX_FRAME_SLOTS];
+    ID3D12CommandAllocator *neural_download_alloc[MAX_FRAME_SLOTS];
+    ID3D12GraphicsCommandList *neural_download_list[MAX_FRAME_SLOTS];
+    ID3D12GraphicsCommandList *pipeline_list[MAX_FRAME_SLOTS];
 
     ID3D12Resource *neural_tex[SLOT_COUNT];
-    // Keep each transfer direction in a different physical allocation. Reusing
-    // one cross-adapter resource in both directions forces the driver to reverse
-    // its ownership/coherency path every frame; under load that occasionally
-    // left the neural -> game copy queued for hundreds of milliseconds.
-    ID3D12Heap *game_heap[CROSS_COUNT];
-    ID3D12Heap *neural_heap[CROSS_COUNT];
-    ID3D12Resource *game_buffer[CROSS_COUNT];
-    ID3D12Resource *neural_buffer[CROSS_COUNT];
-    void *host_memory[CROSS_COUNT];
     SIZE_T host_bytes;
     CrossPlane plane[SLOT_COUNT];
+    CrossFrameTransport frame[MAX_FRAME_SLOTS];
+    UINT64 transport_generation;
+    UINT64 producer_sequence;
+    UINT64 next_present_sequence;
 
-    // Optional zero-queue-hop paths. Vulkan imports both host allocations:
-    // it writes game inputs inline and reads GPU 1 output inline.
-    VkBuffer cross_vk[CROSS_COUNT];
-    VkDeviceMemory cross_vk_memory[CROSS_COUNT];
+    // Optional zero-queue-hop paths. Vulkan imports every frame allocation:
+    // it writes game inputs inline and reads only completion-qualified output.
     bool direct_vulkan_upload;
     bool direct_vulkan_download;
 };
@@ -134,9 +161,9 @@ struct Bridge
     ID3D12CommandQueue        *queue;
     ID3D12GraphicsCommandList *list;
 
-    static const int           kFrames = 3;
-    ID3D12CommandAllocator    *alloc[kFrames];
-    UINT64                     alloc_fence[kFrames];
+    static const int           kMaxFrames = MAX_FRAME_SLOTS;
+    ID3D12CommandAllocator    *alloc[kMaxFrames];
+    UINT64                     alloc_fence[kMaxFrames];
     int                        frame_slot;
 
     HANDLE                     fence_event;
@@ -159,9 +186,6 @@ struct Bridge
 
     UINT64                     timeline;     // per-frame value used on both fences
 
-    VkSemaphore                sem_in;        // aliases fence_in
-    VkSemaphore                sem_out;       // aliases fence_out
-
     PFN_D3D12CreateFeature   create_feature;
     PFN_D3D12EvaluateFeature eval_feature;
     PFN_D3D12ReleaseFeature  release_feature;
@@ -177,6 +201,7 @@ struct Bridge
     UINT        out_width, out_height;  // Output texture size
     UINT        render_w, render_h;     // rendered area (smaller when upscaling)
     UINT        ngx_out_w, ngx_out_h;
+    UINT        feature_flags;
     UINT        slot_w[SLOT_COUNT];
     UINT        slot_h[SLOT_COUNT];
     VkFormat    game_fmt[SLOT_COUNT];   // the game's own Vulkan image formats
@@ -200,20 +225,14 @@ struct Bridge
     // command pool for the bridge's own copy-back / signal command buffers.
     VkQueue        vk_queue;
     uint32_t       vk_queue_family;
-    VkCommandPool  vk_pool;
-    bool           vk_ready;        // pool + per-frame buffers created
-
-    // Per-frame recorded work, one set per frame in flight. The sync sandwich
-    // is recorded straight into the game's command buffer; copy_out is the
-    // async path's own copy-back buffer.
+    // Per-frame work recorded directly into the game's command buffer.
     struct VkFrame
     {
-        VkCommandBuffer copy_out;
         VkBuffer        depth_scratch;      // depth-aspect round-trip staging
         VkDeviceMemory  depth_scratch_mem;
         VkDeviceSize    depth_scratch_size;
         VkFence         retire;             // signalled once the game's submit that
-                                            //   carried this slot's work (or copy_out)
+                                            //   carried this slot's work
                                             //   has retired
         bool            submitted;          // retire fence has pending work
         VkEvent         ev_inputs;          // device->host: input copies executed
@@ -224,30 +243,20 @@ struct Bridge
         VkCommandBuffer primary;            // the primary that executes `cmd` when it
                                             //   is a secondary (vkCmdExecuteCommands)
         UINT64          value;              // this frame's timeline value
-        bool            in_flight;          // recorded, not yet seen retired (sync)
+        bool            in_flight;          // recorded, not yet seen retired
         bool            matching;           // a submit carrying `cmd` is going down
                                             //   the chain right now
         bool            judged;             // the worker's verdict has been applied
-        volatile LONG   worker_done;        // the sync worker is finished with the slot
+        volatile LONG   worker_done;        // the worker is finished with the slot
         volatile LONG   abandoned;          // the game re-recorded `cmd` before it ran
         LONG            result;             // the worker's verdict (see WorkerRunSlot)
-        FrameScalars    scalars;            // this frame's NGX scalars
+        FrameScalars    scalars;
+        int             transport_slot;     // immutable cross-adapter allocation
         VkImageView     game_depth_view;    // bridge-made DEPTH-only view of the
         VkImage         game_depth_image;   //   game's depth image (see interop)
         uint32_t        game_depth_mip, game_depth_layer;
-    } vkframe[kFrames];
+    } vkframe[kMaxFrames];
     int vk_slot;
-
-    // Async path (sync = 0) only: set by the evaluate hook, consumed by the
-    // vkQueueSubmit that carries pending_cmd.
-    bool            pending;
-    int             pending_slot;
-    int             pending_skips;  // evaluates seen while that submit stayed unseen
-    VkCommandBuffer pending_cmd;    // the game command buffer the copies went into
-    VkCommandBuffer pending_primary;
-    VkImage         pending_out_image;
-    VkFormat        pending_out_fmt;
-    UINT            pending_out_w, pending_out_h;
 
     // Which queue family runs the DLSS pass is learned from the submit that
     // carries a command buffer the evaluate hook has seen -- before anything

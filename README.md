@@ -1,100 +1,160 @@
 # Portable DLSS neural execution bridge
 
-The current working implementation intercepts a Vulkan game's NGX temporal-upscaling call, recreates its frame contract on a private D3D12/NGX session, optionally executes that session on a second NVIDIA GPU, and reinserts the neural result before the game runs post-processing, UI, and presentation.
+DLSS Bridge inserts neural rendering into a supported game's temporal
+upscaling pipeline. The neural workload can run on the game GPU or on another
+NVIDIA GPU, and the result returns to the game before post-processing, UI, and
+presentation.
 
-The path is hardware-validated with No Man's Sky under Proton on two RTX 3090s. Sunshine remains an independent launcher and capture server; it receives the game's ordinary presented display.
+The validated Linux path uses a Vulkan NGX title through Proton with two RTX
+3090 GPUs. Native Windows uses the same launcher and injected host without Wine.
 
-## Current implementation
+## Supported path
 
-- Vulkan NGX capture through layer, ReShade add-on, Vulkan proxy, or proxy-DLL host.
-- Same-GPU D3D12 NGX execution.
-- Secondary-GPU D3D12 NGX execution through directional host-memory staging.
-- In-frame Vulkan reinsertion before downstream rendering.
-- Portable C ABI for future host, capture, executor, and transport plugins.
-- Portable configuration and frame-scheduler core.
-- Exact process-local DXGI LUID selection, with the proven numeric index retained for the current NMS setup and UUID/PCI reserved as persistent controller identities.
-- `same_gpu`, `secondary_gpu`, and `auto` execution policies.
-- Shared profile resolver and launch entry points for Linux desktop, Steam/Proton, Sunshine, and Windows.
-- GPU inventory reports using UUID and PCI identity.
+The current release supports 64-bit Windows Vulkan games that expose NVIDIA
+NGX:
 
-The full target design and migration boundaries are in [docs/portable-architecture.md](docs/portable-architecture.md).
+- Steam Proton on Linux
+- Native Windows
+- Same-GPU or secondary-GPU neural execution
+- RTX 3000, 4000, and 5000 series cards when runtime capability checks pass
 
-## Neural-only frame policy
+Native Linux games and Direct3D-only capture are planned backends. Frame
+generation is not supported by the current in-frame execution contract.
 
-The runtime permits the game-side DLSS call during discovery and private-feature bootstrap. After the first private neural frame completes, `require_neural_result=1` latches neural-only operation:
+## Install
 
-- the game-side DLSS evaluate is no longer executed;
-- a late cross-GPU result repeats the last completed neural image;
-- a frame that cannot enter the bridge returns NGX failure;
-- a permanent bridge failure stays intercepted instead of silently resuming game DLSS.
+Linux:
 
-This removes the old per-frame game-DLSS fallback. It also makes failures visible, which is intentional: the runtime must not claim that an original-DLSS frame received neural rendering.
+```bash
+curl -fsSL https://github.com/@GITHUB_REPOSITORY@/releases/latest/download/install.sh | sh
+```
+
+Windows:
+
+1. Download and run `dlss-bridge-windows-x86_64-setup.exe` from the latest
+   release.
+2. Restart Steam.
+
+Set the Steam launch option:
+
+```text
+dlss-bridge run -- %command%
+```
+
+The launcher attaches DLSS Bridge from an isolated user-state session and
+removes that session when the game exits. The game directory and Wine prefix
+remain untouched. Omit the prefix to launch normally.
+
+Both installers download and checksum-verify the pinned NVIDIA neural runtime;
+installation fails if it is unavailable or invalid. The runtime is not bundled
+in this project’s release artifacts. Rerun the Linux installer or run a newer
+Windows setup EXE to update. Runtime files, settings, and collected logs remain
+in user state.
+
+See [Installation and updates](docs/installation.md) for requirements, GPU
+selection, conflicts, removal, and troubleshooting.
+
+## GPU selection
+
+Automatic selection prefers another compatible NVIDIA GPU and uses the game GPU
+when no secondary adapter is available.
+
+```text
+dlss-bridge run --profile same-gpu -- %command%
+dlss-bridge run --profile secondary-gpu -- %command%
+```
+
+## Runtime behavior
+
+The runtime intercepts the game's Vulkan NGX temporal-upscaling call, recreates
+its frame contract in a private D3D12/NGX session, executes neural rendering,
+and reinserts the result before downstream rendering.
+
+After the first private neural frame completes, neural-only operation is
+latched:
+
+- the game-side DLSS evaluate is not executed;
+- a late result repeats the last completed neural image;
+- a frame that cannot enter the bridge reports NGX failure;
+- a permanent bridge failure remains visible instead of silently resuming the
+  game's original DLSS path.
 
 ## Configuration
 
-Portable policy is TOML. Resolve it to the flat in-process format with:
-
-```bash
-./controller/dlss_bridge.py resolve \
-  --config profiles/default.toml \
-  --profile profiles/no-mans-sky-vulkan.toml \
-  --output runtime/resolved/nms.cfg
-```
-
-Important settings:
+Policy is stored in TOML. The default profile uses automatic GPU placement, a
+four-slot ring, a two-frame pipeline, and the unified neural queue.
 
 ```toml
 [feature]
-placement = "before_sr"      # after_sr | before_sr | deferred_dlss
-working_scale = 1.0          # model raster scale; display resolution is unchanged
-passes = 1                   # 1..3 sequential neural passes
-runtime_variant = "presr-v0.7.7" # explicitly staged and hash checked
+placement = "before_sr"
+working_scale = 1.0
+passes = 1
 
 [execution]
-mode = "auto"                 # auto | same_gpu | secondary_gpu
-compute_adapter = "auto"      # auto | game | index:N | luid:HIGH:LOW
-require_neural_result = true
+mode = "auto"
+compute_adapter = "auto"
+
+[transport]
+neural_queue = "unified"
+ring_slots = 4
+neural_pipeline_frames = 2
 ```
 
-GPU series is never used as a compatibility switch. The final capability decision is based on adapter identity, driver/API support, model/runtime compatibility, feature creation/evaluation, resource formats, and the available transport route. This permits RTX 3000, 4000, and 5000 combinations when their actual runtime probes pass.
+Custom profiles can override these values:
 
-## Launch frontends
+```text
+dlss-bridge run --profile /absolute/path/custom.toml -- %command%
+```
 
-Each frontend resolves the same policy and exports `DLSS_BRIDGE_CONFIG`:
+GPU generations are not used as compatibility switches. Adapter identity,
+driver and API support, model compatibility, resource formats, feature
+creation, and transport probes determine whether a route is usable.
+
+## Architecture
+
+The implementation provides:
+
+- Vulkan NGX capture through suspended-process injection, a Vulkan layer, or a ReShade add-on
+- Same-GPU D3D12 NGX execution
+- Secondary-GPU execution through directional host-memory staging
+- In-frame Vulkan reinsertion
+- A versioned C ABI for capture, executor, transport, and host backends
+- Shared configuration, scheduling, adapter identity, and telemetry policy
+- Linux/Proton and native Windows launch wrappers
+
+See [Portable architecture](docs/portable-architecture.md) for interfaces,
+frame ownership, synchronization, and planned backends. [External
+dependencies](docs/dependencies.md) records the version and purpose of every
+third-party runtime, build, and test component. See [Known
+limitations](docs/known-limitations.md) for current coverage and remaining
+extraction work.
+
+## Build and test
+
+Build the Windows bridge DLLs in Docker:
 
 ```bash
-launchers/linux-desktop/run.sh --config profiles/default.toml -- /path/to/game
-launchers/steam-proton/run.sh --config profiles/default.toml -- proton run game.exe
-launchers/sunshine/run.sh --config profiles/default.toml -- /path/to/game-wrapper
+scripts/build-vk-bridge.sh
 ```
 
-The launchers and controller refuse to write outside this project. A game-local or Wine-prefix bundle is installed or mounted by the containing deployment system.
-
-## Build and validation
+Build a Linux release archive:
 
 ```bash
-bash scripts/build-vk-bridge.sh
-bash scripts/bridge-load-test.sh
+VERSION=vVERSION packaging/build-linux-package.sh dist
 ```
 
-The Docker build emits every existing PE64 host under `runtime/build-vk-bridge/`. The portable core tests are:
+Run the core checks:
 
 ```bash
 g++ -std=c++17 -Wall -Wextra -Werror -Icore/include \
-  core/src/runtime.cpp tests/unit/runtime_test.cpp -o /tmp/dlss-runtime-test
+  core/src/runtime.cpp core/src/components.cpp tests/unit/runtime_test.cpp -o /tmp/dlss-runtime-test
 /tmp/dlss-runtime-test
-python3 tests/unit/controller_test.py
-gcc -std=c11 -Wall -Wextra -Werror -Iinclude tests/unit/abi_c_test.c -o /tmp/dlss-abi-test
+PYTHONDONTWRITEBYTECODE=1 python3 tests/unit/controller_test.py
+gcc -std=c11 -Wall -Wextra -Werror -Iinclude \
+  tests/unit/abi_c_test.c -o /tmp/dlss-abi-test
 /tmp/dlss-abi-test
+scripts/bridge-load-test.sh
 ```
 
-## Diagnostics
-
-- `scripts/preflight.sh`: host, driver, Docker, and GPU inventory.
-- `controller/dlss_bridge.py probe`: portable JSON GPU identity report.
-- `scripts/transfer.sh`: bidirectional byte-validated transfer.
-- `scripts/neural-probe.sh`: NGX and neural model initialization.
-- `scripts/neural-mgpu.sh`: synthetic two-GPU D3D12 route.
-- `scripts/build-vk-bridge.sh`: all bridge host builds.
-
-The current cross-adapter transport imports directional host allocations directly into Vulkan on the game GPU and D3D12 on the neural GPU. GPU timestamp instrumentation and per-slot allocation remain the next performance backend milestones.
+Tagged releases build the Linux archive and native Windows setup EXE through
+[the release workflow](.github/workflows/release.yml).

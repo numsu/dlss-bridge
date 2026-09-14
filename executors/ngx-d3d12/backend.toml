@@ -5,3 +5,5 @@ state = "integrated"
 platforms = ["windows", "proton"]
 features = ["super_resolution", "neural_rendering"]
 implementation = "bridge/dlss5-vk-bridge/src/d3d12_session.inc"
+linkage = "static"
+abi = 1

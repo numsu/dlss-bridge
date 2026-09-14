@@ -5,3 +5,5 @@ state = "integrated"
 platforms = ["windows", "proton"]
 apis = ["vulkan"]
 implementation = "bridge/dlss5-vk-bridge/src/vk_layer.inc"
+linkage = "static"
+abi = 1

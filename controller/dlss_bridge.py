@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Portable controller for DLSS Bridge.
 
-The controller only writes beneath the project root. Launch frontends call it
-to resolve policy and produce diagnostics; frame data remains in-process.
+Configuration stays in the installation, launch resources live in a disposable
+user-state session, and game directories and Wine prefixes remain untouched.
+Frame data remains in-process.
 """
 from __future__ import annotations
 
@@ -16,7 +17,15 @@ import sys
 import tomllib
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent.parent
+_controller_dir = str(Path(__file__).resolve().parent)
+if _controller_dir not in sys.path:
+    sys.path.insert(0, _controller_dir)
+from runtime_setup import acquire_model, import_model, model_path, validate_model
+from session import close_session, prepare_session
+
+ROOT = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parent.parent)
+PAYLOAD = ROOT / "payload"
 
 
 def inside_root(path: Path) -> Path:
@@ -31,6 +40,19 @@ def inside_root(path: Path) -> Path:
 def load_toml(path: Path) -> dict[str, Any]:
     with path.open("rb") as stream:
         return tomllib.load(stream)
+
+
+def profile_path(value: str) -> Path:
+    direct = Path(value).expanduser()
+    if direct.is_file():
+        return direct.resolve()
+    bundled = ROOT / "profiles" / value
+    if bundled.is_file():
+        return bundled
+    with_suffix = bundled if bundled.suffix else bundled.with_suffix(".toml")
+    if with_suffix.is_file():
+        return with_suffix
+    raise SystemExit(f"profile does not exist: {value}")
 
 
 def merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -51,11 +73,47 @@ def bool_int(value: Any) -> int:
     raise SystemExit(f"expected boolean, got {value!r}")
 
 
+PROFILE_KEYS = {
+    "feature": {"kind", "placement", "working_scale", "passes"},
+    "execution": {"mode", "compute_adapter"},
+    "transport": {"output_format", "neural_queue", "ring_slots",
+                  "neural_pipeline_frames", "latency_budget_ms"},
+    "telemetry": {"gpu_timestamps"},
+    "bridge": {"verbose"},
+    "match": {"executable", "graphics_api"},
+    "capture": {"adapter"},
+}
+
+
+def validate_profile(data: dict[str, Any], source: str = "profile") -> None:
+    if data.get("schema") != 1:
+        raise SystemExit(f"{source}: schema must be 1")
+    unknown_sections = set(data) - {"schema", *PROFILE_KEYS}
+    if unknown_sections:
+        raise SystemExit(f"{source}: unknown section(s): {', '.join(sorted(unknown_sections))}")
+    for section, allowed in PROFILE_KEYS.items():
+        value = data.get(section, {})
+        if not isinstance(value, dict):
+            raise SystemExit(f"{source}: [{section}] must be a table")
+        unknown = set(value) - allowed
+        if unknown:
+            raise SystemExit(f"{source}: unknown [{section}] setting(s): {', '.join(sorted(unknown))}")
+    kind = data.get("feature", {}).get("kind", "neural_rendering")
+    if kind != "neural_rendering":
+        raise SystemExit(f"{source}: unsupported feature.kind: {kind}")
+    adapter = data.get("capture", {}).get("adapter", "ngx_vulkan")
+    if adapter != "ngx_vulkan":
+        raise SystemExit(f"{source}: capture.adapter is not integrated: {adapter}")
+    graphics_api = data.get("match", {}).get("graphics_api", "vulkan")
+    if graphics_api != "vulkan":
+        raise SystemExit(f"{source}: unsupported match.graphics_api: {graphics_api}")
+
+
 def resolved_runtime(data: dict[str, Any]) -> dict[str, str | int]:
+    validate_profile(data)
     feature = data.get("feature", {})
     execution = data.get("execution", {})
     transport = data.get("transport", {})
-    timing = data.get("timing", {})
     bridge = data.get("bridge", {})
     placement = str(feature.get("placement", "after_sr"))
     if placement not in ("after_sr", "before_sr", "deferred_dlss"):
@@ -66,62 +124,63 @@ def resolved_runtime(data: dict[str, Any]) -> dict[str, str | int]:
     passes = int(feature.get("passes", 1))
     if not 1 <= passes <= 3:
         raise SystemExit("feature.passes must be between 1 and 3")
-    runtime_variant = str(feature.get("runtime_variant", "stable"))
-    if not runtime_variant or any(not (c.isalnum() or c in "_.-") for c in runtime_variant):
-        raise SystemExit(f"invalid feature.runtime_variant: {runtime_variant}")
+    telemetry = data.get("telemetry", {})
     mode = execution.get("mode", "auto")
     if mode not in ("auto", "same_gpu", "secondary_gpu"):
         raise SystemExit(f"invalid execution.mode: {mode}")
     selector = str(execution.get("compute_adapter", "auto"))
-    if not (selector in ("auto", "game") or selector.startswith(("index:", "luid:", "uuid:", "pci:"))):
+    if not (selector in ("auto", "game") or selector.startswith(("index:", "luid:"))):
         raise SystemExit(f"invalid execution.compute_adapter: {selector}")
-    require = bool_int(execution.get("require_neural_result", True))
-    if require != 1:
-        raise SystemExit("require_neural_result=false is unsupported by project policy")
     slots = int(transport.get("ring_slots", 3))
     if not 2 <= slots <= 8:
         raise SystemExit("transport.ring_slots must be between 2 and 8")
-    budget = int(transport.get("latency_budget_ms", timing.get("latency_budget_ms", 16)))
+    pipeline_frames = int(transport.get("neural_pipeline_frames", 2))
+    if not 1 <= pipeline_frames < slots:
+        raise SystemExit("transport.neural_pipeline_frames must be at least 1 and smaller than ring_slots")
+    budget = int(transport.get("latency_budget_ms", 16))
     output_transport = str(transport.get("output_format", "native"))
     if output_transport not in ("native", "r11g11b10_float"):
         raise SystemExit(f"invalid transport.output_format: {output_transport}")
     neural_queue_mode = str(transport.get("neural_queue", "split"))
     if neural_queue_mode not in ("split", "unified"):
         raise SystemExit(f"invalid transport.neural_queue: {neural_queue_mode}")
-    if budget <= 0:
-        raise SystemExit("latency budget must be positive")
+    if not 1 <= budget <= 125:
+        raise SystemExit("transport.latency_budget_ms must be between 1 and 125")
     return {
-        "mode": int(bridge.get("mode", 0)),
-        "flags": int(bridge.get("flags", -1)),
-        "subrects": bool_int(bridge.get("subrects", True)),
         "verbose": bool_int(bridge.get("verbose", False)),
-        "sync": 1,
         "execution_mode": mode,
         "compute_adapter": selector,
-        "require_neural_result": 1,
         "ring_slots": slots,
+        "neural_pipeline_frames": pipeline_frames,
         "latency_budget_ms": budget,
         "output_transport": output_transport,
         "neural_queue_mode": neural_queue_mode,
         "neural_placement": placement,
         "neural_working_scale": format(working_scale, ".6g"),
         "neural_passes": passes,
-        "neural_runtime_variant": runtime_variant,
+        "gpu_timestamps": bool_int(telemetry.get("gpu_timestamps", True)),
     }
+
+
+def runtime_text(settings: dict[str, str | int]) -> str:
+    body = "# generated by controller/dlss_bridge.py; neural-only policy\n"
+    return body + "".join(f"{key}={value}\n" for key, value in settings.items())
 
 
 def write_runtime(settings: dict[str, str | int], output: Path) -> None:
     output = inside_root(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    body = "# generated by controller/dlss_bridge.py; neural-only policy\n"
-    body += "".join(f"{key}={value}\n" for key, value in settings.items())
-    output.write_text(body)
+    output.write_text(runtime_text(settings))
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
     data = load_toml(Path(args.config))
+    validate_profile(data, str(args.config))
     for profile in args.profile:
-        data = merge(data, load_toml(Path(profile)))
+        path = profile_path(profile)
+        item = load_toml(path)
+        validate_profile(item, str(path))
+        data = merge(data, item)
     write_runtime(resolved_runtime(data), Path(args.output))
     print(Path(args.output).expanduser().resolve())
     return 0
@@ -150,6 +209,12 @@ def component_inventory() -> list[dict[str, Any]]:
             for required in ("schema", "kind", "id", "state"):
                 if required not in item:
                     raise SystemExit(f"{manifest}: missing {required}")
+            if item["state"] == "integrated" and item["kind"] != "platform":
+                if item.get("linkage") != "static" or item.get("abi") != 1:
+                    raise SystemExit(f"{manifest}: integrated component must declare static ABI 1 linkage")
+                implementation = item.get("implementation")
+                if not implementation or not (ROOT / implementation).is_file():
+                    raise SystemExit(f"{manifest}: integrated component implementation is missing")
             item["manifest"] = str(manifest.relative_to(ROOT))
             components.append(item)
     return components
@@ -161,15 +226,20 @@ def cmd_components(args: argparse.Namespace) -> int:
 
 
 def cmd_probe(args: argparse.Namespace) -> int:
+    runtime = {"available": False}
+    try:
+        path = model_path()
+        validate_model(path)
+        runtime = {"available": True, "path": str(path)}
+    except (FileNotFoundError, RuntimeError, ValueError, SystemExit) as exc:
+        runtime = {"available": False, "error": str(exc)}
     report = {
         "schema": 1,
         "controller": "portable-dlss-bridge",
         "platform": sys.platform,
         "gpus": gpu_inventory(),
-        "notes": [
-            "GPU series is informational; runtime feature and transport probes decide support.",
-            "DXGI LUID correlation is completed by the in-process Windows/Proton runtime.",
-        ],
+        "neural_runtime": runtime,
+        "scope": "installation and hardware inventory; game feature and transport validation occurs at launch",
     }
     encoded = json.dumps(report, indent=2) + "\n"
     if args.output:
@@ -180,22 +250,67 @@ def cmd_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_executable_name(command: list[str]) -> str | None:
+    names = [Path(value.strip('"')).name.lower() for value in command
+             if value.strip('"').lower().endswith(".exe")]
+    return names[-1] if names else None
+
+
+def matching_profiles(command: list[str]) -> list[Path]:
+    executable = command_executable_name(command)
+    if not executable:
+        return []
+    matched: list[Path] = []
+    for path in sorted((ROOT / "profiles").glob("*.toml")):
+        item = load_toml(path)
+        validate_profile(item, str(path))
+        wanted = item.get("match", {}).get("executable")
+        if wanted and Path(str(wanted)).name.lower() == executable:
+            matched.append(path)
+    return matched
+
+
+def resolve_from_args(args: argparse.Namespace) -> dict[str, str | int]:
+    data = load_toml(Path(args.config))
+    validate_profile(data, str(args.config))
+    for path in matching_profiles(args.command):
+        data = merge(data, load_toml(path))
+    for profile in args.profile:
+        path = profile_path(profile)
+        item = load_toml(path)
+        validate_profile(item, str(path))
+        data = merge(data, item)
+    return resolved_runtime(data)
+
+
+def cmd_import_model(args: argparse.Namespace) -> int:
+    print(json.dumps(import_model(Path(args.path)), indent=2))
+    return 0
+
+
+def cmd_acquire_runtime(args: argparse.Namespace) -> int:
+    print(json.dumps(acquire_model(ROOT / "runtime-sources.json", args.force), indent=2))
+    return 0
+
+
 def cmd_launch(args: argparse.Namespace) -> int:
     if not args.command:
         raise SystemExit("launch requires a command after --")
-    output = ROOT / "runtime" / "resolved" / f"{args.frontend}.cfg"
-    data = load_toml(Path(args.config))
-    for profile in args.profile:
-        data = merge(data, load_toml(Path(profile)))
-    write_runtime(resolved_runtime(data), output)
-    env = os.environ.copy()
-    env["DLSS_BRIDGE_CONFIG"] = str(output)
-    env["DLSS_BRIDGE_FRONTEND"] = args.frontend
-    if args.dry_run:
-        print(json.dumps({"config": str(output), "frontend": args.frontend, "command": args.command}, indent=2))
-        return 0
-    os.execvpe(args.command[0], args.command, env)
-    return 127
+    settings = resolve_from_args(args)
+    session = prepare_session(
+        PAYLOAD, args.command, runtime_text(settings), os.environ.copy()
+    )
+    try:
+        if args.dry_run:
+            print(json.dumps({
+                "session": str(session.directory),
+                "command": session.command,
+                "game_files_modified": False,
+            }, indent=2))
+            return 0
+        return subprocess.run(session.command, env=session.environment, check=False).returncode
+    finally:
+        close_session(session)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -211,8 +326,17 @@ def parser() -> argparse.ArgumentParser:
     probe = commands.add_parser("probe")
     probe.add_argument("--output")
     probe.set_defaults(func=cmd_probe)
-    launch = commands.add_parser("launch")
-    launch.add_argument("--frontend", choices=("desktop", "steam-proton", "sunshine"), required=True)
+    model = commands.add_parser("import-model", help="install a user-supplied NVIDIA neural runtime")
+    model.add_argument("path")
+    model.set_defaults(func=cmd_import_model)
+    acquire = commands.add_parser(
+        "acquire-runtime", help="download and verify the pinned NVIDIA neural runtime"
+    )
+    acquire.add_argument("--force", action="store_true",
+                         help="replace an existing user-supplied runtime")
+    acquire.set_defaults(func=cmd_acquire_runtime)
+
+    launch = commands.add_parser("launch", aliases=["run"])
     launch.add_argument("--config", default=str(ROOT / "profiles" / "default.toml"))
     launch.add_argument("--profile", action="append", default=[])
     launch.add_argument("--dry-run", action="store_true")
@@ -223,6 +347,6 @@ def parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     parsed = parser().parse_args()
-    if parsed.subcommand == "launch" and parsed.command[:1] == ["--"]:
+    if parsed.subcommand in ("launch", "run") and parsed.command[:1] == ["--"]:
         parsed.command = parsed.command[1:]
     raise SystemExit(parsed.func(parsed))

@@ -1,4 +1,0 @@
-LIBRARY WINMM
-EXPORTS
-    timeBeginPeriod=Proxy_timeBeginPeriod
-    timeEndPeriod=Proxy_timeEndPeriod

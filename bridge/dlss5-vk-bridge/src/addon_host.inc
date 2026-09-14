@@ -27,18 +27,17 @@
 //     and the imports additionally ask the driver which memory types the
 //     handle itself allows (vk_interop.inc).
 //   * No VK_KHR_external_semaphore_win32: the D3D12 fences cannot import as
-//     timeline semaphores. The in-frame handoff never waits on them (its
-//     worker signals and waits the fences on the CPU), so the import is
-//     skipped and the asynchronous copy-back (sync=0) is unavailable here.
+//     timeline semaphores. The in-frame handoff uses CPU fence waits, so the
+//     missing import does not alter this host's synchronization contract.
 //   * ReShade's execute_command_list fires BEFORE the submit goes down, so
 //     nothing can be queued behind the game's work: a slot retires through the
 //     ev_done event at the tail of its sandwich instead of a retire fence.
 //   * ReShade loads add-ons at the first vkCreateInstance and unloads them
 //     when the last instance is destroyed. A game that creates and destroys
-//     instances back to back (X4 creates three) would unload a module whose
-//     NGX patches are live, so the module is pinned exactly as the layer is
-//     (DllMain) and AddonInit / AddonUninit are idempotent: each load
-//     re-registers with ReShade, each unload only unregisters.
+//     instances back to back could unload a module whose NGX patches are live,
+//     so explicit initialization pins the module and AddonInit / AddonUninit
+//     are idempotent: each load re-registers with ReShade and each unload only
+//     unregisters.
 //
 // Same rule as the layer, harder here because ReShade's own hooks sit
 // between us and the driver: never be the reason a game call fails. The
@@ -49,8 +48,6 @@
 
 // ---- host traits the core consults ----------------------------------------
 static const bool kHostSubmitsBehindGame = false;  // execute_command_list precedes the submit
-static const bool kHostHasTimelineImport = false;  // no external_semaphore_win32 on ReShade's device
-static const bool kHostAsyncFallback     = false;  // in-frame handoff only
 
 // The core's own submits set this around vkQueueSubmit so a host hook can
 // tell them from the game's. This host never submits, but the core references
@@ -90,7 +87,7 @@ struct AddonQueue { VkQueue queue; VkDevice device; uint32_t flags; };
 // devices, and the counts are high-water marks.
 static AddonDevice      g_adev[8];    static volatile LONG g_adev_count;
 static AddonQueue       g_aqueue[64]; static volatile LONG g_aqueue_count;
-static CRITICAL_SECTION g_disp_cs;    // initialised in DllMain
+static CRITICAL_SECTION g_disp_cs;    // initialized explicitly before AddonInit continues
 
 static bool   g_addon_registered;     // this load registered with ReShade
 static bool   g_addon_active;         // events wired; the bridge may run
@@ -449,9 +446,7 @@ static void OnExecuteCommandList(reshade::api::command_queue *queue, reshade::ap
 static void AddonApplyIniOverrides()
 {
     struct { const char *key; int *dst; } keys[] = {
-        { "mode",      &g_cfg.mode      }, { "flags",   &g_cfg.flags   },
-        { "subrects",  &g_cfg.subrects  }, { "verbose", &g_cfg.verbose },
-        { "sync",      &g_cfg.sync      }, { "require_neural_result", &g_cfg.require_neural_result },
+        { "verbose", &g_cfg.verbose },
     };
     for (const auto &k : keys)
     {
@@ -472,6 +467,7 @@ extern "C" __declspec(dllexport) const char *ISSUES      = "https://github.com/A
 
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_module)
 {
+    if (!EnsureRuntimeInitialized()) return false;
     if (!reshade::register_addon(addon_module, reshade_module))
     {
         Log("[addon] ReShade refused the registration: this build targets add-on API %u, which needs "
@@ -511,12 +507,6 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
     }
 
     AddonApplyIniOverrides();
-    if (!g_cfg.sync)
-    {
-        Log("[addon] sync=0 (the asynchronous copy-back) needs the layer host; using the in-frame handoff");
-        g_cfg.sync = 1;
-    }
-
     reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
     reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
     reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);

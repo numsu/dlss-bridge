@@ -1,0 +1,73 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build Linux package and shared Windows payload
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: packaging/build-linux-package.sh dist
+      - name: Embed repository in published installer
+        run: sed "s|@GITHUB_REPOSITORY@|${{ github.repository }}|g" install.sh > dist/install.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: |
+            dist/dlss-bridge-linux-x86_64.tar.gz
+            dist/SHA256SUMS
+            dist/install.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-payload
+          path: dist/stage-linux/libexec/dlss-bridge
+  windows:
+    needs: linux
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-payload
+          path: dist/windows-stage
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+      - name: Exclude Proton wrapper from native Windows package
+        shell: powershell
+        run: Remove-Item -Recurse -Force dist/windows-stage/platform/wine
+      - name: Build native launcher and setup executable
+        shell: powershell
+        run: packaging/windows/build.ps1 -Stage (Resolve-Path dist/windows-stage) -Version "${{ github.ref_name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: dist/dlss-bridge-windows-x86_64-setup.exe
+  publish:
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-release
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: release
+      - name: Complete checksums
+        run: cd release && sha256sum dlss-bridge-windows-x86_64-setup.exe >> SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/dlss-bridge-linux-x86_64.tar.gz
+            release/dlss-bridge-windows-x86_64-setup.exe
+            release/SHA256SUMS
+            release/install.sh

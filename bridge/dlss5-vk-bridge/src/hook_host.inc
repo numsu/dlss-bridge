@@ -35,13 +35,10 @@ static void     BridgeOnExecuteCommands(VkCommandBuffer primary, uint32_t count,
 static void     BridgeDeviceLost(VkDevice dev);
 
 // ---- host traits the core consults ----------------------------------------
-// The proxy sees a submit after it went down the chain, so it can queue a
-// retire fence behind it; it enables external_semaphore_win32 itself, so the
-// D3D12 fences import as timeline semaphores; and with its own command pool it
-// can run the asynchronous copy-back (sync=0).
+// The injected host sees a submit after it went down the chain, so it can queue
+// a retire fence behind it. It enables external_semaphore_win32 itself, so the
+// D3D12 fences import as timeline semaphores; with its own command pool it can
 static const bool kHostSubmitsBehindGame = true;
-static const bool kHostHasTimelineImport = true;
-static const bool kHostAsyncFallback     = true;
 
 #include "vk_dispatch.inc"
 
@@ -144,12 +141,13 @@ static InstanceDispatch *InstanceForPhys(VkPhysicalDevice phys)
     return only;
 }
 
-// The proxy loads the game-provided Windows Vulkan loader under a private name.
-// Loading is lazy so DllMain never recurses through the Windows loader lock.
+// Resolve the loader already selected by the game. Resolution remains lazy so
+// initialization does not force Vulkan to load before the game requests it.
 static HMODULE g_real_vulkan;
 static PFN_vkCreateInstance g_hook_CreateInstance;
 static PFN_vkCreateDevice g_hook_CreateDevice;
-static bool g_vulkan_hooks_installed;
+static CRITICAL_SECTION g_iat_cs;
+static __declspec(thread) unsigned g_loader_patch_depth;
 
 static bool EnsureRealLoader()
 {
@@ -579,7 +577,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL dlss5vk_QueueSubmit(
     if (g_internal_submit) return d->QueueSubmit(queue, count, submits, fence);
 
     const uint32_t slots = BridgeWantsSubmitMatch() ? BridgeMatchSubmit(count, submits) : 0;
+    const ULONGLONG submit_started = GetTickCount64();
     VkResult r = d->QueueSubmit(queue, count, submits, fence);
+    const ULONGLONG submit_elapsed = GetTickCount64() - submit_started;
+    if (submit_elapsed >= 8)
+        Log("[vk-submit] game GPU vkQueueSubmit blocked %llums family=%u submits=%u matched-slots=0x%X",
+            (unsigned long long)submit_elapsed, family, count, slots);
     if (slots)
         BridgeOnGameSubmitDone(queue, family, tracked, slots, r == VK_SUCCESS);
     else if (r == VK_SUCCESS && BridgeWantsSubmitMatch())
@@ -596,7 +599,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL dlss5vk_QueueSubmit2(
     if (g_internal_submit) return d->QueueSubmit2(queue, count, submits, fence);
 
     const uint32_t slots = BridgeWantsSubmitMatch() ? BridgeMatchSubmit2(count, submits) : 0;
+    const ULONGLONG submit_started = GetTickCount64();
     VkResult r = d->QueueSubmit2(queue, count, submits, fence);
+    const ULONGLONG submit_elapsed = GetTickCount64() - submit_started;
+    if (submit_elapsed >= 8)
+        Log("[vk-submit] game GPU vkQueueSubmit2 blocked %llums family=%u submits=%u matched-slots=0x%X",
+            (unsigned long long)submit_elapsed, family, count, slots);
     if (slots)
         BridgeOnGameSubmitDone(queue, family, tracked, slots, r == VK_SUCCESS);
     else if (r == VK_SUCCESS && BridgeWantsSubmitMatch())
@@ -701,23 +709,224 @@ dlss5vk_GetInstanceProcAddr(VkInstance instance, const char *pName)
     return g_next_gipa ? g_next_gipa(instance, pName) : nullptr;
 }
 
-// Patch the executable's vulkan-1.dll Import Address Table. Wine's Vulkan
+// Patch vulkan-1.dll imports in the executable and modules rooted in the game
+// directory. Wine's Vulkan
 // exports cross from PE code into a Unix thunk and cannot safely be executable-
 // detoured. IAT replacement changes only the caller's function pointers and
 // keeps every original Wine entry point pristine for forwarding.
 struct IatHook { const char *name; void *replacement; };
 
-static bool PatchMainVulkanIat()
+static unsigned InstallVulkanHooks();
+static unsigned PatchLoaderIat(HMODULE module, const wchar_t *module_name);
+static unsigned PatchVulkanIat(HMODULE module, const wchar_t *module_name);
+static wchar_t g_application_root[MAX_PATH];
+static HMODULE g_application_modules[256];
+static volatile LONG g_application_module_count;
+
+static bool IsSystemModulePath(const wchar_t *path)
 {
-    HMODULE exe = GetModuleHandleW(nullptr);
-    if (exe == nullptr) return false;
-    auto *base = reinterpret_cast<unsigned char *>(exe);
+    wchar_t windows[MAX_PATH] = {};
+    const UINT length = GetWindowsDirectoryW(windows, MAX_PATH);
+    return path && length && length < MAX_PATH &&
+        _wcsnicmp(path, windows, length) == 0 &&
+        (path[length] == L'\\' || path[length] == L'/');
+}
+
+static void RegisterApplicationModule(HMODULE module, const wchar_t *path)
+{
+    if (!module || IsSystemModulePath(path)) return;
+    const LONG count = g_application_module_count;
+    for (LONG i = 0; i < count; ++i) if (g_application_modules[i] == module) return;
+    if (count < static_cast<LONG>(_countof(g_application_modules))) {
+        g_application_modules[count] = module;
+        MemoryBarrier();
+        InterlockedCompareExchange(&g_application_module_count, count + 1, count);
+    }
+}
+
+static void InitializeApplicationRoot()
+{
+    GetModuleFileNameW(nullptr, g_application_root, MAX_PATH);
+    wchar_t *slash = wcsrchr(g_application_root, L'\\');
+    if (slash) slash[1] = 0;
+}
+
+static bool IsApplicationModule(HMODULE module, const wchar_t *path)
+{
+    if (module == GetModuleHandleW(nullptr)) return true;
+    for (LONG i = 0; i < g_application_module_count; ++i)
+        if (g_application_modules[i] == module) return true;
+    if (!path || !g_application_root[0]) return false;
+    const size_t root_length = wcslen(g_application_root);
+    return _wcsnicmp(path, g_application_root, root_length) == 0;
+}
+
+static void PatchLoadedApplicationModule(HMODULE module)
+{
+    wchar_t path[MAX_PATH] = {};
+    if (!module || !GetModuleFileNameW(module, path, MAX_PATH) || IsSystemModulePath(path)) return;
+    EnterCriticalSection(&g_iat_cs);
+    RegisterApplicationModule(module, path);
+    PatchLoaderIat(module, path);
+    if (EnsureRealLoader()) PatchVulkanIat(module, path);
+    LeaveCriticalSection(&g_iat_cs);
+}
+
+struct LoaderPatchScope
+{
+    LoaderPatchScope() { ++g_loader_patch_depth; }
+    ~LoaderPatchScope() { --g_loader_patch_depth; }
+};
+
+static void *VulkanReplacement(const char *name)
+{
+    if (strcmp(name, "vkGetInstanceProcAddr") == 0) return (void *)dlss5vk_GetInstanceProcAddr;
+    if (strcmp(name, "vkGetDeviceProcAddr") == 0) return (void *)dlss5vk_GetDeviceProcAddr;
+    if (strcmp(name, "vkCreateInstance") == 0) return (void *)dlss5vk_CreateInstance;
+    if (strcmp(name, "vkCreateDevice") == 0) return (void *)dlss5vk_CreateDevice;
+    if (strcmp(name, "vkDestroyInstance") == 0) return (void *)dlss5vk_DestroyInstance;
+    if (strcmp(name, "vkDestroyDevice") == 0) return (void *)dlss5vk_DestroyDevice;
+    if (strcmp(name, "vkGetDeviceQueue") == 0) return (void *)dlss5vk_GetDeviceQueue;
+    if (strcmp(name, "vkGetDeviceQueue2") == 0) return (void *)dlss5vk_GetDeviceQueue2;
+    if (strcmp(name, "vkQueueSubmit") == 0) return (void *)dlss5vk_QueueSubmit;
+    if (strcmp(name, "vkQueueSubmit2") == 0 || strcmp(name, "vkQueueSubmit2KHR") == 0)
+        return (void *)dlss5vk_QueueSubmit2;
+    if (strcmp(name, "vkBeginCommandBuffer") == 0) return (void *)dlss5vk_BeginCommandBuffer;
+    if (strcmp(name, "vkCmdExecuteCommands") == 0) return (void *)dlss5vk_CmdExecuteCommands;
+    return nullptr;
+}
+
+static FARPROC WINAPI GetProcAddressAndPatch(HMODULE module, LPCSTR name)
+{
+    using Fn = FARPROC (WINAPI *)(HMODULE, LPCSTR);
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    auto real = kernel ? reinterpret_cast<Fn>(GetProcAddress(kernel, "GetProcAddress")) : nullptr;
+    FARPROC resolved = real ? real(module, name) : nullptr;
+    if (reinterpret_cast<uintptr_t>(name) <= 0xffff) return resolved;
+    if (!EnsureRealLoader() || module != g_real_vulkan) return resolved;
+    void *replacement = VulkanReplacement(name);
+    return replacement ? reinterpret_cast<FARPROC>(replacement) : resolved;
+}
+
+// Most engines load their renderer DLL through LoadLibrary. Intercepting that
+// boundary lets us patch a newly loaded module before its first exported entry
+// point returns to the caller. The bounded startup scan below covers modules
+// introduced through lower-level loader APIs during process startup.
+static HMODULE LoadLibraryAndPatchA(LPCSTR path)
+{
+    using Fn = HMODULE (WINAPI *)(LPCSTR);
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    auto real = kernel ? reinterpret_cast<Fn>(GetProcAddress(kernel, "LoadLibraryA")) : nullptr;
+    const bool outermost = g_loader_patch_depth == 0;
+    LoaderPatchScope scope;
+    HMODULE loaded = real ? real(path) : nullptr;
+    if (loaded && outermost) PatchLoadedApplicationModule(loaded);
+    return loaded;
+}
+
+static HMODULE LoadLibraryAndPatchW(LPCWSTR path)
+{
+    using Fn = HMODULE (WINAPI *)(LPCWSTR);
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    auto real = kernel ? reinterpret_cast<Fn>(GetProcAddress(kernel, "LoadLibraryW")) : nullptr;
+    const bool outermost = g_loader_patch_depth == 0;
+    LoaderPatchScope scope;
+    HMODULE loaded = real ? real(path) : nullptr;
+    if (loaded && outermost) PatchLoadedApplicationModule(loaded);
+    return loaded;
+}
+
+static HMODULE LoadLibraryExAndPatchA(LPCSTR path, HANDLE file, DWORD flags)
+{
+    using Fn = HMODULE (WINAPI *)(LPCSTR, HANDLE, DWORD);
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    auto real = kernel ? reinterpret_cast<Fn>(GetProcAddress(kernel, "LoadLibraryExA")) : nullptr;
+    const bool outermost = g_loader_patch_depth == 0;
+    LoaderPatchScope scope;
+    HMODULE loaded = real ? real(path, file, flags) : nullptr;
+    if (loaded && outermost) PatchLoadedApplicationModule(loaded);
+    return loaded;
+}
+
+static HMODULE LoadLibraryExAndPatchW(LPCWSTR path, HANDLE file, DWORD flags)
+{
+    using Fn = HMODULE (WINAPI *)(LPCWSTR, HANDLE, DWORD);
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    auto real = kernel ? reinterpret_cast<Fn>(GetProcAddress(kernel, "LoadLibraryExW")) : nullptr;
+    const bool outermost = g_loader_patch_depth == 0;
+    LoaderPatchScope scope;
+    HMODULE loaded = real ? real(path, file, flags) : nullptr;
+    if (loaded && outermost) PatchLoadedApplicationModule(loaded);
+    return loaded;
+}
+
+static unsigned PatchLoaderIat(HMODULE module, const wchar_t *module_name)
+{
+    if (module == nullptr || module == g_self || !IsApplicationModule(module, module_name)) return 0;
+    auto *base = reinterpret_cast<unsigned char *>(module);
     auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
     auto *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
     const auto &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (dir.VirtualAddress == 0) return false;
+    if (dir.VirtualAddress == 0) return 0;
+
+    IatHook hooks[] = {
+        { "GetProcAddress", (void *)GetProcAddressAndPatch },
+        { "LoadLibraryA",   (void *)LoadLibraryAndPatchA },
+        { "LoadLibraryW",   (void *)LoadLibraryAndPatchW },
+        { "LoadLibraryExA", (void *)LoadLibraryExAndPatchA },
+        { "LoadLibraryExW", (void *)LoadLibraryExAndPatchW },
+    };
+    unsigned patched = 0;
+    auto *imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(base + dir.VirtualAddress);
+    for (; imp->Name; ++imp)
+    {
+        const char *dll = reinterpret_cast<const char *>(base + imp->Name);
+        const bool system_loader = _stricmp(dll, "kernel32.dll") == 0 ||
+            _stricmp(dll, "kernelbase.dll") == 0 ||
+            _strnicmp(dll, "api-ms-win-core-libraryloader-", 30) == 0;
+        if (!system_loader || imp->OriginalFirstThunk == 0) continue;
+        auto *names = reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->OriginalFirstThunk);
+        auto *slots = reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++slots)
+        {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+            auto *byname = reinterpret_cast<IMAGE_IMPORT_BY_NAME *>(base + names->u1.AddressOfData);
+            const char *name = reinterpret_cast<const char *>(byname->Name);
+            for (const auto &h : hooks)
+                if (strcmp(name, h.name) == 0)
+                {
+                    void **slot = reinterpret_cast<void **>(&slots->u1.Function);
+                    if (*slot == h.replacement) break;
+                    DWORD old = 0;
+                    if (VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old))
+                    {
+                        *slot = h.replacement;
+                        VirtualProtect(slot, sizeof(void *), old, &old);
+                        ++patched;
+                    }
+                    break;
+                }
+        }
+    }
+    if (patched)
+        Log("[iat-host] redirected %u loader import(s) in %ls", patched,
+            module_name ? module_name : L"a loaded module");
+    return patched;
+}
+
+static unsigned PatchVulkanIat(HMODULE module, const wchar_t *module_name)
+{
+    if (module == nullptr || module == g_self || module == g_real_vulkan ||
+        !IsApplicationModule(module, module_name)) return 0;
+    auto *base = reinterpret_cast<unsigned char *>(module);
+    auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    const auto &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (dir.VirtualAddress == 0) return 0;
 
     IatHook hooks[] = {
         { "vkGetInstanceProcAddr", (void *)dlss5vk_GetInstanceProcAddr },
@@ -741,9 +950,9 @@ static bool PatchMainVulkanIat()
     {
         const char *dll = reinterpret_cast<const char *>(base + imp->Name);
         if (_stricmp(dll, "vulkan-1.dll") != 0) continue;
+        if (imp->OriginalFirstThunk == 0) break;
         auto *names = reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->OriginalFirstThunk);
         auto *slots = reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->FirstThunk);
-        if (imp->OriginalFirstThunk == 0) break;
         for (; names->u1.AddressOfData; ++names, ++slots)
         {
             if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
@@ -753,13 +962,14 @@ static bool PatchMainVulkanIat()
                 if (strcmp(name, h.name) == 0)
                 {
                     void **slot = reinterpret_cast<void **>(&slots->u1.Function);
+                    if (*slot == h.replacement) break;
                     DWORD old = 0;
                     if (VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old))
                     {
-                        // Capture the resolved Wine addresses used for direct
-                        // create calls before replacing those two slots.
-                        if (strcmp(name, "vkCreateInstance") == 0) g_hook_CreateInstance = (PFN_vkCreateInstance)*slot;
-                        if (strcmp(name, "vkCreateDevice") == 0)   g_hook_CreateDevice = (PFN_vkCreateDevice)*slot;
+                        if (strcmp(name, "vkCreateInstance") == 0 && g_hook_CreateInstance == nullptr)
+                            g_hook_CreateInstance = (PFN_vkCreateInstance)*slot;
+                        if (strcmp(name, "vkCreateDevice") == 0 && g_hook_CreateDevice == nullptr)
+                            g_hook_CreateDevice = (PFN_vkCreateDevice)*slot;
                         *slot = h.replacement;
                         VirtualProtect(slot, sizeof(void *), old, &old);
                         ++patched;
@@ -769,26 +979,48 @@ static bool PatchMainVulkanIat()
         }
         break;
     }
-    if (patched == 0) return false;
-    g_vulkan_hooks_installed = true;
-    Log("[iat-host] redirected %u vulkan-1.dll import(s) in the game executable", patched);
-    return true;
+    if (patched)
+    {
+        Log("[iat-host] redirected %u vulkan-1.dll import(s) in %ls", patched,
+            module_name ? module_name : L"a loaded module");
+    }
+    return patched;
 }
 
-static bool InstallVulkanHooks()
+static unsigned InstallVulkanHooks()
 {
-    if (g_vulkan_hooks_installed) return true;
-    if (!EnsureRealLoader()) return false;
-    return PatchMainVulkanIat();
+    LoaderPatchScope recursion_guard;
+    EnterCriticalSection(&g_iat_cs);
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+        LeaveCriticalSection(&g_iat_cs);
+        return 0;
+    }
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    unsigned patched = 0;
+    const bool have_vulkan = EnsureRealLoader();
+    if (Module32FirstW(snapshot, &entry))
+        do
+        {
+            PatchLoaderIat(entry.hModule, entry.szExePath);
+            if (have_vulkan) patched += PatchVulkanIat(entry.hModule, entry.szExePath);
+        }
+        while (Module32NextW(snapshot, &entry));
+    CloseHandle(snapshot);
+    LeaveCriticalSection(&g_iat_cs);
+    return patched;
 }
 
 static DWORD WINAPI VulkanHookWatch(void *)
 {
-    for (int i = 0; i < 1200 && !g_bridge.disabled; ++i)
-    {
-        if (InstallVulkanHooks()) return 0;
-        Sleep(5);
+    // LoadLibrary interception covers normal late renderer loading. The bounded
+    // scan covers engines that use lower-level loader calls during startup,
+    // without walking every process module for the lifetime of the game.
+    for (int i = 0; i < 600 && !g_bridge.disabled; ++i) {
+        InstallVulkanHooks();
+        Sleep(100);
     }
-    Log("[iat-host] no vulkan-1.dll imports were available during startup; bridge host remains inactive");
     return 0;
 }

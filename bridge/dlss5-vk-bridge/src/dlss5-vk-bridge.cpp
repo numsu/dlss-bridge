@@ -7,10 +7,9 @@
 // D3D12 device, and runs a second NGX evaluate there -- the call the add-on
 // detours -- copying the neural result back into the game's own output image.
 //
-// Two pieces cooperate:
-//   * a Vulkan layer (vk_layer.inc) that enables the interop extensions the
-//     game never asked for and exposes the vkQueueSubmit handoff point;
-//   * an NGX Vulkan evaluate hook (this file) that arms each bridged frame.
+// The injected hook host enables the interop extensions the game did not ask
+// for, intercepts the Vulkan submission boundary, and hooks NGX Vulkan feature
+// creation/evaluation. The launch session is external to the game directory.
 //
 // Original DLSS 5 DX11 Bridge (c) 2026 NIGos, MIT. This port (c) 2026 Alan Z.
 
@@ -19,6 +18,9 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 
 #include <windows.h>
+#if defined(DLSS5VK_HOOK_HOST)
+#include <tlhelp32.h>
+#endif
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <malloc.h>     // _resetstkoflw
@@ -46,29 +48,140 @@ typedef NVSDK_NGX_Result (*PFN_D3D12ReleaseFeature)(NVSDK_NGX_Handle *);
 
 #include "bridge.h"
 #include "dlss_bridge/runtime.hpp"
+#include "dlss_bridge/components.hpp"
 
-// One string for the log banner, the ReShade add-on registration and the
-// release notes; version.rc carries the same numbers.
-#define DLSS5VK_VERSION_STRING "v0.3.0"
+// Release builds generate this header from the package version. Direct source
+// builds use an explicit development label.
+#if __has_include("build_version.hpp")
+#include "build_version.hpp"
+#else
+#define DLSS_BRIDGE_VERSION "dev"
+#endif
+#define DLSS5VK_VERSION_STRING DLSS_BRIDGE_VERSION
 
 // ---------------------------------------------------------------------------
 // module-wide state
 // ---------------------------------------------------------------------------
 static HMODULE          g_self;
+static HMODULE          g_optiscaler_module;
 static CRITICAL_SECTION g_log_cs;
 static CRITICAL_SECTION g_hook_cs;
 static wchar_t          g_log_path[MAX_PATH];
 static bool             g_log_ready;
+static INIT_ONCE        g_runtime_once = INIT_ONCE_STATIC_INIT;
+static bool EnsureRuntimeInitialized();
 
 // ---------------------------------------------------------------------------
 // configuration (dlss5-vk-bridge.cfg, next to the DLL)
 // ---------------------------------------------------------------------------
 using dlss_bridge::RuntimeConfig;
 static RuntimeConfig g_cfg;
+static dlss_bridge::RuntimeComposition g_components;
+static void Log(const char *fmt, ...);
+static void Warn(const char *fmt, ...);
+
+enum class NgxInitKind : LONG { None = 0, ApplicationId = 1, ProjectId = 2 };
+struct NgxInitIdentity {
+    volatile LONG valid;
+    NgxInitKind kind;
+    unsigned long long application_id;
+    int engine_type;
+    int sdk_version;
+    char project_id[128];
+    char engine_version[64];
+};
+static NgxInitIdentity g_ngx_identity{};
+
+struct FeatureCreateContract {
+    const NVSDK_NGX_Handle *handle;
+    int feature;
+    unsigned int width, height, out_width, out_height;
+    unsigned int quality, flags, output_subrects;
+    bool has_output_subrects;
+    bool valid;
+};
+static FeatureCreateContract g_feature_contracts[32]{};
+
+static bool ReadCreateUInt(const NVSDK_NGX_Parameter *p, const char *key, unsigned int *value)
+{
+    return p && p->Get(key, value) == NGX_SUCCESS;
+}
+
+static void CaptureFeatureContract(int feature, const NVSDK_NGX_Parameter *p,
+                                   const NVSDK_NGX_Handle *handle)
+{
+    if (!handle) return;
+    FeatureCreateContract contract{};
+    contract.handle = handle;
+    contract.feature = feature;
+    contract.valid =
+        ReadCreateUInt(p, "Width", &contract.width) && contract.width &&
+        ReadCreateUInt(p, "Height", &contract.height) && contract.height &&
+        ReadCreateUInt(p, "OutWidth", &contract.out_width) && contract.out_width &&
+        ReadCreateUInt(p, "OutHeight", &contract.out_height) && contract.out_height &&
+        ReadCreateUInt(p, "PerfQualityValue", &contract.quality) &&
+        ReadCreateUInt(p, "DLSS.Feature.Create.Flags", &contract.flags);
+    contract.has_output_subrects =
+        ReadCreateUInt(p, "DLSS.Enable.Output.Subrects", &contract.output_subrects);
+    FeatureCreateContract *slot = nullptr;
+    for (FeatureCreateContract &item : g_feature_contracts)
+        if (item.handle == handle) { slot = &item; break; }
+    if (!slot)
+        for (FeatureCreateContract &item : g_feature_contracts)
+            if (!item.handle) { slot = &item; break; }
+    if (slot) *slot = contract;
+    else contract.valid = false;
+    if (contract.valid)
+        Log("[contract] captured NGX feature %d handle=%p: %ux%u -> %ux%u quality=%u flags=0x%X%s",
+            feature, (void *)handle, contract.width, contract.height,
+            contract.out_width, contract.out_height, contract.quality, contract.flags,
+            contract.has_output_subrects ? " with output-subrect policy" : "");
+    else
+        Log("[contract] NGX feature %d handle=%p is missing mandatory creation parameters",
+            feature, (void *)handle);
+    if (!slot) Warn("feature contract table is full; handle=%p cannot be bridged", (void *)handle);
+}
+
+static const FeatureCreateContract *FindFeatureContract(const NVSDK_NGX_Handle *handle)
+{
+    if (!handle) return nullptr;
+    for (const FeatureCreateContract &contract : g_feature_contracts)
+        if (contract.handle == handle) return contract.valid ? &contract : nullptr;
+    return nullptr;
+}
+
+static void CaptureNgxApplicationIdentity(unsigned long long application_id, int sdk_version)
+{
+    g_ngx_identity.kind = NgxInitKind::ApplicationId;
+    g_ngx_identity.application_id = application_id;
+    g_ngx_identity.sdk_version = sdk_version;
+    g_ngx_identity.project_id[0] = 0;
+    g_ngx_identity.engine_version[0] = 0;
+    MemoryBarrier();
+    InterlockedExchange(&g_ngx_identity.valid, 1);
+}
+
+static void CaptureNgxProjectIdentity(const char *project_id, int engine_type,
+                                      const char *engine_version, int sdk_version)
+{
+    g_ngx_identity.kind = NgxInitKind::ProjectId;
+    g_ngx_identity.application_id = 0;
+    g_ngx_identity.engine_type = engine_type;
+    g_ngx_identity.sdk_version = sdk_version;
+    strncpy_s(g_ngx_identity.project_id, project_id ? project_id : "", _TRUNCATE);
+    strncpy_s(g_ngx_identity.engine_version, engine_version ? engine_version : "", _TRUNCATE);
+    MemoryBarrier();
+    InterlockedExchange(&g_ngx_identity.valid, 1);
+}
+
+static int ActiveFrameCount()
+{
+    return g_cfg.ring_slots;
+}
 
 // Once the first private neural frame completes, strict mode never executes
-// the game-side upscaler again. Startup calls are observation/bootstrap, not a
-// displayed fallback path. A failed strict frame repeats the last neural image.
+// the game-side upscaler again. Startup calls only establish and seed the
+// private path. A failed strict frame repeats the last neural image.
 static volatile LONG g_neural_only_latched;
 
 // ---------------------------------------------------------------------------
@@ -115,11 +228,10 @@ static void LogV(const char *tag, const char *fmt, va_list ap)
 static void Log(const char *fmt, ...)  { va_list ap; va_start(ap, fmt); LogV("",      fmt, ap); va_end(ap); }
 static void Warn(const char *fmt, ...) { va_list ap; va_start(ap, fmt); LogV(" WARN:", fmt, ap); va_end(ap); }
 
-static void LoadConfig()
+static bool LoadConfig()
 {
     wchar_t path[MAX_PATH] = {};
-    // Every launch frontend can point at one resolved policy. Existing game-
-    // local deployments remain compatible when the variable is absent.
+    // The launcher points at the policy in its isolated session.
     if (GetEnvironmentVariableW(L"DLSS_BRIDGE_CONFIG", path, MAX_PATH) == 0)
     {
         GetModuleFileNameW(g_self, path, MAX_PATH);
@@ -130,157 +242,66 @@ static void LoadConfig()
     FILE *f = nullptr;
     if (_wfopen_s(&f, path, L"r") != 0 || f == nullptr)
     {
-        // write a documented default so users have something to edit.
-        if (_wfopen_s(&f, path, L"w") == 0 && f)
-        {
-            fputs("# dlss5 portable runtime configuration\n"
-                  "# execution_mode auto | same_gpu | secondary_gpu\n"
-                  "# compute_adapter auto | game | index:N | luid:HIGH:LOW\n"
-                  "# require_neural_result=1 permits bootstrap, then never displays game DLSS\n"
-                  "mode = 0\nflags = -1\nsubrects = 1\nverbose = 0\nsync = 1\n"
-                  "execution_mode = auto\ncompute_adapter = auto\n"
-                  "require_neural_result = 1\nring_slots = 3\nlatency_budget_ms = 16\n"
-                  "output_transport = native\nneural_queue_mode = split\n"
-                  "neural_placement = after_sr\nneural_working_scale = 1.0\n"
-                  "neural_passes = 1\nneural_runtime_variant = stable\n", f);
-            fclose(f);
-        }
-        return;
+        Log("[cfg] no runtime policy found; using compiled defaults");
+        return true;
     }
     char line[256];
     while (fgets(line, sizeof(line), f))
     {
         char key[64] = {}, value[128] = {};
-        if (line[0] == '#' || line[0] == '\n') continue;
+        char *content = line;
+        while (*content == ' ' || *content == '\t') ++content;
+        if (*content == '#' || *content == '\r' || *content == '\n' || *content == 0) continue;
         if (sscanf_s(line, " %63[^= ] = %127[^\r\n]", key, (unsigned)sizeof(key),
-                     value, (unsigned)sizeof(value)) != 2) continue;
+                     value, (unsigned)sizeof(value)) != 2)
+        { Warn("[cfg] malformed policy line: %s", content); fclose(f); return false; }
         char *begin = value;
         while (*begin == ' ' || *begin == '\t') ++begin;
         char *tail = begin + strlen(begin);
         while (tail > begin && (tail[-1] == ' ' || tail[-1] == '\t')) *--tail = 0;
-        if (!g_cfg.Apply(key, begin)) Warn("[cfg] ignored invalid or unknown setting %s=%s", key, begin);
+        if (!g_cfg.Apply(key, begin))
+        { Warn("[cfg] invalid or unknown setting %s=%s", key, begin); fclose(f); return false; }
     }
     fclose(f);
-    Log("[cfg] mode=%d flags=%d subrects=%d verbose=%d sync=%d execution_mode=%s "
-        "compute_adapter=%s require_neural_result=%d ring_slots=%d latency_budget_ms=%d "
-        "output_transport=%s neural_queue_mode=%s neural_placement=%s "
-        "neural_working_scale=%.3f neural_passes=%d neural_runtime_variant=%s",
-        g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.verbose, g_cfg.sync,
+    if (!g_cfg.Valid())
+    { Warn("[cfg] neural_pipeline_frames must be smaller than ring_slots"); return false; }
+    Log("[cfg] verbose=%d execution_mode=%s "
+        "compute_adapter=%s ring_slots=%d neural_pipeline_frames=%d latency_budget_ms=%d "
+        "output_transport=%s neural_queue_mode=%s gpu_timestamps=%d",
+        g_cfg.verbose,
         dlss_bridge::ExecutionModeName(g_cfg.execution_mode), g_cfg.compute_adapter.text,
-        g_cfg.require_neural_result, g_cfg.ring_slots, g_cfg.latency_budget_ms,
+        g_cfg.ring_slots, g_cfg.neural_pipeline_frames,
+        g_cfg.latency_budget_ms,
         dlss_bridge::OutputTransportName(g_cfg.output_transport),
-        dlss_bridge::NeuralQueueModeName(g_cfg.neural_queue_mode),
-        dlss_bridge::NeuralPlacementName(g_cfg.neural_placement),
-        g_cfg.neural_working_scale, g_cfg.neural_passes, g_cfg.neural_runtime_variant);
-    if (g_cfg.ring_slots != Bridge::kFrames)
-        Warn("[cfg] ring_slots=%d requested; working Vulkan backend currently provides %d",
-             g_cfg.ring_slots, Bridge::kFrames);
+        dlss_bridge::NeuralQueueModeName(g_cfg.neural_queue_mode), g_cfg.gpu_timestamps);
+    Log("[cfg] active frame/transport ring slots=%d", ActiveFrameCount());
+    return true;
 }
 
-// Defined with the NGX hook below. BridgeDisable calls it so a bridge that has
-// stopped also stops intercepting: the game's DLSS calls go back to running
-// exactly as they would without this DLL loaded at all.
-static void BridgeUnhookAll();
-
 // ---------------------------------------------------------------------------
-// Frame Generation stand-aside
-//
-// Streamline's DLSS Frame Generation (sl.dlss_g) pairs every present with that
-// frame's DLSS evaluate and interpolates between the two most recent frames at
-// present time. The bridge breaks both halves of that pairing: it stalls the
-// game's queue mid-submit (the sync sandwich) and runs a second, private DLSS
-// evaluate each frame inside the same process. X4: Foundations (#1) showed
-// what that costs: one bridged frame, then a null dereference inside
-// sl.dlss_g.dll's present-time bookkeeping (minidump: sl.dlss_g+0x3d320,
-// v2.7.30, reached from vkQueuePresentKHR through the driver, the frame after
-// the bridge's first sandwich).
-//
-// The bridge cannot make FG's internal bookkeeping robust, so while FG is
-// active it must not bridge at all. The latch below is set the moment the game
-// creates an NGX FrameGeneration feature -- the earliest reliable signal.
-// (Module presence is NOT such a signal: Streamline preloads nvngx_dlssg.dll
-// to probe support long before the user's setting is known; both X4 logs show
-// it resident before any VkInstance existed.) Feature creation, by contrast,
-// happens only when FG is actually enabled, and always before FG's first
-// evaluate -- so the latch is in place before the first frame the bridge
-// would otherwise touch. It never clears: a mid-session FG toggle-off leaves
-// NGX state the bridge has no way to re-validate, so standing back up is a
-// game restart.
+// Frame Generation has a different presentation-time contract from the
+// temporal upscaling operation implemented here. Refuse its feature creation
+// explicitly so an attached process never enters a partially supported mode.
 // ---------------------------------------------------------------------------
-static volatile LONG g_fg_active;
-static volatile LONG g_frames_touched;   // a sandwich was recorded into a game frame
-
-static bool BridgeFrameGenerationActive() { return g_fg_active != 0; }
-static void NoteFrameTouched()            { g_frames_touched = 1; }
-
-// Transient-fault cooldown. The X4 #1 forensics pinned the one-off contained
-// evaluate fault inside ReShade64.dll itself (+0x1EAF11, reading null+0x440)
-// with every bridge patch audited intact -- a cooperating interposer having a
-// moment, not corrupted state on this side. Standing down for the whole
-// session over it (v0.1.10/11) cost the add-on the session; the game demons-
-// trably renders on fine after the containment. So the first contained fault
-// only pauses bridged frames for a cooldown; forwarding continues untouched
-// every frame, and a second fault stands the bridge down for real.
-static volatile LONG      g_eval_fault_count;
-static volatile ULONGLONG g_bridge_hold_until;   // tick until which frames pass untouched
-
-static bool BridgeInFaultCooldown()
-{
-    return g_bridge_hold_until != 0 && GetTickCount64() < g_bridge_hold_until;
-}
-
-// Called with the feature id of every NGX Vulkan feature the game creates,
-// BEFORE the create is forwarded. Returns true when the create must be
-// REFUSED (fail, never forwarded): a FrameGeneration create arriving after
-// the bridge has already recorded into this session's frames. Forwarded, FG
-// would come up over a history of stalled, double-evaluated frames, and its
-// present-time bookkeeping crashes on exactly that -- X4 #1 hit it twice
-// (3000 and 2000 bridged frames in, the log's last line the old stand-aside
-// notice). Refused, the FG feature never exists, its bookkeeping never arms,
-// and the bridge keeps working; a relaunch with FG enabled gets FG, because
-// the create then lands before any frame is touched and takes the stand-aside
-// branch below.
 static bool NoteVkFeatureCreate(int feature)
 {
-    const int kNGXFeatureFrameGeneration = 11;   // NVSDK_NGX_Feature_FrameGeneration
-    if (feature != kNGXFeatureFrameGeneration) return false;
-    if (g_frames_touched != 0)
-    {
-        static LONG warned = 0;
-        if (InterlockedExchange(&warned, 1) == 0)
-            Log("[bridge] REFUSING a mid-session NGX Frame Generation create: the bridge "
-                "has already recorded into this session's frames, and FG's present-time "
-                "bookkeeping cannot absorb that mixed history. The refusal fails the "
-                "create in the most standard way NGX has (FeatureNotSupported, null "
-                "handle). If the game dies moments after this line anyway, its own FG "
-                "enable path did not survive being told no either -- change Frame "
-                "Generation only from a fresh launch.");
-        return true;
-    }
-    if (InterlockedExchange(&g_fg_active, 1) == 0)
-        Log("[bridge] the game is creating an NGX Frame Generation feature (DLSS-G). "
-            "The bridge stands aside for this session: FG pairs each present with the "
-            "frame's DLSS evaluate, and the bridge's in-frame stall plus private second "
-            "evaluate breaks that pairing inside sl.dlss_g. Restart the game with Frame "
-            "Generation disabled to use the bridge.");
-    return false;
+    if (feature != NVSDK_NGX_FEATURE_FRAME_GENERATION) return false;
+    static LONG warned = 0;
+    if (InterlockedExchange(&warned, 1) == 0)
+        Warn("NGX Frame Generation is unsupported by this temporal bridge; refusing the feature create");
+    return true;
 }
 
 // ---------------------------------------------------------------------------
-// the three halves (order matters: d3d12 session, then the host, then interop)
+// the three halves (order matters: D3D12 session, then the host, then interop)
 //
-// Two hosts build from this file. The Vulkan layer (dlss5-vk-bridge.dll, the
-// v0.1 line) interposes the loader chain; the ReShade add-on
-// (dlss5-vk-bridge.addon64, the v0.2 line, DLSS5VK_ADDON_HOST) is loaded by
-// ReShade next to the DLSS 5 add-on it feeds. Either supplies the same seam
-// to vk_interop.inc: the device dispatch, the submit / command-buffer
-// notifications and a handful of kHost* traits.
+// The injected hook, Vulkan layer, and ReShade add-on builds supply the same
+// seam to vk_interop.inc: device dispatch, submit and command-buffer events,
+// and a handful of kHost* traits.
 // ---------------------------------------------------------------------------
 #include "d3d12_session.inc"
 #if defined(DLSS5VK_HOOK_HOST)
 #include "hook_host.inc"
-#elif defined(DLSS5VK_PROXY_HOST)
-#include "proxy_host.inc"
 #elif defined(DLSS5VK_ADDON_HOST)
 #include "addon_host.inc"
 #else
@@ -313,12 +334,12 @@ static Hook      g_create_hooks[kMaxHooks];    // NVSDK_NGX_VULKAN_CreateFeature
 static int       g_create_count;
 static Hook      g_create1_hooks[kMaxHooks];   // NVSDK_NGX_VULKAN_CreateFeature1
 static int       g_create1_count;
-#if defined(DLSS5VK_HOOK_HOST)
 static Hook      g_init_ext_hooks[kMaxHooks];  // NVSDK_NGX_VULKAN_Init_Ext
 static int       g_init_ext_count;
 static Hook      g_init_ext2_hooks[kMaxHooks]; // NVSDK_NGX_VULKAN_Init_Ext2
 static int       g_init_ext2_count;
-#endif
+static Hook      g_init_project_hooks[kMaxHooks]; // NVSDK_NGX_VULKAN_Init_ProjectID
+static int       g_init_project_count;
 static __declspec(thread) int g_ngx_nest;
 
 static void WriteCode(void *dst, const void *src, size_t n)
@@ -353,17 +374,11 @@ static void HookReinstall(Hook *h){ if (h->installed) { unsigned char j[14]; Bui
 // Lift / restore every installed evaluate patch at once. The game's evaluate is
 // forwarded with ALL of them removed, not just the module being called through.
 //
-// Un-patching only the module being called leaves the other four live inside
-// the forwarded call, and these modules call each other: with Streamline in the
-// process the game reaches sl.common.dll, which forwards into _nvngx.dll, which
-// dispatches into nvngx_dlss.dll -- each hop re-entering a detour, and any of
-// those detours' "original" bytes possibly being another interposer's jump
-// rather than real code. X4: Foundations reported exactly what that costs: the
-// forwarded evaluate raising 0xC00000FD, a stack overflow, once per launch,
-// with the game dying immediately after. Removing every patch for the duration
-// makes the whole forwarded call tree run byte for byte as it would with this
-// DLL absent, whatever its shape; the nesting depth still arms the bridge on
-// the outermost call alone.
+// Un-patching only the module being called leaves the other hooks live inside
+// a forwarded call. NGX and Streamline modules can call through one another,
+// so another live detour can recursively re-enter the bridge. Removing every
+// evaluate patch for the duration preserves the complete forwarded call chain;
+// the nesting depth still arms the bridge on the outermost call alone.
 //
 // The two hook classes lift differently:
 //
@@ -372,9 +387,9 @@ static void HookReinstall(Hook *h){ if (h->installed) { unsigned char j[14]; Bui
 //     schedule (enabling Frame Generation mid-session, for instance), and if
 //     they were lifted here, a create landing during any forwarded evaluate
 //     would run unobserved -- with evaluates streaming every frame, that race
-//     would miss the one signal the FG stand-aside depends on. A concurrent
-//     create hits its still-installed detour instead and serialises on the
-//     same critical section.
+//     would miss the feature create that the bridge must explicitly classify.
+//     A concurrent create hits its still-installed detour instead and
+//     serialises on the same critical section.
 //   * Forwarding a CREATE lifts everything. A create chains through the same
 //     interposer modules as an evaluate and can run warm-up work behind it;
 //     no patch of this DLL's may be live while that original code runs.
@@ -414,16 +429,10 @@ static const DWORD kStatusStackOverflow = 0xC00000FDu;
 // ---------------------------------------------------------------------------
 // fault forensics
 //
-// X4 #1 (v0.1.10) had a forwarded evaluate raise an access violation ~55
-// frames into an otherwise healthy session -- contained by design, but the
-// log recorded only the exception code, which pins nothing. A contained
-// fault now logs where the faulting instruction lives (module+offset, or
-// "not in any loaded module" -- that alone convicts a jump into freed code),
-// what it touched, and an audit of every hooked entry point taken BEFORE the
-// lifted patches go back on: is the module still loaded, and are the bytes
-// on the entry the expected ones for the current lift depth. Another
-// interposer rewriting or unhooking these same exports is exactly what such
-// an audit catches red-handed.
+// A contained fault records the faulting module and offset, the accessed
+// address, and the state of every hook before lifted patches are restored.
+// This distinguishes a graphics-runtime fault from a stale module or another
+// interposer rewriting the same export.
 // ---------------------------------------------------------------------------
 static const wchar_t *ModuleName(HMODULE m);
 
@@ -526,12 +535,10 @@ static NVSDK_NGX_Result SafeCallVkEvaluate(PFN_NGX_VK_Evaluate fn, VkCommandBuff
     __try { return fn(cmd, feat, p, cb); }
     __except (FaultCapture(fi, GetExceptionInformation()))
     {
-        // Catching a stack overflow does not put the guard page back. Leave it
-        // consumed and the next deep call on this thread takes the process down
-        // with no exception at all -- which is what the game did a moment after
-        // this line in the X4: Foundations report.
+        // Catching a stack overflow does not put the guard page back. Restore
+        // it before another deep call on this thread can terminate the process.
         if (fi->code == kStatusStackOverflow) _resetstkoflw();
-        return NGX_SUCCESS;
+        return NGX_FAIL;
     }
 }
 
@@ -549,9 +556,8 @@ static NVSDK_NGX_Result ForwardVkEvaluateVia(int idx, VkCommandBuffer cmd,
         // once instead of silently swallowing the game's DLSS call.
         static LONG warned = 0;
         if (InterlockedExchange(&warned, 1) == 0)
-            Warn("[hook] an evaluate arrived through a detour with no hook behind it; "
-                 "returning success without forwarding.");
-        return NGX_SUCCESS;
+            Warn("[hook] an evaluate arrived through a detour with no hook behind it; failing the call");
+        return NGX_FAIL;
     }
 
     EnterCriticalSection(&g_hook_cs);
@@ -567,23 +573,7 @@ static NVSDK_NGX_Result ForwardVkEvaluateVia(int idx, VkCommandBuffer cmd,
         Log("[hook] forwarded NGX Vulkan evaluate raised 0x%08X%s", fi.code,
             fi.code == kStatusStackOverflow ? " (stack overflow)" : "");
         LogFaultSite(&fi);
-        // The game's own DLSS call faulted while we were holding it. The X4 #1
-        // forensics showed this can be a transient in a neighbouring interposer
-        // (ReShade64.dll reading null+0x440, every bridge patch intact) with
-        // the game rendering on fine after containment -- so the first fault
-        // only pauses bridged frames for a cooldown, with forwarding running
-        // untouched throughout. A second fault means it was not transient:
-        // stop, un-patch, and let the game have its own entry points back.
-        if (InterlockedIncrement(&g_eval_fault_count) == 1)
-        {
-            const ULONGLONG kFaultCooldownMs = 5000;
-            g_bridge_hold_until = GetTickCount64() + kFaultCooldownMs;
-            Warn("a forwarded evaluate faulted but was contained; pausing bridged frames "
-                 "for %llu ms, then resuming (a second fault stands the bridge down for "
-                 "the session). The game renders normally.", kFaultCooldownMs);
-        }
-        else
-            BridgeDisable("the game's NGX evaluate faulted twice while the bridge was forwarding it");
+        BridgeDisable("the game's NGX evaluate faulted while the bridge was forwarding it");
     }
     return r;
 }
@@ -594,10 +584,19 @@ static NVSDK_NGX_Result BridgedVkEvaluate(int idx, VkCommandBuffer cmd, const NV
     ++g_ngx_nest;
     const bool outer = (g_ngx_nest == 1);
 
-    // A hard failure after strict mode has latched must not unhook and silently
-    // resume the game's original DLSS. Report NGX failure to the game instead.
-    if (outer && g_bridge.disabled && dlss_bridge::IsStrictNeural(g_cfg) &&
-        g_neural_only_latched)
+    // A worker-side failure cannot join its own handoff thread, so teardown is
+    // deferred to the next game-thread evaluate. Finish it before the disabled
+    // gate; fail-closed sessions otherwise never re-enter BridgeVkFrame.
+    if (outer && g_release_deferred)
+    {
+        InterlockedExchange(&g_release_deferred, 0);
+        FrameLock();
+        D3D12ReleaseResources();
+        FrameUnlock();
+    }
+
+    // An attached bridge that has failed remains fail-closed for the process.
+    if (outer && g_bridge.disabled)
     {
         --g_ngx_nest;
         return NGX_FAIL;
@@ -622,7 +621,7 @@ static NVSDK_NGX_Result BridgedVkEvaluate(int idx, VkCommandBuffer cmd, const NV
     {
         FaultInfo fi;
         memset(&fi, 0, sizeof(fi));
-        __try { BridgeVkFrame(cmd, p); }
+        __try { BridgeVkFrame(cmd, feat, p); }
         __except (FaultCapture(&fi, GetExceptionInformation()))
         { BridgeFrameUnlockAll();   // never leave the submit hooks locked out
           Log("[bridge] frame path faulted 0x%08X; disabling to protect the game", fi.code);
@@ -648,8 +647,8 @@ static void *const g_eval_detours[kMaxHooks] = {
 };
 
 // ---------------------------------------------------------------------------
-// NGX Vulkan create hook -- only to observe the feature id (see the Frame
-// Generation stand-aside above); every call is forwarded, nothing is altered.
+// NGX Vulkan create hook. Supported creates are forwarded and captured;
+// unsupported feature contracts are rejected explicitly.
 // The forwarding contract is the evaluate's: all patches lifted for the
 // duration, serialised on the same critical section, exceptions contained.
 // One difference: a create that FAULTS must report failure, not success -- a
@@ -718,14 +717,20 @@ static NVSDK_NGX_Result BridgedVkCreate(int idx, VkCommandBuffer cmd, int featur
 {
     if (NoteVkFeatureCreate(feature))
     { if (out) *out = nullptr; return NGX_FAIL_FEATURE_NOT_SUPPORTED; }
-    return ForwardVkCreateVia(&g_create_hooks[idx], false, VK_NULL_HANDLE, cmd, feature, p, out);
+    NVSDK_NGX_Result result = ForwardVkCreateVia(
+        &g_create_hooks[idx], false, VK_NULL_HANDLE, cmd, feature, p, out);
+    if (result == NGX_SUCCESS && out) CaptureFeatureContract(feature, p, *out);
+    return result;
 }
 static NVSDK_NGX_Result BridgedVkCreate1(int idx, VkDevice dev, VkCommandBuffer cmd, int feature,
                                          NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
     if (NoteVkFeatureCreate(feature))
     { if (out) *out = nullptr; return NGX_FAIL_FEATURE_NOT_SUPPORTED; }
-    return ForwardVkCreateVia(&g_create1_hooks[idx], true, dev, cmd, feature, p, out);
+    NVSDK_NGX_Result result = ForwardVkCreateVia(
+        &g_create1_hooks[idx], true, dev, cmd, feature, p, out);
+    if (result == NGX_SUCCESS && out) CaptureFeatureContract(feature, p, *out);
+    return result;
 }
 
 #define CREATE_DETOUR(N) \
@@ -750,24 +755,25 @@ static void *const g_create1_detours[kMaxHooks] = {
     (void *)Detour_VK_Create1_8, (void *)Detour_VK_Create1_9, (void *)Detour_VK_Create1_10, (void *)Detour_VK_Create1_11,
 };
 
-#if defined(DLSS5VK_HOOK_HOST)
-// NMS creates Vulkan before its local WinHTTP proxy loads this DLL. Its later
-// NGX Init_Ext call supplies the already-created handles, which lets the IAT
-// host adopt the real render device instead of guessing from opaque handles.
-// All Init_Ext patches are lifted while forwarding because NGX proxy modules
-// may forward this call through one another just like Create/Evaluate.
+// A game can create Vulkan before NGX loads. The later NGX Init_Ext call
+// supplies the already-created handles, which lets the injected host adopt the
+// real render device instead of guessing from opaque handles.
+// All Init_Ext patches are lifted while forwarding because NGX modules may
+// forward this call through one another just like Create/Evaluate.
 static int g_lift_init_ext_depth;
 static void LiftInitExtHooks()
 {
     if (++g_lift_init_ext_depth != 1) return;
     for (int i = 0; i < g_init_ext_count; ++i) HookRestore(&g_init_ext_hooks[i]);
     for (int i = 0; i < g_init_ext2_count; ++i) HookRestore(&g_init_ext2_hooks[i]);
+    for (int i = 0; i < g_init_project_count; ++i) HookRestore(&g_init_project_hooks[i]);
 }
 static void UnliftInitExtHooks()
 {
     if (--g_lift_init_ext_depth != 0) return;
     for (int i = 0; i < g_init_ext_count; ++i) HookReinstall(&g_init_ext_hooks[i]);
     for (int i = 0; i < g_init_ext2_count; ++i) HookReinstall(&g_init_ext2_hooks[i]);
+    for (int i = 0; i < g_init_project_count; ++i) HookReinstall(&g_init_project_hooks[i]);
 }
 
 static NVSDK_NGX_Result ForwardVkInitExt(int idx, unsigned long long app_id,
@@ -776,11 +782,14 @@ static NVSDK_NGX_Result ForwardVkInitExt(int idx, unsigned long long app_id,
                                          const void *feature_info)
 {
     Hook &h = g_init_ext_hooks[idx];
+#if defined(DLSS5VK_HOOK_HOST)
     HostCaptureNgxInit(instance, phys, device);
+#endif
     EnterCriticalSection(&g_hook_cs);
     LiftInitExtHooks();
     const NVSDK_NGX_Result result = reinterpret_cast<PFN_NGX_VK_Init>(h.target)(
         app_id, data_path, instance, phys, device, version, feature_info);
+    if (result == NGX_SUCCESS) CaptureNgxApplicationIdentity(app_id, version);
     UnliftInitExtHooks();
     LeaveCriticalSection(&g_hook_cs);
     return result;
@@ -808,11 +817,14 @@ static NVSDK_NGX_Result ForwardVkInitExt2(
     int version, const void *feature_info)
 {
     Hook &h = g_init_ext2_hooks[idx];
+#if defined(DLSS5VK_HOOK_HOST)
     HostCaptureNgxInit(instance, phys, device);
+#endif
     EnterCriticalSection(&g_hook_cs);
     LiftInitExtHooks();
     const NVSDK_NGX_Result result = reinterpret_cast<PFN_NGX_VK_Init_Ext2>(h.target)(
         app_id, data_path, instance, phys, device, gipa, gdpa, version, feature_info);
+    if (result == NGX_SUCCESS) CaptureNgxApplicationIdentity(app_id, version);
     UnliftInitExtHooks();
     LeaveCriticalSection(&g_hook_cs);
     return result;
@@ -834,7 +846,45 @@ static void *const g_init_ext2_detours[kMaxHooks] = {
     (void *)Detour_VK_InitExt2_6, (void *)Detour_VK_InitExt2_7, (void *)Detour_VK_InitExt2_8,
     (void *)Detour_VK_InitExt2_9, (void *)Detour_VK_InitExt2_10, (void *)Detour_VK_InitExt2_11,
 };
+
+static NVSDK_NGX_Result ForwardVkInitProject(
+    int idx, const char *project_id, int engine_type, const char *engine_version,
+    const wchar_t *data_path, VkInstance instance, VkPhysicalDevice phys,
+    VkDevice device, int version, const void *feature_info)
+{
+    Hook &h = g_init_project_hooks[idx];
+#if defined(DLSS5VK_HOOK_HOST)
+    HostCaptureNgxInit(instance, phys, device);
 #endif
+    EnterCriticalSection(&g_hook_cs);
+    LiftInitExtHooks();
+    const NVSDK_NGX_Result result = reinterpret_cast<PFN_NGX_VK_Init_ProjectID>(h.target)(
+        project_id, engine_type, engine_version, data_path,
+        instance, phys, device, version, feature_info);
+    if (result == NGX_SUCCESS)
+        CaptureNgxProjectIdentity(project_id, engine_type, engine_version, version);
+    UnliftInitExtHooks();
+    LeaveCriticalSection(&g_hook_cs);
+    return result;
+}
+
+#define INIT_PROJECT_DETOUR(N) \
+    static NVSDK_NGX_Result Detour_VK_InitProject_##N( \
+        const char *p, int e, const char *ev, const wchar_t *d, VkInstance i, \
+        VkPhysicalDevice ph, VkDevice vkd, int v, const void *f) \
+    { return ForwardVkInitProject(N, p, e, ev, d, i, ph, vkd, v, f); }
+INIT_PROJECT_DETOUR(0) INIT_PROJECT_DETOUR(1) INIT_PROJECT_DETOUR(2) INIT_PROJECT_DETOUR(3)
+INIT_PROJECT_DETOUR(4) INIT_PROJECT_DETOUR(5) INIT_PROJECT_DETOUR(6) INIT_PROJECT_DETOUR(7)
+INIT_PROJECT_DETOUR(8) INIT_PROJECT_DETOUR(9) INIT_PROJECT_DETOUR(10) INIT_PROJECT_DETOUR(11)
+
+static void *const g_init_project_detours[kMaxHooks] = {
+    (void *)Detour_VK_InitProject_0, (void *)Detour_VK_InitProject_1,
+    (void *)Detour_VK_InitProject_2, (void *)Detour_VK_InitProject_3,
+    (void *)Detour_VK_InitProject_4, (void *)Detour_VK_InitProject_5,
+    (void *)Detour_VK_InitProject_6, (void *)Detour_VK_InitProject_7,
+    (void *)Detour_VK_InitProject_8, (void *)Detour_VK_InitProject_9,
+    (void *)Detour_VK_InitProject_10, (void *)Detour_VK_InitProject_11,
+};
 
 // ---------------------------------------------------------------------------
 // module discovery: hook every real NGX module that exports the Vulkan evaluate
@@ -847,37 +897,12 @@ static const wchar_t *ModuleName(HMODULE m)
     return s ? s + 1 : buf;
 }
 
-// Lift every patch for good. Reached from BridgeDisable, so a bridge that has
-// given up leaves the game's NGX entry points exactly as it found them.
-static void UnhookArray(Hook *hooks, int n)
-{
-    for (int i = 0; i < n; ++i)
-        if (hooks[i].installed)
-        {
-            HookRestore(&hooks[i]);
-            hooks[i].installed = false;
-        }
-}
-
-static void BridgeUnhookAll()
-{
-    EnterCriticalSection(&g_hook_cs);
-    UnhookArray(g_eval_hooks,    g_eval_count);
-    UnhookArray(g_create_hooks,  g_create_count);
-    UnhookArray(g_create1_hooks, g_create1_count);
-#if defined(DLSS5VK_HOOK_HOST)
-    UnhookArray(g_init_ext_hooks, g_init_ext_count);
-    UnhookArray(g_init_ext2_hooks, g_init_ext2_count);
-#endif
-    LeaveCriticalSection(&g_hook_cs);
-}
-
 // True when an entry point already starts with one of THIS DLL's own jumps: a
 // previous load of the bridge patched it and was unloaded without a chance to
 // unpatch (the reload lands at the same base, so the old jump targets the new
 // detours). Saving those 14 bytes as "original" makes every forwarded call
-// jump back into the detour forever. The module pin in DllMain makes this
-// state unreachable; if some day it is reached anyway, the original bytes are
+// jump back into the detour forever. Explicit initialization pins the module,
+// making this state unreachable; if some day it is reached anyway, the original bytes are
 // simply gone and the only honest move is to leave the export alone.
 static bool EntryIsOwnDetourJump(const void *entry)
 {
@@ -888,10 +913,9 @@ static bool EntryIsOwnDetourJump(const void *entry)
     for (int i = 0; i < kMaxHooks; ++i)
         if (dst == g_eval_detours[i] || dst == g_create_detours[i] || dst == g_create1_detours[i])
             return true;
-#if defined(DLSS5VK_HOOK_HOST)
     for (int i = 0; i < kMaxHooks; ++i)
-        if (dst == g_init_ext_detours[i] || dst == g_init_ext2_detours[i]) return true;
-#endif
+        if (dst == g_init_ext_detours[i] || dst == g_init_ext2_detours[i] ||
+            dst == g_init_project_detours[i]) return true;
     return false;
 }
 
@@ -923,13 +947,11 @@ static void TryHookModule(HMODULE m)
     auto eval   = GetProcAddress(m, "NVSDK_NGX_VULKAN_EvaluateFeature");
     auto create = GetProcAddress(m, "NVSDK_NGX_VULKAN_CreateFeature");
     auto create1 = GetProcAddress(m, "NVSDK_NGX_VULKAN_CreateFeature1");   // optional export
-#if defined(DLSS5VK_HOOK_HOST)
     auto init_ext = GetProcAddress(m, "NVSDK_NGX_VULKAN_Init_Ext");
     auto init_ext2 = GetProcAddress(m, "NVSDK_NGX_VULKAN_Init_Ext2");
-    if ((eval == nullptr || create == nullptr) && init_ext == nullptr && init_ext2 == nullptr) return;
-#else
-    if (eval == nullptr || create == nullptr) return;            // not a real NGX Vulkan module
-#endif
+    auto init_project = GetProcAddress(m, "NVSDK_NGX_VULKAN_Init_ProjectID");
+    if ((eval == nullptr || create == nullptr) && init_ext == nullptr &&
+        init_ext2 == nullptr && init_project == nullptr) return;
 
     EnterCriticalSection(&g_hook_cs);
     if (eval && create)
@@ -939,12 +961,13 @@ static void TryHookModule(HMODULE m)
     }
     if (create1)
         InstallOne(g_create1_hooks, &g_create1_count, g_create1_detours, (void *)create1, "CreateFeature1", m);
-#if defined(DLSS5VK_HOOK_HOST)
     if (init_ext)
         InstallOne(g_init_ext_hooks, &g_init_ext_count, g_init_ext_detours, (void *)init_ext, "Init_Ext", m);
     if (init_ext2)
         InstallOne(g_init_ext2_hooks, &g_init_ext2_count, g_init_ext2_detours, (void *)init_ext2, "Init_Ext2", m);
-#endif
+    if (init_project)
+        InstallOne(g_init_project_hooks, &g_init_project_count, g_init_project_detours,
+                   (void *)init_project, "Init_ProjectID", m);
     LeaveCriticalSection(&g_hook_cs);
 }
 
@@ -960,64 +983,107 @@ static void ScanModules()
     for (DWORD i = 0; i < n; ++i) TryHookModule(mods[i]);
 }
 
-// NGX and the DLSS 5 add-on can load well after the game starts, so scan
-// eagerly for the first minute, then keep a slow watch for the whole session.
+// Normal library loading is intercepted immediately. A bounded scan covers
+// startup modules loaded through lower-level APIs without leaving a permanent
+// polling thread behind.
 static DWORD WINAPI NgxWatch(void *)
 {
-#if defined(DLSS5VK_HOOK_HOST)
-    for (int i = 0; i < 2000 && !g_bridge.disabled; ++i) { ScanModules(); Sleep(5); }
-#else
     for (int i = 0; i < 240 && !g_bridge.disabled; ++i) { ScanModules(); Sleep(250); }
-#endif
-    while (!g_bridge.disabled) { ScanModules(); Sleep(2000); }
     return 0;
 }
 
+// Load the session-local OptiScaler during explicit initialization. The
+// controller assembles this isolated directory before launch.
+static bool LoadLocalOptiScaler()
+{
+    wchar_t path[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(g_self, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if (slash == nullptr) return false;
+    wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"OptiScaler.dll");
+    g_optiscaler_module = GetModuleHandleW(L"OptiScaler.dll");
+    if (g_optiscaler_module)
+    {
+        wchar_t loaded[MAX_PATH] = {};
+        if (!GetModuleFileNameW(g_optiscaler_module, loaded, MAX_PATH) ||
+            _wcsicmp(loaded, path) != 0)
+        {
+            Warn("a different OptiScaler.dll is already loaded from %ls; refusing it", loaded);
+            g_optiscaler_module = nullptr;
+            return false;
+        }
+    }
+    else
+        g_optiscaler_module = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (g_optiscaler_module)
+    {
+        Log("loaded colocated OptiScaler.dll");
+        return true;
+    }
+    Log("could not load colocated OptiScaler.dll (Win32 %lu)", GetLastError());
+    return false;
+}
+
 // ---------------------------------------------------------------------------
+static BOOL CALLBACK InitializeRuntimeOnce(PINIT_ONCE, PVOID, PVOID *)
+{
+    HMODULE pin = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                            reinterpret_cast<LPCWSTR>(&InitializeRuntimeOnce), &pin))
+        return FALSE;
+    InitializeCriticalSection(&g_log_cs);
+    InitializeCriticalSection(&g_hook_cs);
+    InitializeCriticalSection(&g_disp_cs);
+    InitializeCriticalSection(&g_frame_cs);
+#if defined(DLSS5VK_HOOK_HOST)
+    InitializeCriticalSection(&g_iat_cs);
+#endif
+    LogPath();
+    if (!LoadConfig()) return FALSE;
+#if defined(DLSS5VK_HOOK_HOST)
+    const char *host_id = "injected-vulkan";
+    InitializeApplicationRoot();
+#elif defined(DLSS5VK_ADDON_HOST)
+    const char *host_id = "reshade-addon";
+#else
+    const char *host_id = "vulkan-windows";
+#endif
+    if (!g_components.Configure(host_id))
+    {
+        Log("[components] invalid static component composition for host %s", host_id);
+        return FALSE;
+    }
+    if (!LoadLocalOptiScaler()) return FALSE;
+#if defined(DLSS5VK_HOOK_HOST)
+    Log("dlss5-vk-bridge " DLSS5VK_VERSION_STRING " initialized -- injected Vulkan host.");
+    InstallVulkanHooks();
+    CreateThread(nullptr, 0, VulkanHookWatch, nullptr, 0, nullptr);
+    CreateThread(nullptr, 0, NgxWatch, nullptr, 0, nullptr);
+#elif defined(DLSS5VK_ADDON_HOST)
+    Log("dlss5-vk-bridge " DLSS5VK_VERSION_STRING " initialized -- ReShade add-on host.");
+#else
+    Log("dlss5-vk-bridge " DLSS5VK_VERSION_STRING " initialized -- Vulkan layer host.");
+    CreateThread(nullptr, 0, NgxWatch, nullptr, 0, nullptr);
+#endif
+    return TRUE;
+}
+
+static bool EnsureRuntimeInitialized()
+{
+    return InitOnceExecuteOnce(&g_runtime_once, InitializeRuntimeOnce, nullptr, nullptr) != FALSE;
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI DLSSBridgeInitialize(void *)
+{
+    return EnsureRuntimeInitialized() ? 1u : 0u;
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *)
 {
-    if (reason == DLL_PROCESS_ATTACH)
-    {
+    if (reason == DLL_PROCESS_ATTACH) {
         g_self = inst;
-
-        // Pin this module for the life of the process. A DLL that writes jump
-        // patches into other modules and runs a watcher thread cannot be
-        // unloaded safely, but the Vulkan loader unloads implicit layers
-        // whenever the last instance is destroyed -- and a game may create and
-        // destroy several instances back to back (X4: Foundations creates
-        // three). Each unload left the patches jumping into a dead mapping;
-        // each reload then landed at the same base, read its predecessor's
-        // still-installed jump back as the "original bytes", and the first
-        // forwarded evaluate jumped straight back into its own detour forever:
-        // the 0xC00000FD stack overflow in both X4 crash reports. Pinned, every
-        // later FreeLibrary is a no-op, so one load's patches, watcher and
-        // layer state outlive every instance the process creates.
-        HMODULE pin = nullptr;
-        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                           reinterpret_cast<LPCWSTR>(&DllMain), &pin);
-
         DisableThreadLibraryCalls(inst);
-        InitializeCriticalSection(&g_log_cs);
-        InitializeCriticalSection(&g_hook_cs);
-        InitializeCriticalSection(&g_disp_cs);   // owned by the host half
-        InitializeCriticalSection(&g_frame_cs);  // the interop half's slot state
-        LogPath();
-        LoadConfig();
-#if defined(DLSS5VK_HOOK_HOST)
-        Log("dlss5-vk-bridge " DLSS5VK_VERSION_STRING " loaded -- in-process Vulkan hook host + NGX evaluate/create hooks.");
-        CreateThread(nullptr, 0, VulkanHookWatch, nullptr, 0, nullptr);
-        CreateThread(nullptr, 0, NgxWatch, nullptr, 0, nullptr);
-#elif defined(DLSS5VK_PROXY_HOST)
-        Log("dlss5-vk-bridge " DLSS5VK_VERSION_STRING " loaded -- Vulkan loader proxy + NGX Vulkan evaluate/create hooks.");
-        CreateThread(nullptr, 0, NgxWatch, nullptr, 0, nullptr);
-#elif defined(DLSS5VK_ADDON_HOST)
-        // ReShade calls AddonInit next; the NGX hooks start there, once the
-        // registration went through, so a module ReShade rejects stays inert.
-        Log("dlss5-vk-bridge " DLSS5VK_VERSION_STRING " loaded -- ReShade add-on host + NGX Vulkan evaluate/create hooks.");
-#else
-        Log("dlss5-vk-bridge " DLSS5VK_VERSION_STRING " loaded -- Vulkan layer + NGX Vulkan evaluate/create hooks.");
-        CreateThread(nullptr, 0, NgxWatch, nullptr, 0, nullptr);
-#endif
     }
     return TRUE;
 }

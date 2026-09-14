@@ -1,7 +1,6 @@
-# Launch frontends
+# Launch wrappers
 
-Every frontend consumes the same resolved manifest. Desktop, Steam/Proton,
-Sunshine, and Windows integrations may prepare environment variables and mount
-or copy a game-local bundle, but must not alter capture, scheduling, execution,
-or fallback policy. Sunshine is a launcher/capture frontend and is not part of
-the in-process frame path.
+The wrappers invoke the same controller on Linux/Proton and native Windows.
+The controller prepares an isolated session in user state and does not write to
+the game directory or Wine prefix. Launch context does not change capture,
+scheduling, execution, or failure policy.

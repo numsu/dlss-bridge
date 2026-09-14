@@ -1,14 +1,14 @@
 param(
-    [Parameter(Mandatory=$true)][string]$Config,
+    [string]$Config = "",
     [Parameter(Mandatory=$true)][string]$Executable,
     [Parameter(ValueFromRemainingArguments=$true)][string[]]$GameArguments
 )
-$resolved = (Resolve-Path $Config).Path
 $project = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-if (-not $resolved.StartsWith($project, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Configuration must remain inside the project directory: $project"
-}
-$env:DLSS_BRIDGE_CONFIG = $resolved
-$env:DLSS_BRIDGE_FRONTEND = "windows"
-& $Executable @GameArguments
+$controller = Join-Path $project "controller\dlss_bridge.py"
+$arguments = @($controller, "run")
+if ($Config) { $arguments += @("--config", (Resolve-Path $Config).Path) }
+$arguments += "--"
+$arguments += $Executable
+$arguments += $GameArguments
+& python @arguments
 exit $LASTEXITCODE

@@ -14,6 +14,11 @@ static const NVSDK_NGX_Result NGX_FAIL    = (NVSDK_NGX_Result)0xBAD00000;   // N
 static const NVSDK_NGX_Result NGX_FAIL_FEATURE_NOT_SUPPORTED
                                           = (NVSDK_NGX_Result)0xBAD00001;   // NVSDK_NGX_Result_FAIL_FeatureNotSupported
 
+// Public NGX feature identifier used at the feature-create boundary. Keep SDK
+// ABI declarations centralized here rather than scattering numeric IDs through
+// the interception policy.
+static const int NVSDK_NGX_FEATURE_FRAME_GENERATION = 11;
+
 struct NVSDK_NGX_Handle { unsigned int Id; };
 
 struct ID3D11Resource;   // opaque, only used to keep the vtable shape identical

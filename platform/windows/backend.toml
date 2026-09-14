@@ -2,4 +2,4 @@ schema = 1
 kind = "platform"
 id = "windows"
 state = "integrated"
-launch_frontend = "launchers/windows/run.ps1"
+launcher = "launchers/windows/run.ps1"

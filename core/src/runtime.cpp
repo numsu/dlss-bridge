@@ -1,7 +1,9 @@
 #include "dlss_bridge/runtime.hpp"
 
 #include <ctype.h>
+#include <errno.h>
 #include <cmath>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +27,17 @@ static void CopyText(char *dst, size_t size, const char *src)
     dst[size - 1] = 0;
 }
 
+static bool ParseInt(const char *text, int *out)
+{
+    if (!text || !*text || !out) return false;
+    errno = 0;
+    char *end = nullptr;
+    const long value = strtol(text, &end, 10);
+    if (errno || end == text || *end || value < INT_MIN || value > INT_MAX) return false;
+    *out = static_cast<int>(value);
+    return true;
+}
+
 bool ParseAdapterSelector(const char *text, AdapterSelector *out)
 {
     if (!out || !text) return false;
@@ -42,47 +55,48 @@ bool ParseAdapterSelector(const char *text, AdapterSelector *out)
             parsed.kind = SelectorKind::Luid;
             parsed.luid_high = (uint32_t)hi;
             parsed.luid_low = (uint32_t)lo;
-        } else if (!strncmp(text, "uuid:", 5) && text[5]) parsed.kind = SelectorKind::Uuid;
-        else if (!strncmp(text, "pci:", 4) && text[4]) parsed.kind = SelectorKind::Pci;
-        else return false;
+        } else return false;
     }
     *out = parsed;
     return true;
 }
 
 RuntimeConfig::RuntimeConfig()
-    : mode(0), flags(-1), subrects(1), verbose(0), sync(1), game_eval(0),
-      neural_adapter(-1), require_neural_result(1), ring_slots(3),
-      latency_budget_ms(16), execution_mode(ExecutionMode::Auto),
+    : verbose(0),
+      ring_slots(3), neural_pipeline_frames(2),
+      latency_budget_ms(16), gpu_timestamps(1), execution_mode(ExecutionMode::Auto),
       output_transport(OutputTransport::Native), neural_queue_mode(NeuralQueueMode::Split),
-      neural_placement(NeuralPlacement::AfterSr), neural_working_scale(1.0f), neural_passes(1),
-      neural_runtime_variant{}, compute_adapter{}
+      compute_adapter{}
 {
     ParseAdapterSelector("auto", &compute_adapter);
-    CopyText(neural_runtime_variant, sizeof(neural_runtime_variant), "stable");
 }
 
 bool RuntimeConfig::Apply(const char *key, const char *value)
 {
     if (!key || !value) return false;
-    const int n = atoi(value);
-    if (EqualNoCase(key, "mode")) mode = n;
-    else if (EqualNoCase(key, "flags")) flags = n;
-    else if (EqualNoCase(key, "subrects")) subrects = n;
-    else if (EqualNoCase(key, "verbose")) verbose = n;
-    else if (EqualNoCase(key, "sync")) sync = n;
-    else if (EqualNoCase(key, "game_eval")) game_eval = n;
-    else if (EqualNoCase(key, "neural_adapter")) {
-        neural_adapter = n;
-        if (n >= 0) {
-            char selector[32];
-            snprintf(selector, sizeof(selector), "index:%d", n);
-            ParseAdapterSelector(selector, &compute_adapter);
-        }
+    int n = 0;
+    if (EqualNoCase(key, "verbose")) {
+        if (!ParseInt(value, &n) || (n != 0 && n != 1)) return false;
+        verbose = n;
     }
-    else if (EqualNoCase(key, "require_neural_result")) require_neural_result = n != 0;
-    else if (EqualNoCase(key, "ring_slots")) ring_slots = n;
-    else if (EqualNoCase(key, "latency_budget_ms")) latency_budget_ms = n;
+    else if (EqualNoCase(key, "ring_slots")) {
+        if (!ParseInt(value, &n)) return false;
+        if (n < 2 || n > 8) return false;
+        ring_slots = n;
+    }
+    else if (EqualNoCase(key, "neural_pipeline_frames")) {
+        if (!ParseInt(value, &n)) return false;
+        if (n < 1 || n > 7) return false;
+        neural_pipeline_frames = n;
+    }
+    else if (EqualNoCase(key, "latency_budget_ms")) {
+        if (!ParseInt(value, &n) || n < 1 || n > 125) return false;
+        latency_budget_ms = n;
+    }
+    else if (EqualNoCase(key, "gpu_timestamps")) {
+        if (!ParseInt(value, &n) || (n != 0 && n != 1)) return false;
+        gpu_timestamps = n;
+    }
     else if (EqualNoCase(key, "execution_mode")) {
         if (EqualNoCase(value, "auto")) execution_mode = ExecutionMode::Auto;
         else if (EqualNoCase(value, "same_gpu")) execution_mode = ExecutionMode::SameGpu;
@@ -99,31 +113,16 @@ bool RuntimeConfig::Apply(const char *key, const char *value)
         else if (EqualNoCase(value, "unified")) neural_queue_mode = NeuralQueueMode::Unified;
         else return false;
     }
-    else if (EqualNoCase(key, "neural_placement")) {
-        if (EqualNoCase(value, "after_sr")) neural_placement = NeuralPlacement::AfterSr;
-        else if (EqualNoCase(value, "before_sr")) neural_placement = NeuralPlacement::BeforeSr;
-        else if (EqualNoCase(value, "deferred_dlss")) neural_placement = NeuralPlacement::DeferredDlss;
-        else return false;
-    }
-    else if (EqualNoCase(key, "neural_working_scale")) {
-        char *end = nullptr;
-        const float scale = strtof(value, &end);
-        if (end == value || *end != 0 || !std::isfinite(scale) || scale < 0.25f || scale > 2.0f) return false;
-        neural_working_scale = scale;
-    }
-    else if (EqualNoCase(key, "neural_passes")) {
-        if (n < 1 || n > 3) return false;
-        neural_passes = n;
-    }
-    else if (EqualNoCase(key, "neural_runtime_variant")) {
-        if (!*value || strlen(value) >= sizeof(neural_runtime_variant)) return false;
-        for (const char *p = value; *p; ++p)
-            if (!(isalnum((unsigned char)*p) || *p == '_' || *p == '-' || *p == '.')) return false;
-        CopyText(neural_runtime_variant, sizeof(neural_runtime_variant), value);
-    }
     else if (EqualNoCase(key, "compute_adapter")) return ParseAdapterSelector(value, &compute_adapter);
     else return false;
     return true;
+}
+
+bool RuntimeConfig::Valid() const
+{
+    return ring_slots >= 2 && ring_slots <= 8 &&
+        neural_pipeline_frames >= 1 && neural_pipeline_frames < ring_slots &&
+        latency_budget_ms >= 1 && latency_budget_ms <= 125;
 }
 
 const char *ExecutionModeName(ExecutionMode mode)
@@ -143,20 +142,6 @@ const char *OutputTransportName(OutputTransport format)
 const char *NeuralQueueModeName(NeuralQueueMode mode)
 {
     return mode == NeuralQueueMode::Unified ? "unified" : "split";
-}
-
-const char *NeuralPlacementName(NeuralPlacement placement)
-{
-    switch (placement) {
-    case NeuralPlacement::BeforeSr: return "before_sr";
-    case NeuralPlacement::DeferredDlss: return "deferred_dlss";
-    default: return "after_sr";
-    }
-}
-
-bool IsStrictNeural(const RuntimeConfig &cfg)
-{
-    return cfg.require_neural_result != 0;
 }
 
 Scheduler::Scheduler(FrameSlot *slots, size_t slot_count)

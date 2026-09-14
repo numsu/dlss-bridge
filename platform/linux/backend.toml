@@ -2,4 +2,4 @@ schema = 1
 kind = "platform"
 id = "native-linux"
 state = "controller_only"
-launch_frontend = "launchers/linux-desktop/run.sh"
+launcher = "launchers/linux-desktop/run.sh"

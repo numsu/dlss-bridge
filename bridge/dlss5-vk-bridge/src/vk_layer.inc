@@ -39,10 +39,7 @@ static void     BridgeDeviceLost(VkDevice dev);
 // The layer sees a submit after it went down the chain, so it can queue a
 // retire fence behind it; it enables external_semaphore_win32 itself, so the
 // D3D12 fences import as timeline semaphores; and with its own command pool it
-// can run the asynchronous copy-back (sync=0).
 static const bool kHostSubmitsBehindGame = true;
-static const bool kHostHasTimelineImport = true;
-static const bool kHostAsyncFallback     = true;
 
 #include "vk_dispatch.inc"
 
@@ -521,7 +518,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL dlss5vk_QueueSubmit(
     if (g_internal_submit) return d->QueueSubmit(queue, count, submits, fence);
 
     const uint32_t slots = BridgeWantsSubmitMatch() ? BridgeMatchSubmit(count, submits) : 0;
+    const ULONGLONG submit_started = GetTickCount64();
     VkResult r = d->QueueSubmit(queue, count, submits, fence);
+    const ULONGLONG submit_elapsed = GetTickCount64() - submit_started;
+    if (submit_elapsed >= 8)
+        Log("[vk-submit] game GPU vkQueueSubmit blocked %llums family=%u submits=%u matched-slots=0x%X",
+            (unsigned long long)submit_elapsed, family, count, slots);
     if (slots)
         BridgeOnGameSubmitDone(queue, family, tracked, slots, r == VK_SUCCESS);
     else if (r == VK_SUCCESS && BridgeWantsSubmitMatch())
@@ -538,7 +540,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL dlss5vk_QueueSubmit2(
     if (g_internal_submit) return d->QueueSubmit2(queue, count, submits, fence);
 
     const uint32_t slots = BridgeWantsSubmitMatch() ? BridgeMatchSubmit2(count, submits) : 0;
+    const ULONGLONG submit_started = GetTickCount64();
     VkResult r = d->QueueSubmit2(queue, count, submits, fence);
+    const ULONGLONG submit_elapsed = GetTickCount64() - submit_started;
+    if (submit_elapsed >= 8)
+        Log("[vk-submit] game GPU vkQueueSubmit2 blocked %llums family=%u submits=%u matched-slots=0x%X",
+            (unsigned long long)submit_elapsed, family, count, slots);
     if (slots)
         BridgeOnGameSubmitDone(queue, family, tracked, slots, r == VK_SUCCESS);
     else if (r == VK_SUCCESS && BridgeWantsSubmitMatch())
@@ -648,6 +655,7 @@ dlss5vk_GetInstanceProcAddr(VkInstance instance, const char *pName)
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pVersionStruct)
 {
+    if (!EnsureRuntimeInitialized()) return VK_ERROR_INITIALIZATION_FAILED;
     if (pVersionStruct == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
     if (pVersionStruct->loaderLayerInterfaceVersion > 2)
         pVersionStruct->loaderLayerInterfaceVersion = 2;

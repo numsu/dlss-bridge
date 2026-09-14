@@ -1,7 +1,0 @@
-schema = 1
-kind = "host"
-id = "windows-proxy"
-state = "integrated"
-platforms = ["windows", "proton"]
-apis = ["vulkan"]
-implementation = "bridge/dlss5-vk-bridge/src/hook_host.inc"

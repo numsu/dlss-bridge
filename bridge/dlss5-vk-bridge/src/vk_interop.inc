@@ -6,12 +6,9 @@
 // VkCommandBuffer. We forward the game's evaluate untouched, then record the
 // input copies (game Color/Depth/MV -> the shared textures) straight into that
 // same command buffer, so they run as part of the game's own submit. When the
-// game submits, the vkQueueSubmit hook does the rest on the same queue: a
-// signal-only submit raises fence_in, the D3D12 evaluate waits on it and
-// signals fence_out (this is where a DLSS 5 add-on inserts its pass), and a
-// final copy-back submit waits fence_out and writes the shared Output into the
-// game's own Output image. Two D3D12 fences imported as timeline semaphores
-// (sem_in / sem_out) carry the ordering across the API boundary.
+// game submits, its command buffer signals a Vulkan event, waits while the
+// worker executes the private D3D12 pass, and copies the completed output back
+// before the game's downstream rendering consumes it.
 //
 // Layouts: DLSS for Vulkan requires the resources it is handed to be in
 // VK_IMAGE_LAYOUT_GENERAL, so the input copies transition the game images
@@ -23,6 +20,13 @@
 
 // ---- cached dispatch / device state ---------------------------------------
 static DeviceDispatch               *g_disp;        // game device dispatch
+
+static void BridgeReleaseVkOutputEarly(int transport_slot)
+{
+    if (g_disp && transport_slot >= 0 && transport_slot < ActiveFrameCount())
+        g_disp->SetEvent(g_bridge.device,
+                         g_bridge.vkframe[transport_slot].ev_output);
+}
 static VkPhysicalDeviceMemoryProperties g_mem_props;
 
 static UINT umin(UINT a, UINT b) { return a < b ? a : b; }
@@ -222,86 +226,145 @@ static bool VkImportSharedTex(int slot)
     return true;
 }
 
+static UINT DxgiBytesPerTexel(DXGI_FORMAT fmt);
+
+static void VkReleaseCrossDirection(int direction)
+{
+    for (int slot = 0; slot < Bridge::kMaxFrames; ++slot)
+    {
+        CrossFrameTransport &fr = g_mgpu.frame[slot];
+        if (fr.cross_vk[direction])
+        {
+            g_disp->DestroyBuffer(g_bridge.device, fr.cross_vk[direction], nullptr);
+            fr.cross_vk[direction] = VK_NULL_HANDLE;
+        }
+        if (fr.cross_vk_memory[direction])
+        {
+            g_disp->FreeMemory(g_bridge.device, fr.cross_vk_memory[direction], nullptr);
+            fr.cross_vk_memory[direction] = VK_NULL_HANDLE;
+        }
+    }
+}
+
 static bool VkImportCrossBuffer(int direction)
 {
     const bool upload = direction == CROSS_UPLOAD;
     bool &active = upload ? g_mgpu.direct_vulkan_upload : g_mgpu.direct_vulkan_download;
     active = false;
-    if (!g_mgpu.active || !g_mgpu.host_memory[direction] ||
-        !g_disp->GetMemoryHostPointerPropertiesEXT)
+    if (!g_mgpu.active || !g_disp->GetMemoryHostPointerPropertiesEXT)
     {
         Log("[vk] direct cross-buffer %s unavailable; retaining the D3D12 game-adapter copy",
             upload ? "input" : "output");
         return false;
     }
 
+    const int first_plane = upload ? SLOT_COLOR : SLOT_OUTPUT;
+    const int last_plane = upload ? SLOT_MV : SLOT_OUTPUT;
+    for (int plane = first_plane; plane <= last_plane; ++plane)
+        if (DxgiBytesPerTexel(g_mgpu.plane[plane].format) == 0)
+        {
+            Log("[vk] direct %s disabled: %s plane DXGI format %u has no exact byte mapping",
+                upload ? "upload" : "download", kSlotName[plane],
+                (unsigned)g_mgpu.plane[plane].format);
+            return false;
+        }
+
     VkExternalMemoryBufferCreateInfo ext = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
     ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
     VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     bci.pNext = &ext;
     bci.size = g_mgpu.host_bytes;
-    bci.usage = upload ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.usage = upload ? VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                       : (VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (g_disp->CreateBuffer(g_bridge.device, &bci, nullptr, &g_mgpu.cross_vk[direction]) != VK_SUCCESS)
-    {
-        Log("[vk] direct %s cross-buffer vkCreateBuffer failed; retaining the D3D12 copy",
-            upload ? "input" : "output");
-        return false;
-    }
 
-    VkMemoryRequirements req = {};
-    g_disp->GetBufferMemoryRequirements(g_bridge.device, g_mgpu.cross_vk[direction], &req);
-    VkMemoryHostPointerPropertiesEXT hp = { VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
-    if (g_disp->GetMemoryHostPointerPropertiesEXT(
-            g_bridge.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-            g_mgpu.host_memory[direction], &hp) != VK_SUCCESS ||
-        !(hp.memoryTypeBits & req.memoryTypeBits))
+    for (int slot = 0; slot < ActiveFrameCount(); ++slot)
     {
-        Log("[vk] %s host pointer is not importable; retaining the D3D12 copy",
-            upload ? "input" : "output");
-        return false;
-    }
+        CrossFrameTransport &fr = g_mgpu.frame[slot];
+        void *import_pointer = nullptr;
+        if (upload)
+        {
+            fr.vulkan_input_memory = VirtualAlloc(nullptr, g_mgpu.host_bytes,
+                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (fr.vulkan_input_memory)
+                memset(fr.vulkan_input_memory, 0, g_mgpu.host_bytes);
+            import_pointer = fr.vulkan_input_memory;
+        }
+        else
+        {
+            fr.vulkan_output_memory = VirtualAlloc(nullptr, g_mgpu.host_bytes,
+                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (fr.vulkan_output_memory)
+                memset(fr.vulkan_output_memory, 0, g_mgpu.host_bytes);
+            import_pointer = fr.vulkan_output_memory;
+        }
+        if (!import_pointer ||
+            g_disp->CreateBuffer(g_bridge.device, &bci, nullptr,
+                                 &fr.cross_vk[direction]) != VK_SUCCESS)
+        {
+            Log("[vk] frame %d direct %s allocation/buffer creation failed", slot,
+                upload ? "upload" : "download");
+            VkReleaseCrossDirection(direction);
+            return false;
+        }
 
-    VkImportMemoryHostPointerInfoEXT imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
-    imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-    imp.pHostPointer = g_mgpu.host_memory[direction];
-    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    mai.pNext = &imp;
-    mai.allocationSize = req.size;
-    mai.memoryTypeIndex = PickMemType(hp.memoryTypeBits & req.memoryTypeBits,
-                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-    if (g_disp->AllocateMemory(g_bridge.device, &mai, nullptr,
-                               &g_mgpu.cross_vk_memory[direction]) != VK_SUCCESS ||
-        g_disp->BindBufferMemory(g_bridge.device, g_mgpu.cross_vk[direction],
-                                 g_mgpu.cross_vk_memory[direction], 0) != VK_SUCCESS)
-    {
-        Log("[vk] %s cross-buffer import/bind failed; retaining the D3D12 copy",
-            upload ? "input" : "output");
-        return false;
+        VkMemoryRequirements req = {};
+        g_disp->GetBufferMemoryRequirements(g_bridge.device, fr.cross_vk[direction], &req);
+        VkMemoryHostPointerPropertiesEXT hp = { VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
+        if (req.size > g_mgpu.host_bytes ||
+            g_disp->GetMemoryHostPointerPropertiesEXT(
+                g_bridge.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                import_pointer, &hp) != VK_SUCCESS ||
+            !(hp.memoryTypeBits & req.memoryTypeBits))
+        {
+            Log("[vk] frame %d %s host allocation is not importable (need=%llu have=%llu)",
+                slot, upload ? "upload" : "download", (unsigned long long)req.size,
+                (unsigned long long)g_mgpu.host_bytes);
+            VkReleaseCrossDirection(direction);
+            return false;
+        }
+
+        const uint32_t type_bits = hp.memoryTypeBits & req.memoryTypeBits;
+        const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        uint32_t memory_type = g_mem_props.memoryTypeCount;
+        for (uint32_t i = 0; i < g_mem_props.memoryTypeCount; ++i)
+            if ((type_bits & (1u << i)) &&
+                (g_mem_props.memoryTypes[i].propertyFlags & wanted) == wanted)
+            { memory_type = i; break; }
+        if (memory_type == g_mem_props.memoryTypeCount)
+        {
+            Log("[vk] frame %d direct %s has no %s host memory type", slot,
+                upload ? "upload" : "download", "coherent");
+            VkReleaseCrossDirection(direction);
+            return false;
+        }
+
+        VkImportMemoryHostPointerInfoEXT imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
+        imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        imp.pHostPointer = import_pointer;
+        VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        mai.pNext = &imp;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = memory_type;
+        if (g_disp->AllocateMemory(g_bridge.device, &mai, nullptr,
+                                   &fr.cross_vk_memory[direction]) != VK_SUCCESS ||
+            g_disp->BindBufferMemory(g_bridge.device, fr.cross_vk[direction],
+                                     fr.cross_vk_memory[direction], 0) != VK_SUCCESS)
+        {
+            Log("[vk] frame %d %s cross-buffer import/bind failed", slot,
+                upload ? "upload" : "download");
+            VkReleaseCrossDirection(direction);
+            return false;
+        }
     }
     active = true;
-    Log("[vk] direct neural-%s buffer imported; GPU 0 D3D12 %s copy removed",
-        upload ? "input" : "output", upload ? "input" : "output");
-    return true;
-}
-
-static bool VkImportFence(VkSemaphore *out, HANDLE h, const char *name)
-{
-    VkDevice dev = g_bridge.device;
-    VkSemaphoreTypeCreateInfo st = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
-    st.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-    VkSemaphoreCreateInfo sc = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    sc.pNext = &st;
-    if (g_disp->CreateSemaphore(dev, &sc, nullptr, out) != VK_SUCCESS)
-    { Log("[vk] %s: vkCreateSemaphore(timeline) failed", name); return false; }
-
-    VkImportSemaphoreWin32HandleInfoKHR imp = { VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
-    imp.semaphore  = *out;
-    imp.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
-    imp.handle     = h;
-    if (g_disp->ImportSemaphoreWin32HandleKHR(dev, &imp) != VK_SUCCESS)
-    { Log("[vk] %s: vkImportSemaphoreWin32HandleKHR failed", name); return false; }
-    Log("[vk] %s imported as timeline semaphore %p", name, (void *)*out);
+    if (upload)
+        Log("[vk] %d coherent neural-input producers imported; D3D12 uses native upload staging",
+            ActiveFrameCount());
+    else
+        Log("[vk] %d coherent Vulkan output consumers imported; D3D12 uses native readback staging",
+            ActiveFrameCount());
     return true;
 }
 
@@ -374,14 +437,11 @@ static bool EnsureVkDevice(VkCommandBuffer cmd)
 
 static void VkReleaseSharedTex(int slot);
 
-// ---- per-frame command resources (bridge-owned) ---------------------------
-// The retire fences are device-level and serve both paths. The command pool
-// (holding the async copy-back buffers) needs the queue family the DLSS pass
-// is submitted on, which is only known once its submit has been matched.
+// ---- per-frame retirement resources ---------------------------------------
 static bool EnsureRetireFences()
 {
     VkDevice dev = g_bridge.device;
-    for (int i = 0; i < Bridge::kFrames; ++i)
+    for (int i = 0; i < ActiveFrameCount(); ++i)
     {
         if (g_bridge.vkframe[i].retire) continue;
         VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
@@ -393,41 +453,14 @@ static bool EnsureRetireFences()
     }
     return true;
 }
-static bool EnsureVkFrames(uint32_t family)
-{
-    if (g_bridge.vk_ready) return true;
-    if (!EnsureRetireFences()) return false;
-    VkDevice dev = g_bridge.device;
-    g_bridge.vk_queue_family = family;
-
-    VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    pci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    pci.queueFamilyIndex = family;
-    if (g_disp->CreateCommandPool(dev, &pci, nullptr, &g_bridge.vk_pool) != VK_SUCCESS)
-    { Log("[vk] vkCreateCommandPool failed"); return false; }
-
-    for (int i = 0; i < Bridge::kFrames; ++i)
-    {
-        VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-        ai.commandPool        = g_bridge.vk_pool;
-        ai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        ai.commandBufferCount = 1;
-        if (g_disp->AllocateCommandBuffers(dev, &ai, &g_bridge.vkframe[i].copy_out) != VK_SUCCESS)
-        { Log("[vk] vkAllocateCommandBuffers failed"); return false; }
-    }
-    g_bridge.vk_ready = true;
-    Log("[vk] per-frame command resources ready (family %u)", family);
-    return true;
-}
-
 // ---- the sync-handoff worker -----------------------------------------------
-// Why a sandwich at all: the async path submitted the copy-back as its own
-// fence-chained submit AFTER the game's. That is provably too late -- the
+// The handoff must live inside the game command buffer. A copy-back submitted
+// after the game work is too late because the
 // game's post-processing reads its DLSS output in the same command buffer,
-// right after the evaluate, so every async copy-back landed on pixels nobody
+// right after the evaluate, so a late copy-back landed on pixels nobody
 // would ever read again ("2000 frames bridged", zero visible change). The
 // evaluate hook sits exactly between the game's evaluate and those consumers,
-// so with sync=1 it records the wait and the copy-back INLINE at that spot:
+// so the hook records the wait and copy-back inline at that spot:
 //
 //   game cmd buffer: ... game evaluate | input copies | SetEvent(ev_inputs)
 //                    | WaitEvents(ev_output) | copy-back | SetEvent(ev_done)
@@ -454,26 +487,23 @@ static DWORD         g_worker_tid;
 static HANDLE        g_worker_wake;         // auto-reset: slots were queued
 static HANDLE        g_worker_fence_event;  // the worker's own fence_out wait
 static volatile LONG g_worker_stop;
-static bool          g_worker_healthy;      // last JUDGED frame was a clean 0;
-                                            // gates game_eval=0 skipping. Only
-                                            // touched on the game's thread.
 static volatile LONG g_release_deferred;    // teardown was requested ON the worker
-static bool          g_sync_active;
-static bool          g_sync_init_done;
+static bool          g_handoff_ready;
+static bool          g_handoff_init_done;
 
 static void ApplyFrameScalars(const FrameScalars *s);
 
 // Recording-order queue of slots: single producer (the game's thread, under
 // g_frame_cs), single consumer (the worker). A slot is queued at most once
 // while in flight, so kFrames + 1 entries can never overflow.
-static int           g_wq[Bridge::kFrames + 1];
+static int           g_wq[Bridge::kMaxFrames + 1];
 static volatile LONG g_wq_head;             // consumer
 static volatile LONG g_wq_tail;             // producer
 static void WorkQueuePush(int slot)
 {
     g_wq[g_wq_tail] = slot;
     MemoryBarrier();
-    g_wq_tail = (g_wq_tail + 1) % (Bridge::kFrames + 1);
+    g_wq_tail = (g_wq_tail + 1) % (ActiveFrameCount() + 1);
     SetEvent(g_worker_wake);
 }
 static int WorkQueuePop()
@@ -481,7 +511,7 @@ static int WorkQueuePop()
     if (g_wq_head == g_wq_tail) return -1;
     const int slot = g_wq[g_wq_head];
     MemoryBarrier();
-    g_wq_head = (g_wq_head + 1) % (Bridge::kFrames + 1);
+    g_wq_head = (g_wq_head + 1) % (ActiveFrameCount() + 1);
     return slot;
 }
 
@@ -509,7 +539,7 @@ static const ULONGLONG kInputsTimeoutMs = 3000;
 static bool WorkerLaterSlotReached(int slot)
 {
     const UINT64 mine = g_bridge.vkframe[slot].value;
-    for (int i = 0; i < Bridge::kFrames; ++i)
+    for (int i = 0; i < ActiveFrameCount(); ++i)
     {
         if (i == slot) continue;
         const Bridge::VkFrame &o = g_bridge.vkframe[i];
@@ -561,7 +591,7 @@ static void WorkerRunSlot(int slot)
         // The D3D12 fence is the same object Vulkan imported; a CPU-side
         // signal satisfies the queue Wait inside the evaluate core.
         g_bridge.fence_in->Signal(v);
-        D3D12RunEvaluateCore(v, &result, true);
+        D3D12RunEvaluateCore(v, &result, fr.transport_slot);
         if (result == 0 && g_bridge.fence_out->GetCompletedValue() < v)
         {
             g_bridge.fence_out->SetEventOnCompletion(v, g_worker_fence_event);
@@ -598,40 +628,40 @@ static DWORD WINAPI BridgeWorkerProc(void *)
 // Events and the worker are device-level, so unlike the command pool (which
 // needs the queue family, known only at submit time) they can be created at
 // hook time -- they must be, the sandwich is recorded before the first submit.
-static void EnsureSyncObjects()
+static void EnsureInFrameHandoff()
 {
-    if (g_sync_init_done || !g_cfg.sync) return;
-    g_sync_init_done = true;
+    if (g_handoff_init_done) return;
+    g_handoff_init_done = true;
 
     if (!g_disp->CreateEvent || !g_disp->DestroyEvent || !g_disp->SetEvent || !g_disp->ResetEvent ||
         !g_disp->GetEventStatus || !g_disp->CmdSetEvent || !g_disp->CmdWaitEvents)
-    { Log("[bridge] device dispatch lacks VkEvent entry points; falling back to the async copy-back"); return; }
+    { Warn("device dispatch lacks the VkEvent operations required for the in-frame handoff"); return; }
 
     VkDevice dev = g_bridge.device;
-    for (int i = 0; i < Bridge::kFrames; ++i)
+    for (int i = 0; i < ActiveFrameCount(); ++i)
     {
         VkEventCreateInfo eci = { VK_STRUCTURE_TYPE_EVENT_CREATE_INFO };
         Bridge::VkFrame &fr = g_bridge.vkframe[i];
         if (g_disp->CreateEvent(dev, &eci, nullptr, &fr.ev_inputs) != VK_SUCCESS ||
             g_disp->CreateEvent(dev, &eci, nullptr, &fr.ev_output) != VK_SUCCESS ||
             g_disp->CreateEvent(dev, &eci, nullptr, &fr.ev_done)   != VK_SUCCESS)
-        { Log("[bridge] vkCreateEvent failed; falling back to the async copy-back"); return; }
+        { Warn("vkCreateEvent failed while creating the in-frame handoff"); return; }
     }
     g_wq_head = g_wq_tail = 0;
     g_worker_wake        = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_worker_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_worker_wake || !g_worker_fence_event)
-    { Log("[bridge] worker event creation failed; falling back to the async copy-back"); return; }
+    { Warn("worker event creation failed while creating the in-frame handoff"); return; }
     InterlockedExchange(&g_worker_stop, 0);   // a previous device's teardown left it set
     g_worker_thread = CreateThread(nullptr, 0, BridgeWorkerProc, nullptr, 0, &g_worker_tid);
     if (g_worker_thread == nullptr)
-    { Log("[bridge] worker thread creation failed; falling back to the async copy-back"); return; }
+    { Warn("worker thread creation failed while creating the in-frame handoff"); return; }
     if (SetThreadPriority(g_worker_thread, THREAD_PRIORITY_HIGHEST))
-        Log("[bridge] sync worker raised to high priority");
+        Log("[bridge] handoff worker raised to high priority");
     else
-        Log("[bridge] sync worker priority raise was unavailable (error %lu)", GetLastError());
-    g_sync_active = true;
-    Log("[bridge] synchronous in-frame handoff active (sync=1): the game's frame now waits "
+        Log("[bridge] handoff worker priority raise was unavailable (error %lu)", GetLastError());
+    g_handoff_ready = true;
+    Log("[bridge] in-frame handoff active: the game's frame waits "
         "for the D3D12 result before its own post-processing reads the output");
 }
 
@@ -675,7 +705,7 @@ static VkDescriptorSetLayout g_depth_dsl;
 static VkPipelineLayout      g_depth_pl;
 static VkPipeline            g_depth_pipe;
 static VkDescriptorPool      g_depth_pool;
-static VkDescriptorSet       g_depth_desc[Bridge::kFrames];
+static VkDescriptorSet       g_depth_desc[Bridge::kMaxFrames];
 static VkImageView           g_depth_store_view;   // storage view of the shared image
 static bool                  g_depth_pipe_failed;
 
@@ -693,7 +723,7 @@ static void DestroyDepthPipeline()
     { g_disp->DestroyDescriptorSetLayout(dev, g_depth_dsl, nullptr); g_depth_dsl = VK_NULL_HANDLE; }
     if (g_depth_sampler && g_disp->DestroySampler)
     { g_disp->DestroySampler(dev, g_depth_sampler, nullptr); g_depth_sampler = VK_NULL_HANDLE; }
-    for (int i = 0; i < Bridge::kFrames; ++i) g_depth_desc[i] = VK_NULL_HANDLE;
+    for (int i = 0; i < ActiveFrameCount(); ++i) g_depth_desc[i] = VK_NULL_HANDLE;
 }
 
 static bool EnsureDepthPipeline()
@@ -751,20 +781,20 @@ static bool EnsureDepthPipeline()
         if (pr != VK_SUCCESS || g_depth_pipe == VK_NULL_HANDLE) goto bad;
 
         VkDescriptorPoolSize ps[2] = {
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, Bridge::kFrames },
-            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          Bridge::kFrames },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ActiveFrameCount() },
+            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          ActiveFrameCount() },
         };
         VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        dpi.maxSets       = Bridge::kFrames;
+        dpi.maxSets       = ActiveFrameCount();
         dpi.poolSizeCount = 2;
         dpi.pPoolSizes    = ps;
         if (g_disp->CreateDescriptorPool(dev, &dpi, nullptr, &g_depth_pool) != VK_SUCCESS) goto bad;
 
-        VkDescriptorSetLayout layouts[Bridge::kFrames];
-        for (int i = 0; i < Bridge::kFrames; ++i) layouts[i] = g_depth_dsl;
+        VkDescriptorSetLayout layouts[Bridge::kMaxFrames];
+        for (int i = 0; i < ActiveFrameCount(); ++i) layouts[i] = g_depth_dsl;
         VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
         dai.descriptorPool     = g_depth_pool;
-        dai.descriptorSetCount = Bridge::kFrames;
+        dai.descriptorSetCount = ActiveFrameCount();
         dai.pSetLayouts        = layouts;
         if (g_disp->AllocateDescriptorSets(dev, &dai, g_depth_desc) != VK_SUCCESS) goto bad;
     }
@@ -782,7 +812,8 @@ bad:
 // Called from the evaluate hook when the geometry / formats change. Creates the
 // D3D12 shared textures, imports them into Vulkan, binds them into the private
 // NGX parameter block, builds the DLSS feature and the depth staging buffers.
-static bool RebuildResources(const NVSDK_NGX_Parameter *p, const GameRes &col,
+static bool RebuildResources(const FeatureCreateContract &contract,
+                             const NVSDK_NGX_Parameter *p, const GameRes &col,
                              const GameRes &out, const GameRes &dep, const GameRes &mv)
 {
     Log("[bridge] (re)building resources for %ux%u -> %ux%u", col.w, col.h, out.w, out.h);
@@ -794,7 +825,7 @@ static bool RebuildResources(const NVSDK_NGX_Parameter *p, const GameRes &col,
     // may die with the old contract.
     D3D12DrainGpu();
     if (g_disp && g_bridge.device)
-        for (int i = 0; i < Bridge::kFrames; ++i)
+        for (int i = 0; i < ActiveFrameCount(); ++i)
         {
             Bridge::VkFrame &fr = g_bridge.vkframe[i];
             if (fr.submitted && fr.retire)
@@ -806,8 +837,18 @@ static bool RebuildResources(const NVSDK_NGX_Parameter *p, const GameRes &col,
             { g_disp->DestroyImageView(g_bridge.device, fr.game_depth_view, nullptr); fr.game_depth_view = VK_NULL_HANDLE; }
         }
     g_bridge.frame_ready = false;
+    if (g_bridge.feature && g_bridge.release_feature)
+    { g_bridge.release_feature(g_bridge.feature); g_bridge.feature = nullptr; }
+    if (g_depth_store_view && g_disp->DestroyImageView)
+    { g_disp->DestroyImageView(g_bridge.device, g_depth_store_view, nullptr); g_depth_store_view = VK_NULL_HANDLE; }
+    for (int direction = 0; direction < CROSS_COUNT; ++direction)
+        VkReleaseCrossDirection(direction);
     D3D12ReleaseMultiGpuFrameResources();
     for (int i = 0; i < SLOT_COUNT; ++i) VkReleaseSharedTex(i);
+    g_mgpu.direct_vulkan_upload = false;
+    g_mgpu.direct_vulkan_download = false;
+    if (InterlockedExchange(&g_neural_only_latched, 0) != 0)
+        Log("[policy] resource contract changed; warming every new transport slot before neural-only relatches");
 
     g_bridge.width  = col.w; g_bridge.height = col.h;
     g_bridge.out_width = out.w; g_bridge.out_height = out.h;
@@ -858,8 +899,11 @@ static bool RebuildResources(const NVSDK_NGX_Parameter *p, const GameRes &col,
     if (!D3D12BuildCrossBuffer()) { BridgeFail("cross-adapter buffer"); return false; }
     if (g_mgpu.active)
     {
-        (void)VkImportCrossBuffer(CROSS_UPLOAD);
-        (void)VkImportCrossBuffer(CROSS_DOWNLOAD);
+        const bool direct_upload = VkImportCrossBuffer(CROSS_UPLOAD);
+        const bool direct_download = VkImportCrossBuffer(CROSS_DOWNLOAD);
+        Log("[transport] secondary-GPU route: upload=%s download=%s",
+            direct_upload ? "Vulkan host import" : "D3D12 game-adapter helper copy",
+            direct_download ? "Vulkan host import" : "D3D12 game-adapter helper copy");
     }
 
     // storage view of the shared depth image, for the compute conversion pass
@@ -877,11 +921,11 @@ static bool RebuildResources(const NVSDK_NGX_Parameter *p, const GameRes &col,
     for (int i = 0; i < SLOT_COUNT; ++i)
         g_bridge.params->Set(kSlotKey[i], NeuralTex(i));
 
-    for (int i = 0; i < Bridge::kFrames; ++i)
+    for (int i = 0; i < ActiveFrameCount(); ++i)
         if (!EnsureDepthScratch(i, (VkDeviceSize)plan[SLOT_DEPTH].w * plan[SLOT_DEPTH].h * 4))
         { Log("[vk] depth staging alloc failed"); BridgeFail("depth staging"); return false; }
 
-    if (!D3D12CreateDlssFeature(p)) { BridgeFail("create feature"); return false; }
+    if (!D3D12CreateDlssFeature(contract)) { BridgeFail("create feature from captured contract"); return false; }
 
     g_bridge.game_fmt[SLOT_COLOR] = col.fmt;
     g_bridge.game_fmt[SLOT_OUTPUT] = out.fmt;
@@ -911,7 +955,7 @@ static bool ContractChanged(const GameRes &col, const GameRes &out,
 // is optional (MV scale, exposure), and OR the reset flag with our own.
 // Captured on the game's thread at record time and applied to the private
 // parameter block right before the D3D12 evaluate that consumes them -- which
-// in the sync sandwich runs on the worker, possibly after the next frame has
+// in the in-frame handoff runs on the worker, possibly after the next frame has
 // already been recorded.
 static const char *const kSubrectBaseKeys[8] = {
     "DLSS.Input.Color.Subrect.Base.X",  "DLSS.Input.Color.Subrect.Base.Y",
@@ -1001,26 +1045,75 @@ static void ApplyFrameScalars(const FrameScalars *s)
 static void VkImgBarrier(VkCommandBuffer c, VkImage img, VkImageAspectFlags aspect,
                          VkImageLayout from, VkImageLayout to)
 {
-    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    b.srcAccessMask       = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-    b.dstAccessMask       = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-    b.oldLayout           = from;
-    b.newLayout           = to;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image               = img;
-    b.subresourceRange    = { aspect, 0, 1, 0, 1 };
-    g_disp->CmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                               0, 0, nullptr, 0, nullptr, 1, &b);
+    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkAccessFlags src_access = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+    VkAccessFlags dst_access = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+
+    if (from == VK_IMAGE_LAYOUT_UNDEFINED)
+    {
+        src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        src_access = 0;
+    }
+    else if (from == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+    {
+        src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        src_access = VK_ACCESS_TRANSFER_READ_BIT;
+    }
+    else if (from == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+    {
+        src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        src_access = VK_ACCESS_TRANSFER_WRITE_BIT;
+    }
+
+    if (to == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+    {
+        dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dst_access = VK_ACCESS_TRANSFER_READ_BIT;
+    }
+    else if (to == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+    {
+        dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dst_access = VK_ACCESS_TRANSFER_WRITE_BIT;
+    }
+
+    VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    barrier.srcAccessMask = src_access;
+    barrier.dstAccessMask = dst_access;
+    barrier.oldLayout = from;
+    barrier.newLayout = to;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = img;
+    barrier.subresourceRange = { aspect, 0, 1, 0, 1 };
+    g_disp->CmdPipelineBarrier(c, src_stage, dst_stage, 0,
+                               0, nullptr, 0, nullptr, 1, &barrier);
 }
 
-static void MemBarrier(VkCommandBuffer c)
+static void TransferWriteReadBarrier(VkCommandBuffer c, VkBuffer buffer,
+                                     VkDeviceSize size)
 {
-    VkMemoryBarrier b = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    g_disp->CmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                               0, 1, &b, 0, nullptr, 0, nullptr);
+    VkBufferMemoryBarrier barrier = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = buffer;
+    barrier.offset = 0;
+    barrier.size = size;
+    g_disp->CmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                               0, nullptr, 1, &barrier, 0, nullptr);
+}
+
+static void ComputeWriteTransferReadBarrier(VkCommandBuffer c)
+{
+    VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    g_disp->CmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                               1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 // game colour/MV image -> shared texture (size-compatible copy, or blit).
@@ -1072,7 +1165,7 @@ static void CopyDepth(VkCommandBuffer c, const GameRes &src, int frame_slot)
     g_disp->CmdCopyImageToBuffer(c, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging, 1, &toBuf);
     VkImgBarrier(c, src.image, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
 
-    MemBarrier(c);
+    TransferWriteReadBarrier(c, staging, g_bridge.vkframe[frame_slot].depth_scratch_size);
 
     VkImgBarrier(c, dst.image, VK_IMAGE_ASPECT_COLOR_BIT, dst.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy toImg = {};
@@ -1083,13 +1176,10 @@ static void CopyDepth(VkCommandBuffer c, const GameRes &src, int frame_slot)
     dst.layout = VK_IMAGE_LAYOUT_GENERAL;
 }
 
-// The subresource range the game hands NGX often names both DEPTH and STENCIL
-// aspects (BG3: aspect=0x6 on D24_UNORM_S8_UINT), and a combined-aspect view
-// cannot legally be sampled -- which is why v0.1.4's "sample the game's own
-// view" never engaged. The image itself is fine: make our own DEPTH-only view
-// of it and sample that. Cached per frame slot, keyed on image+mip+layer (the
-// game may rotate depth images); the caller only hands out a slot whose
-// previous sandwich has retired, so replacing the old view is safe.
+// The subresource range handed to NGX can name both depth and stencil aspects,
+// while a combined-aspect view cannot legally be sampled. Make a depth-only
+// view of the same image. It is cached per frame slot and keyed by image, mip,
+// and layer; a slot is reused only after its previous work retires.
 static VkImageView GetSampleableDepthView(Bridge::VkFrame &fr, const GameRes &dep)
 {
     if (dep.aspect == VK_IMAGE_ASPECT_DEPTH_BIT && dep.view != VK_NULL_HANDLE)
@@ -1156,7 +1246,7 @@ static void DispatchDepthConvert(VkCommandBuffer c, VkImageView src_view, UINT s
     const uint32_t extent[2] = { w, h };
     g_disp->CmdPushConstants(c, g_depth_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(extent), extent);
     g_disp->CmdDispatch(c, (w + 7) / 8, (h + 7) / 8, 1);
-    MemBarrier(c);
+    ComputeWriteTransferReadBarrier(c);
 }
 
 static UINT DxgiBytesPerTexel(DXGI_FORMAT fmt)
@@ -1167,42 +1257,156 @@ static UINT DxgiBytesPerTexel(DXGI_FORMAT fmt)
     case DXGI_FORMAT_R16G16B16A16_FLOAT:
     case DXGI_FORMAT_R16G16B16A16_UNORM: return 8;
     case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R16G16_FLOAT:
     case DXGI_FORMAT_R11G11B10_FLOAT:
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_B8G8R8A8_UNORM: return 4;
+    case DXGI_FORMAT_R32G32_FLOAT: return 8;
     default: return 0;
     }
 }
 
-static void RecordDirectInputCopies(VkCommandBuffer c)
+struct UploadRegion
 {
-    if (!g_mgpu.direct_vulkan_upload) return;
-    const int inputs[] = { SLOT_COLOR, SLOT_DEPTH, SLOT_MV };
-    for (int slot : inputs)
-    {
-        SharedTex &src = g_bridge.tex[slot];
-        const CrossPlane &p = g_mgpu.plane[slot];
-        const UINT bytes = DxgiBytesPerTexel(p.format);
-        if (!bytes) continue;
-        VkImgBarrier(c, src.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL,
-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        VkBufferImageCopy r = {};
-        r.bufferOffset = p.offset;
-        r.bufferRowLength = p.row_pitch / bytes;
-        r.bufferImageHeight = p.height;
-        r.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        r.imageExtent = { p.width, p.height, 1 };
-        g_disp->CmdCopyImageToBuffer(c, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                     g_mgpu.cross_vk[CROSS_UPLOAD], 1, &r);
-        VkImgBarrier(c, src.image, VK_IMAGE_ASPECT_COLOR_BIT,
-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-    }
+    UINT x, y, width, height;
+};
+
+static UploadRegion SelectUploadRegion(UINT source_w, UINT source_h,
+                                       const CrossPlane &plane, UINT base_x,
+                                       UINT base_y, UINT wanted_w, UINT wanted_h)
+{
+    if (wanted_w && wanted_h && base_x <= source_w && base_y <= source_h &&
+        base_x <= plane.width && base_y <= plane.height &&
+        wanted_w <= source_w - base_x && wanted_h <= source_h - base_y &&
+        wanted_w <= plane.width - base_x && wanted_h <= plane.height - base_y)
+        return { base_x, base_y, wanted_w, wanted_h };
+    // A malformed or incomplete subrect contract must not truncate an input.
+    // Copy the whole common extent and let NGX apply the supplied base itself.
+    return { 0, 0, umin(source_w, plane.width), umin(source_h, plane.height) };
 }
 
-// shared Output -> the game's own Output image. The body carries no begin/end
-// so it can be recorded either inline into the game's command buffer (sync
-// sandwich) or into the bridge's own copy_out buffer (async path).
-static void RecordCopyOutBody(VkCommandBuffer c, VkImage game_out, VkFormat game_fmt, UINT w, UINT h)
+static void RecordImageToUploadRaw(VkCommandBuffer c, VkImage image,
+                                   VkImageAspectFlags aspect, uint32_t mip,
+                                   uint32_t layer, UINT source_w, UINT source_h,
+                                   const CrossPlane &plane, int transport_slot,
+                                   UINT base_x, UINT base_y,
+                                   UINT wanted_w, UINT wanted_h)
+{
+    const UINT bytes = DxgiBytesPerTexel(plane.format);
+    const UploadRegion region = SelectUploadRegion(source_w, source_h, plane,
+        base_x, base_y, wanted_w, wanted_h);
+    VkImgBarrier(c, image, aspect, VK_IMAGE_LAYOUT_GENERAL,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy copy = {};
+    copy.bufferOffset = plane.offset + (VkDeviceSize)region.y * plane.row_pitch +
+                        (VkDeviceSize)region.x * bytes;
+    copy.bufferRowLength = plane.row_pitch / bytes;
+    copy.bufferImageHeight = plane.height;
+    copy.imageSubresource = { aspect, mip, layer, 1 };
+    copy.imageOffset = { (int32_t)region.x, (int32_t)region.y, 0 };
+    copy.imageExtent = { region.width, region.height, 1 };
+    g_disp->CmdCopyImageToBuffer(c, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        g_mgpu.frame[transport_slot].cross_vk[CROSS_UPLOAD], 1, &copy);
+    VkImgBarrier(c, image, aspect, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                 VK_IMAGE_LAYOUT_GENERAL);
+}
+
+static void RecordImageToUpload(VkCommandBuffer c, const GameRes &source,
+                                const CrossPlane &plane, int transport_slot,
+                                UINT base_x, UINT base_y,
+                                UINT wanted_w, UINT wanted_h)
+{
+    RecordImageToUploadRaw(c, source.image, source.aspect, source.mip,
+        source.layer, source.w, source.h, plane, transport_slot,
+        base_x, base_y, wanted_w, wanted_h);
+}
+
+static void RecordSharedToUpload(VkCommandBuffer c, int input, int transport_slot,
+                                 UINT base_x, UINT base_y,
+                                 UINT wanted_w, UINT wanted_h)
+{
+    SharedTex &source = g_bridge.tex[input];
+    RecordImageToUploadRaw(c, source.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+        source.w, source.h, g_mgpu.plane[input], transport_slot,
+        base_x, base_y, wanted_w, wanted_h);
+}
+
+// Compatible game images go directly to the frame's cross-adapter upload
+// allocation. A shared image remains only where format conversion is required.
+static void RecordDirectInputCopies(VkCommandBuffer c, int transport_slot,
+                                    const GameRes &col, const GameRes &dep,
+                                    const GameRes &mv, bool color_converted,
+                                    bool depth_converted, bool mv_converted,
+                                    const FrameScalars &scalars)
+{
+    if (!g_mgpu.direct_vulkan_upload) return;
+    const UINT rw = g_bridge.render_w, rh = g_bridge.render_h;
+    const bool low_res_mv = (g_bridge.feature_flags & (1u << 1)) != 0;
+    const UINT mv_w = low_res_mv ? rw : g_bridge.ngx_out_w;
+    const UINT mv_h = low_res_mv ? rh : g_bridge.ngx_out_h;
+
+    if (color_converted) RecordSharedToUpload(c, SLOT_COLOR, transport_slot,
+                                               scalars.bases[0], scalars.bases[1], rw, rh);
+    else RecordImageToUpload(c, col, g_mgpu.plane[SLOT_COLOR], transport_slot,
+                             scalars.bases[0], scalars.bases[1], rw, rh);
+
+    if (depth_converted) RecordSharedToUpload(c, SLOT_DEPTH, transport_slot,
+                                               scalars.bases[2], scalars.bases[3], rw, rh);
+    else RecordImageToUpload(c, dep, g_mgpu.plane[SLOT_DEPTH], transport_slot,
+                             scalars.bases[2], scalars.bases[3], rw, rh);
+
+    if (mv_converted) RecordSharedToUpload(c, SLOT_MV, transport_slot,
+                                            scalars.bases[4], scalars.bases[5], mv_w, mv_h);
+    else RecordImageToUpload(c, mv, g_mgpu.plane[SLOT_MV], transport_slot,
+                             scalars.bases[4], scalars.bases[5], mv_w, mv_h);
+}
+
+static void RecordBootstrapOutput(VkCommandBuffer c, const GameRes &game_out,
+                                  bool converted, int transport_slot)
+{
+    if (!g_mgpu.direct_vulkan_download ||
+        g_mgpu.frame[transport_slot].output_valid) return;
+    const CrossPlane &p = g_mgpu.plane[SLOT_OUTPUT];
+    const UINT bytes = DxgiBytesPerTexel(p.format);
+    VkImage src_image = converted ? g_bridge.tex[SLOT_OUTPUT].image : game_out.image;
+    VkImageAspectFlags aspect = converted ? VK_IMAGE_ASPECT_COLOR_BIT : game_out.aspect;
+    uint32_t mip = converted ? 0 : game_out.mip;
+    uint32_t layer = converted ? 0 : game_out.layer;
+    UINT width = converted ? umin(g_bridge.tex[SLOT_OUTPUT].w, p.width)
+                           : umin(game_out.w, p.width);
+    UINT height = converted ? umin(g_bridge.tex[SLOT_OUTPUT].h, p.height)
+                            : umin(game_out.h, p.height);
+    VkImgBarrier(c, src_image, aspect, VK_IMAGE_LAYOUT_GENERAL,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy r = {};
+    r.bufferOffset = p.offset;
+    r.bufferRowLength = p.row_pitch / bytes;
+    r.bufferImageHeight = p.height;
+    r.imageSubresource = { aspect, mip, layer, 1 };
+    r.imageExtent = { width, height, 1 };
+    VkBuffer target = g_mgpu.frame[transport_slot].cross_vk[CROSS_DOWNLOAD];
+    g_disp->CmdCopyImageToBuffer(c, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                 target, 1, &r);
+    VkImgBarrier(c, src_image, aspect, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                 VK_IMAGE_LAYOUT_GENERAL);
+
+    VkBufferMemoryBarrier mb = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    mb.buffer = target;
+    mb.offset = p.offset;
+    mb.size = (VkDeviceSize)p.row_pitch * p.height;
+    g_disp->CmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                               0, nullptr, 1, &mb, 0, nullptr);
+}
+
+// Shared Output -> the game's Output, recorded inline before downstream work.
+static void RecordCopyOutBody(VkCommandBuffer c, VkImage game_out, VkFormat game_fmt,
+                              UINT w, UINT h, int transport_slot)
 {
     SharedTex &src = g_bridge.tex[SLOT_OUTPUT];
     const UINT bytes_per_texel = DxgiBytesPerTexel(g_mgpu.plane[SLOT_OUTPUT].format);
@@ -1228,7 +1432,7 @@ static void RecordCopyOutBody(VkCommandBuffer c, VkImage game_out, VkFormat game
         r.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         r.imageExtent = { cw, ch, 1 };
         VkImage target = direct ? game_out : src.image;
-        g_disp->CmdCopyBufferToImage(c, g_mgpu.cross_vk[CROSS_DOWNLOAD], target,
+        g_disp->CmdCopyBufferToImage(c, g_mgpu.frame[transport_slot].cross_vk[CROSS_DOWNLOAD], target,
                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
         if (!direct)
             VkImgBarrier(c, src.image, VK_IMAGE_ASPECT_COLOR_BIT,
@@ -1254,32 +1458,11 @@ static void RecordCopyOutBody(VkCommandBuffer c, VkImage game_out, VkFormat game
                              game_out, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
     }
 
-    // mode=2 self-test: flood the game's output magenta right after the
-    // copy-back. Screen turns magenta -> the copy-back lands where and when
-    // the game reads it, and any remaining blandness is the D3D12 side.
-    // Screen unchanged -> the write path or its timing is still wrong.
-    if (g_cfg.mode == 2 && g_disp->CmdClearColorImage)
-    {
-        VkClearColorValue mag = {};
-        mag.float32[0] = 10.0f; mag.float32[2] = 10.0f; mag.float32[3] = 1.0f;
-        VkImageSubresourceRange rr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        g_disp->CmdClearColorImage(c, game_out, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &mag, 1, &rr);
-    }
-
     if (!direct)
         VkImgBarrier(c, src.image, VK_IMAGE_ASPECT_COLOR_BIT,
                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
     VkImgBarrier(c, game_out, VK_IMAGE_ASPECT_COLOR_BIT,
                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-}
-
-static void RecordCopyOut(VkCommandBuffer c, VkImage game_out, VkFormat game_fmt, UINT w, UINT h)
-{
-    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    g_disp->BeginCommandBuffer(c, &bi);
-    RecordCopyOutBody(c, game_out, game_fmt, w, h);
-    g_disp->EndCommandBuffer(c);
 }
 
 // ---- which evaluates the bridge mirrors ------------------------------------
@@ -1325,25 +1508,15 @@ static const char *BridgeRayReconstructionInput(const NVSDK_NGX_Parameter *p)
 // has been forwarded. Reads the contract, (re)builds if needed, records the
 // input copies into the game's command buffer and arms the pending handoff.
 static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *p,
+                                const FeatureCreateContract &contract,
                                 const GameRes &col, const GameRes &out,
                                 const GameRes &dep, const GameRes &mv);
 static void ArmFamilyProbe(VkCommandBuffer cmd);
 
-static void BridgeVkFrame(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *p)
+static void BridgeVkFrame(VkCommandBuffer cmd, const NVSDK_NGX_Handle *feature,
+                          const NVSDK_NGX_Parameter *p)
 {
-    // A teardown requested while ON the worker thread (BridgeDisable can be
-    // reached from inside the evaluate core) was deferred; finish it here on
-    // the game's thread, where joining the worker is legal.
-    if (g_release_deferred)
-    { InterlockedExchange(&g_release_deferred, 0); FrameLock(); D3D12ReleaseResources(); FrameUnlock(); }
-
     if (g_bridge.disabled || cmd == VK_NULL_HANDLE || p == nullptr) return;
-    if (BridgeFrameGenerationActive()) return;   // DLSS-G owns the frame's pacing;
-                                                 // announced once by the latch
-    if (BridgeInFaultCooldown()) return;         // transient-fault pause; announced
-                                                 // by the fault handler
-    if (g_bridge_hold_until != 0)                // cooldown just expired
-    { g_bridge_hold_until = 0; Log("[bridge] fault cooldown over; resuming bridged frames"); }
     if (!EnsureVkDevice(cmd)) { BridgeFail("no vulkan device"); return; }
 
     GameRes col, out, dep, mv;
@@ -1361,57 +1534,23 @@ static void BridgeVkFrame(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *p)
         return;
     }
 
-    // Hold off before touching the first frame. When DLSS is (re)enabled the
-    // game brings its features up in a burst -- SuperSampling first, evaluates
-    // flowing immediately, FrameGeneration a few milliseconds later. The X4
-    // retest log for v0.1.9 shows the whole race: first frame bridged at
-    // .537, the FG create latch at .544, dead at FG's next present. Creation-
-    // time latching alone loses by those 7 ms, so the first bridgeable
-    // evaluate only starts a clock: every frame is forwarded untouched until
-    // the grace expires, and an FG create landing inside it (400x margin)
-    // means no frame was ever touched. The residual risk is FG enabled in the
-    // menu of a session that has ALREADY been bridging for longer than the
-    // grace -- the latch still stops the next frame, but the transition frame
-    // may collide once; the relaunch is then protected end to end.
+    const FeatureCreateContract *contract = FindFeatureContract(feature);
+    if (!contract)
     {
-        const ULONGLONG kArmGraceMs = 3000;
-        static ULONGLONG first_tick;
-        if (first_tick == 0)
-        {
-            first_tick = GetTickCount64();
-            Log("[bridge] first bridgeable evaluate; forwarding untouched for %llu ms in case "
-                "Frame Generation comes up in the same settings burst", kArmGraceMs);
-        }
-        if (GetTickCount64() - first_tick < kArmGraceMs)
-        {
-            // Nothing is recorded during the grace, but the submit carrying
-            // this very command buffer tells which queue family runs the
-            // DLSS pass -- learn it now, so the first real frame already
-            // knows whether a blit is allowed.
-            if (g_bridge.vk_queue_flags == 0) { FrameLock(); ArmFamilyProbe(cmd); FrameUnlock(); }
-            return;
-        }
+        BridgeDisable("the DLSS feature has no complete captured creation contract");
+        return;
     }
 
     if (!g_bridge.session_ready)
     {
         if (!D3D12InitSession(g_bridge.game_luid, g_bridge.luid_valid)) return;   // disables on failure
-        // The timeline-semaphore imports drive the asynchronous copy-back; the
-        // in-frame handoff never waits on them. A host whose device lacks
-        // VK_KHR_external_semaphore_win32 (the ReShade add-on) skips them.
-        if (kHostHasTimelineImport || !g_cfg.sync)
-        {
-            if (!VkImportFence(&g_bridge.sem_in,  g_shared_fence_in,  "fence_in") ||
-                !VkImportFence(&g_bridge.sem_out, g_shared_fence_out, "fence_out"))
-            { BridgeDisable("could not import the shared fences into Vulkan"); return; }
-        }
     }
-    EnsureSyncObjects();
-    if (!kHostAsyncFallback && !g_sync_active)
-    { BridgeDisable("the in-frame handoff could not be set up and this host has no asynchronous fallback"); return; }
+    EnsureInFrameHandoff();
+    if (!g_handoff_ready)
+    { BridgeDisable("the required in-frame handoff could not be set up"); return; }
 
     FrameLock();
-    BridgeVkFrameLocked(cmd, p, col, out, dep, mv);
+    BridgeVkFrameLocked(cmd, p, *contract, col, out, dep, mv);
     FrameUnlock();
 }
 
@@ -1434,30 +1573,30 @@ static bool SlotRetired(Bridge::VkFrame &fr)
 static int BridgeSlotsBusy()
 {
     int n = 0;
-    for (int i = 0; i < Bridge::kFrames; ++i)
-    {
-        const Bridge::VkFrame &fr = g_bridge.vkframe[i];
-        if (g_sync_active) { if (fr.in_flight) ++n; }
-        else if (fr.submitted && fr.retire && g_disp->GetFenceStatus &&
-                 g_disp->GetFenceStatus(g_bridge.device, fr.retire) != VK_SUCCESS) ++n;
-    }
-    if (!g_sync_active && g_bridge.pending) ++n;
+    for (int i = 0; i < ActiveFrameCount(); ++i)
+        if (g_bridge.vkframe[i].in_flight) ++n;
     return n;
+}
+
+static bool AllTransportOutputsValid()
+{
+    if (!g_mgpu.active) return true;
+    for (int slot = 0; slot < ActiveFrameCount(); ++slot)
+        if (!g_mgpu.frame[slot].output_valid) return false;
+    return true;
 }
 
 // The worker's verdict on one frame, applied on the game's thread.
 static void BridgeJudge(Bridge::VkFrame &fr, int slot)
 {
-    g_worker_healthy = false;
     switch (fr.result)
     {
     case 0:
         g_bridge.consecutive_fails = 0;
-        g_worker_healthy = true;
-        if (dlss_bridge::IsStrictNeural(g_cfg) &&
+        if (AllTransportOutputsValid() &&
             InterlockedCompareExchange(&g_neural_only_latched, 1, 0) == 0)
-            Log("[policy] neural-only mode latched after the first completed private result; "
-                "game-side DLSS fallback is now disabled for this process");
+            Log("[policy] neural-only mode latched after every transport slot received a "
+                "completed private result; game-side DLSS is now suppressed for this process");
         break;
     case 2:  Log("[bridge] disabling to protect the game");
              BridgeDisable("NGX raised an exception in the D3D12 evaluate"); return;
@@ -1499,27 +1638,18 @@ static void BridgeJudge(Bridge::VkFrame &fr, int slot)
 // the last one, and release the slots whose sandwich the GPU has finished.
 static void BridgeCollectSlots()
 {
-    for (int i = 0; i < Bridge::kFrames; ++i)
+    for (int i = 0; i < ActiveFrameCount(); ++i)
     {
         Bridge::VkFrame &fr = g_bridge.vkframe[i];
-        if (g_sync_active)
+        if (!fr.in_flight || !fr.worker_done) continue;
+        if (!fr.judged)
         {
-            if (!fr.in_flight || !fr.worker_done) continue;
-            if (!fr.judged)
-            {
-                fr.judged = true;
-                BridgeJudge(fr, i);
-                if (g_bridge.disabled) return;
-            }
-            if (fr.matching || !SlotRetired(fr)) continue;
-            fr.in_flight = false;
+            fr.judged = true;
+            BridgeJudge(fr, i);
+            if (g_bridge.disabled) return;
         }
-        else if (fr.submitted && fr.retire && g_disp->GetFenceStatus &&
-                 g_disp->GetFenceStatus(g_bridge.device, fr.retire) == VK_SUCCESS)
-        {
-            g_disp->ResetFences(g_bridge.device, 1, &fr.retire);
-            fr.submitted = false;
-        }
+        if (fr.matching || !SlotRetired(fr)) continue;
+        fr.in_flight = false;
     }
 }
 
@@ -1527,23 +1657,12 @@ static void RecountSlots();
 static void NoteFrameBridged(UINT64 v);
 
 static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *p,
+                                const FeatureCreateContract &contract,
                                 const GameRes &col, const GameRes &out,
                                 const GameRes &dep, const GameRes &mv)
 {
     BridgeCollectSlots();
     if (g_bridge.disabled) return;
-
-    // The async path drives one frame at a time: while the previous one's
-    // submit has not been seen, stand aside -- and give up on it after a few
-    // evaluates, since a submit that has not shown up by then never will.
-    if (!g_sync_active && g_bridge.pending)
-    {
-        if (++g_bridge.pending_skips < 4) { RecountSlots(); return; }
-        Log("[bridge] no submit carrying command buffer %p was seen within %d evaluates; that frame is dropped",
-            (void *)g_bridge.pending_cmd, g_bridge.pending_skips);
-        g_bridge.pending = false;
-        g_bridge.pending_skips = 0;
-    }
 
     if (ContractChanged(col, out, dep, mv))
     {
@@ -1561,7 +1680,7 @@ static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *
             return;
         }
         g_bridge.rebuild_busy = 0;
-        if (!RebuildResources(p, col, out, dep, mv)) { RecountSlots(); return; }
+        if (!RebuildResources(contract, p, col, out, dep, mv)) { RecountSlots(); return; }
     }
     if (!g_bridge.frame_ready) { RecountSlots(); return; }
 
@@ -1570,32 +1689,30 @@ static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *
     // work this very thread has not submitted yet.
     const int slot = g_bridge.vk_slot;
     Bridge::VkFrame &fr = g_bridge.vkframe[slot];
-    if (g_sync_active ? fr.in_flight : (fr.submitted && fr.retire))
+    if (fr.in_flight)
     {
         if (g_bridge.no_slot_skips++ == 0)
-            Log(dlss_bridge::IsStrictNeural(g_cfg) && g_neural_only_latched
+            Log(g_neural_only_latched
                 ? "[bridge] no free frame slot (%d bridged frames in flight); repeating the last neural image. "
                   "Repeats silently while the GPU stays more than %d frames behind."
                 : "[bridge] no free frame slot (%d bridged frames in flight); forwarding this frame untouched. "
                   "Repeats silently while the GPU stays more than %d frames behind.",
-                Bridge::kFrames, Bridge::kFrames);
-        if (g_sync_active && dlss_bridge::IsStrictNeural(g_cfg) && g_neural_only_latched)
+                ActiveFrameCount(), ActiveFrameCount());
+        if (g_neural_only_latched)
         {
+            ProfileRepeat(g_bridge.timeline + 1, slot);
             // Queue order keeps the shared image stable: the preceding admitted
             // command waits for its D3D12 writer, while a following admitted
             // command cannot release its input event until after this copy.
-            NoteFrameTouched();
-            RecordCopyOutBody(cmd, out.image, out.fmt, out.w, out.h);
+            RecordCopyOutBody(cmd, out.image, out.fmt, out.w, out.h, slot);
         }
         RecountSlots();
         return;
     }
-    if (g_sync_active)   // slot retired: nothing on the GPU references its events
-    {
-        g_disp->ResetEvent(g_bridge.device, fr.ev_inputs);
-        g_disp->ResetEvent(g_bridge.device, fr.ev_output);
-        g_disp->ResetEvent(g_bridge.device, fr.ev_done);
-    }
+    // Slot retired: nothing on the GPU references its events.
+    g_disp->ResetEvent(g_bridge.device, fr.ev_inputs);
+    g_disp->ResetEvent(g_bridge.device, fr.ev_output);
+    g_disp->ResetEvent(g_bridge.device, fr.ev_done);
 
     // vkCmdBlitImage needs a graphics queue. Which family runs the DLSS pass
     // is only known from a submit carrying one of its command buffers, so
@@ -1649,72 +1766,71 @@ static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *
 
     FrameScalars scalars;
     CaptureFrameScalars(p, &scalars);
-    if (!g_sync_active) ApplyFrameScalars(&scalars);   // consumed on this thread at the submit
 
-    // From here the bridge records into the game's own command buffer -- the
-    // session's history is no longer FG-compatible (see NoteVkFeatureCreate).
-    NoteFrameTouched();
-
-    // Record the input copies straight into the game's command buffer.
-    CopyColorLike(cmd, col, SLOT_COLOR, cblit);
-    CopyColorLike(cmd, mv, SLOT_MV, mvblit);
-    if (float_depth)        CopyDepth(cmd, dep, slot);
-    else if (depth_compute) DispatchDepthConvert(cmd, depth_view, dep.w, dep.h, slot);
-    RecordDirectInputCopies(cmd);
+    // Compatible inputs go directly to this frame's cross-adapter allocation.
+    // Shared textures are populated only for the same-adapter D3D12 route or
+    // where Vulkan must convert the game's format first.
+    if (!g_mgpu.direct_vulkan_upload || cblit)
+        CopyColorLike(cmd, col, SLOT_COLOR, cblit);
+    if (!g_mgpu.direct_vulkan_upload || mvblit)
+        CopyColorLike(cmd, mv, SLOT_MV, mvblit);
+    if (float_depth)
+    {
+        if (!g_mgpu.direct_vulkan_upload) CopyDepth(cmd, dep, slot);
+    }
+    else if (depth_compute)
+        DispatchDepthConvert(cmd, depth_view, dep.w, dep.h, slot);
+    else
+    {
+        // Supplying stale or zero depth is never a valid neural evaluation.
+        // Leave this frame untouched and retry only after a contract rebuild.
+        RecountSlots();
+        return;
+    }
+    RecordDirectInputCopies(cmd, slot, col, dep, mv, cblit, !float_depth, mvblit, scalars);
 
     // During discovery/bootstrap the game output seeds the shared target. Once
     // strict neural-only mode latches, preserve the last completed neural image
     // instead. A missed result then repeats neural output rather than silently
     // displaying the game's original upscaler.
-    if (g_sync_active && !g_neural_only_latched)
+    if (!g_neural_only_latched)
+    {
         CopyColorLike(cmd, out, SLOT_OUTPUT, outblit);
+        // Every direct-download slot starts with a valid game image. Before
+        // strict mode latches, a missed first neural result can therefore use
+        // this seed; after latching, all slots contain completed neural output.
+        RecordBootstrapOutput(cmd, out, outblit, slot);
+    }
 
+    fr.transport_slot = slot;
     fr.cmd       = cmd;
     fr.primary   = VK_NULL_HANDLE;
     fr.matching  = false;
     InterlockedExchange(&fr.abandoned, 0);
 
-    if (g_sync_active)
-    {
-        // The sandwich: tell the worker the inputs are on the GPU, park the
-        // game's command buffer until the worker reports the D3D12 result,
-        // then copy that result back in place -- all before the game's own
-        // post-processing (recorded right after this hook) reads the output.
-        // ev_done at the tail is how the slot learns it has retired without
-        // depending on any submit being seen.
-        g_disp->CmdSetEvent(cmd, fr.ev_inputs, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-        mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        g_disp->CmdWaitEvents(cmd, 1, &fr.ev_output, VK_PIPELINE_STAGE_HOST_BIT,
-                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 1, &mb, 0, nullptr, 0, nullptr);
-        RecordCopyOutBody(cmd, out.image, out.fmt, out.w, out.h);
-        g_disp->CmdSetEvent(cmd, fr.ev_done, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    // Tell the worker the inputs are available, park the game command buffer,
+    // and reinsert the completed result before downstream rendering reads it.
+    g_disp->CmdSetEvent(cmd, fr.ev_inputs,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    g_disp->CmdWaitEvents(cmd, 1, &fr.ev_output, VK_PIPELINE_STAGE_HOST_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 1, &mb,
+                          0, nullptr, 0, nullptr);
+    RecordCopyOutBody(cmd, out.image, out.fmt, out.w, out.h, slot);
+    g_disp->CmdSetEvent(cmd, fr.ev_done, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-        fr.value     = ++g_bridge.timeline;
-        fr.scalars   = scalars;
-        fr.result    = 0;
-        fr.judged    = false;
-        fr.in_flight = true;
-        InterlockedExchange(&fr.worker_done, 0);
-        g_bridge.vk_slot = (slot + 1) % Bridge::kFrames;
-        RecountSlots();
-        WorkQueuePush(slot);          // armed now; no submit has to be guessed
-        NoteFrameBridged(fr.value);
-    }
-    else
-    {
-        g_bridge.pending           = true;
-        g_bridge.pending_slot      = slot;
-        g_bridge.pending_skips     = 0;
-        g_bridge.pending_cmd       = cmd;
-        g_bridge.pending_primary   = VK_NULL_HANDLE;
-        g_bridge.pending_out_image = out.image;
-        g_bridge.pending_out_fmt   = out.fmt;
-        g_bridge.pending_out_w     = out.w;
-        g_bridge.pending_out_h     = out.h;
-        RecountSlots();
-    }
+    fr.value     = ++g_bridge.timeline;
+    fr.scalars   = scalars;
+    fr.result    = 0;
+    fr.judged    = false;
+    fr.in_flight = true;
+    InterlockedExchange(&fr.worker_done, 0);
+    g_bridge.vk_slot = (slot + 1) % ActiveFrameCount();
+    RecountSlots();
+    WorkQueuePush(slot);
+    NoteFrameBridged(fr.value);
 }
 
 // ---- the queue-submit handoff ---------------------------------------------
@@ -1727,15 +1843,13 @@ static volatile LONG g_slots_in_flight;
 static void RecountSlots()
 {
     LONG wanted = 0, flying = 0;
-    if (g_sync_active)
-        for (int i = 0; i < Bridge::kFrames; ++i)
-        {
-            const Bridge::VkFrame &fr = g_bridge.vkframe[i];
-            if (!fr.in_flight) continue;
-            ++flying;
-            if (!fr.submitted && !fr.matching) ++wanted;
-        }
-    else if (g_bridge.pending) { ++wanted; ++flying; }
+    for (int i = 0; i < ActiveFrameCount(); ++i)
+    {
+        const Bridge::VkFrame &fr = g_bridge.vkframe[i];
+        if (!fr.in_flight) continue;
+        ++flying;
+        if (!fr.submitted && !fr.matching) ++wanted;
+    }
     if (g_bridge.probe_cmd != VK_NULL_HANDLE) { ++wanted; ++flying; }
     InterlockedExchange(&g_match_wanted, wanted);
     InterlockedExchange(&g_slots_in_flight, flying);
@@ -1747,10 +1861,7 @@ static void NoteFrameBridged(UINT64 v)
     const UINT64 n = ++g_bridge.frames_done;
     // Liveness in the default log; per-frame detail only when configured.
     if (n == 1)
-        Log(g_sync_active
-            ? "[bridge] first frame bridged: in-frame sandwich armed (copies -> D3D12 evaluate -> in-place copy-back)"
-            : "[bridge] first frame bridged end to end: input copies, D3D12 evaluate and "
-              "output copy-back queued on the GPU");
+        Log("[bridge] first frame bridged: in-frame handoff armed (copies -> D3D12 evaluate -> in-place copy-back)");
     if (n == 100 || n % 1000 == 0 || (g_cfg.verbose && (n <= 10 || n % 60 == 0)))
         Log("[bridge] %llu frames bridged (timeline %llu; %llu forwarded untouched for lack of a free "
             "slot; %lld unrelated submits passed while a match was awaited)",
@@ -1760,24 +1871,13 @@ static void NoteFrameBridged(UINT64 v)
         D3D12ProbeEvalDetour("at heartbeat");
 }
 
-// game_eval=0 (see the config): whether this frame's game-side evaluate can be
-// skipped. Only in the sync sandwich (the async copy-back is never seen, so
-// there the game's evaluate IS the picture), only in mode 0, only while the
-// last judged worker frame was clean, and only when the frame path is certain
-// to record: a free slot, no rebuild pending. frame_ready drops on any
-// BridgeFail, so one bad frame closes the gate before the next evaluate.
+// Once neural-only operation latches, determine whether this frame can safely
+// suppress the game-side evaluate and record the private output instead.
 static bool BridgeSkipGameEvaluate(const NVSDK_NGX_Parameter *p)
 {
-    const bool strict_latched = dlss_bridge::IsStrictNeural(g_cfg) &&
-                                g_neural_only_latched != 0;
-    if (!(g_cfg.mode == 0 && g_sync_active && !BridgeFrameGenerationActive()))
-        return false;
-    // Strict mode stays neural-only after its first completed result. Slot
-    // pressure records a copy of the last neural image, so it does not reopen
-    // the original game evaluate. Legacy game_eval=0 retains its conservative gate.
-    if (!strict_latched && !(g_cfg.game_eval == 0 && g_worker_healthy &&
-          !g_bridge.disabled && g_bridge.frame_ready && !BridgeInFaultCooldown()))
-        return false;
+    const bool strict_latched = g_neural_only_latched != 0;
+    if (!g_handoff_ready) return false;
+    if (!strict_latched) return false;
     GameRes col, out, dep, mv;
     if (!ReadGameRes(p, "Color", &col) || !ReadGameRes(p, "Output", &out) ||
         !ReadGameRes(p, "Depth", &dep) || !ReadGameRes(p, "MotionVectors", &mv))
@@ -1790,21 +1890,6 @@ static bool BridgeSkipGameEvaluate(const NVSDK_NGX_Parameter *p)
     return ok;
 }
 
-static bool SubmitSignal(VkQueue queue, VkSemaphore sem, UINT64 value)
-{
-    VkTimelineSemaphoreSubmitInfo ts = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
-    ts.signalSemaphoreValueCount = 1;
-    ts.pSignalSemaphoreValues    = &value;
-    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    si.pNext                = &ts;
-    si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores    = &sem;
-    g_internal_submit = 1;
-    VkResult r = g_disp->QueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-    g_internal_submit = 0;
-    return r == VK_SUCCESS;
-}
-
 // Fence-only submit, queued behind the game's own: the fence signals once the
 // game's command buffer (carrying the whole sandwich) has fully retired.
 static bool SubmitFenceOnly(VkQueue queue, VkFence fence)
@@ -1815,35 +1900,15 @@ static bool SubmitFenceOnly(VkQueue queue, VkFence fence)
     return r == VK_SUCCESS;
 }
 
-static bool SubmitCopyOut(VkQueue queue, VkCommandBuffer cmd, VkSemaphore sem, UINT64 value, VkFence retire)
-{
-    VkTimelineSemaphoreSubmitInfo ts = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
-    ts.waitSemaphoreValueCount = 1;
-    ts.pWaitSemaphoreValues    = &value;
-    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    si.pNext                = &ts;
-    si.waitSemaphoreCount   = 1;
-    si.pWaitSemaphores      = &sem;
-    si.pWaitDstStageMask    = &stage;
-    si.commandBufferCount   = 1;
-    si.pCommandBuffers      = &cmd;
-    g_internal_submit = 1;
-    VkResult r = g_disp->QueueSubmit(queue, 1, &si, retire);
-    g_internal_submit = 0;
-    return r == VK_SUCCESS;
-}
-
 // ---- submit matching --------------------------------------------------------
 static bool SlotWantsMatch(const Bridge::VkFrame &fr, int i)
 {
-    if (g_sync_active) return fr.in_flight && !fr.submitted && !fr.matching;
-    return g_bridge.pending && g_bridge.pending_slot == i && !fr.matching;
+    (void)i;
+    return fr.in_flight && !fr.submitted && !fr.matching;
 }
 static bool SlotOwnsBuffer(const Bridge::VkFrame &fr, VkCommandBuffer cb)
 {
-    if (g_sync_active) return cb == fr.cmd || (fr.primary && cb == fr.primary);
-    return cb == g_bridge.pending_cmd || (g_bridge.pending_primary && cb == g_bridge.pending_primary);
+    return cb == fr.cmd || (fr.primary && cb == fr.primary);
 }
 
 // ---- the queue-family probe (under g_frame_cs) -----------------------------
@@ -1884,7 +1949,7 @@ static void ResolveFamilyProbe(VkQueue queue, uint32_t family, bool tracked)
 static uint32_t ClaimBuffer(VkCommandBuffer cb)
 {
     uint32_t mask = 0;
-    for (int i = 0; i < Bridge::kFrames; ++i)
+    for (int i = 0; i < ActiveFrameCount(); ++i)
     {
         Bridge::VkFrame &fr = g_bridge.vkframe[i];
         if (SlotWantsMatch(fr, i) && SlotOwnsBuffer(fr, cb)) { fr.matching = true; mask |= 1u << i; }
@@ -1994,7 +2059,7 @@ static void NoteMatchedQueue(VkQueue queue, uint32_t family, bool tracked, bool 
         (long long)g_bridge.unmatched_submits);
 }
 
-// Sync path, one matched slot: its sandwich is on the queue now. Drop a
+// One matched slot: its sandwich is on the queue now. Drop a
 // fence-only submit behind it to learn precisely when the slot has retired
 // (ev_done is the fallback when no submit is ever seen).
 static void SyncSlotSubmitted(VkQueue queue, uint32_t family, bool tracked, int slot)
@@ -2010,55 +2075,6 @@ static void SyncSlotSubmitted(VkQueue queue, uint32_t family, bool tracked, int 
     if (fr.retire && !fr.submitted && SubmitFenceOnly(queue, fr.retire)) fr.submitted = true;
 }
 
-// Async path (sync = 0): drive the frame now that its inputs are on the queue.
-static void AsyncDriveFrame(VkQueue queue, uint32_t family, bool tracked, int slot)
-{
-    g_bridge.pending = false;
-    if (g_bridge.disabled || !g_bridge.frame_ready) return;
-    if (!tracked)
-    {
-        static bool said = false;
-        if (!said) { said = true;
-            Log("[bridge] the DLSS command buffer is submitted on a queue the layer never saw handed "
-                "out; the async copy-back cannot follow it (use sync = 1)"); }
-        return;
-    }
-    if (!EnsureVkFrames(family)) { BridgeFail("vk frame resources"); return; }
-    if (g_bridge.vk_queue_family != family)
-    {
-        static bool said = false;
-        if (!said) { said = true;
-            Log("[bridge] the DLSS command buffer is submitted on queue family %u but the bridge's "
-                "command pool is on family %u; the async copy-back is skipped (use sync = 1)",
-                family, g_bridge.vk_queue_family); }
-        return;
-    }
-    NoteMatchedQueue(queue, family, tracked, g_bridge.pending_primary != VK_NULL_HANDLE);
-
-    Bridge::VkFrame &fr = g_bridge.vkframe[slot];
-    const UINT64 v = ++g_bridge.timeline;
-
-    // 1. inputs are ready once the game's submit (carrying our copies) drains.
-    if (!SubmitSignal(queue, g_bridge.sem_in, v)) { BridgeFail("signal fence_in"); return; }
-
-    // 2. the D3D12 evaluate: wait fence_in, evaluate (add-on inserts here),
-    //    signal fence_out.
-    if (!D3D12RunEvaluate(v)) return;   // logs / disables internally
-
-    // 3. copy the neural result back into the game's Output image.
-    VkCommandBuffer c = fr.copy_out;
-    g_disp->ResetCommandBuffer(c, 0);
-    RecordCopyOut(c, g_bridge.pending_out_image, g_bridge.pending_out_fmt,
-                  g_bridge.pending_out_w, g_bridge.pending_out_h);
-    if (!SubmitCopyOut(queue, c, g_bridge.sem_out, v, fr.retire))
-    { BridgeFail("copy-back submit"); return; }
-
-    fr.submitted = true;
-    g_bridge.consecutive_fails = 0;
-    g_bridge.vk_slot = (slot + 1) % Bridge::kFrames;
-    NoteFrameBridged(v);
-}
-
 // Runs on the submitting thread, right after a submit carrying bridged work
 // (claimed by BridgeMatchSubmit) has been forwarded down the chain.
 static void BridgeOnGameSubmitDone(VkQueue queue, uint32_t family, bool tracked, uint32_t slots, bool ok)
@@ -2069,14 +2085,13 @@ static void BridgeOnGameSubmitDone(VkQueue queue, uint32_t family, bool tracked,
         g_bridge.probe_matching = false;
         if (ok) ResolveFamilyProbe(queue, family, tracked);
     }
-    for (int i = 0; i < Bridge::kFrames; ++i)
+    for (int i = 0; i < ActiveFrameCount(); ++i)
     {
         if (!(slots & (1u << i))) continue;
         Bridge::VkFrame &fr = g_bridge.vkframe[i];
         fr.matching = false;
         if (!ok) continue;                     // the submit failed: nothing went out
-        if (g_sync_active) SyncSlotSubmitted(queue, family, tracked, i);
-        else               AsyncDriveFrame(queue, family, tracked, i);
+        SyncSlotSubmitted(queue, family, tracked, i);
     }
     RecountSlots();
     FrameUnlock();
@@ -2092,25 +2107,13 @@ static void BridgeOnCommandBufferBegin(VkCommandBuffer cb)
     bool changed = false;
     if (g_bridge.probe_cmd == cb && !g_bridge.probe_matching)
     { g_bridge.probe_cmd = VK_NULL_HANDLE; g_bridge.probe_primary = VK_NULL_HANDLE; changed = true; }
-    for (int i = 0; i < Bridge::kFrames; ++i)
+    for (int i = 0; i < ActiveFrameCount(); ++i)
     {
         Bridge::VkFrame &fr = g_bridge.vkframe[i];
         if (fr.matching) continue;             // a submit carrying it is under way
-        if (g_sync_active)
-        {
-            if (!fr.in_flight || fr.submitted || fr.abandoned || cb != fr.cmd) continue;
-            InterlockedExchange(&fr.abandoned, 1);
-            changed = true;
-        }
-        else if (g_bridge.pending && g_bridge.pending_slot == i && cb == g_bridge.pending_cmd)
-        {
-            g_bridge.pending = false;
-            changed = true;
-            static bool said = false;
-            if (!said) { said = true;
-                Log("[bridge] the game re-recorded command buffer %p before submitting it; that frame is dropped",
-                    (void *)cb); }
-        }
+        if (!fr.in_flight || fr.submitted || fr.abandoned || cb != fr.cmd) continue;
+        InterlockedExchange(&fr.abandoned, 1);
+        changed = true;
     }
     if (changed) RecountSlots();
     FrameUnlock();
@@ -2127,19 +2130,11 @@ static void BridgeOnExecuteCommands(VkCommandBuffer primary, uint32_t count, con
     {
         if (g_bridge.probe_cmd != VK_NULL_HANDLE && !g_bridge.probe_matching && secondaries[k] == g_bridge.probe_cmd)
         { g_bridge.probe_primary = primary; found = true; }
-        for (int i = 0; i < Bridge::kFrames; ++i)
+        for (int i = 0; i < ActiveFrameCount(); ++i)
         {
             Bridge::VkFrame &fr = g_bridge.vkframe[i];
-            if (g_sync_active)
-            {
-                if (!fr.in_flight || fr.submitted || fr.matching || secondaries[k] != fr.cmd) continue;
-                fr.primary = primary;
-            }
-            else
-            {
-                if (!g_bridge.pending || g_bridge.pending_slot != i || secondaries[k] != g_bridge.pending_cmd) continue;
-                g_bridge.pending_primary = primary;
-            }
+            if (!fr.in_flight || fr.submitted || fr.matching || secondaries[k] != fr.cmd) continue;
+            fr.primary = primary;
             found = true;
         }
     }
@@ -2181,28 +2176,27 @@ static void D3D12ReleaseResources()
     if (g_worker_thread && GetCurrentThreadId() == g_worker_tid)
     { InterlockedExchange(&g_release_deferred, 1); return; }
 
-    // Stop the sync worker first: it may be mid-use of the D3D12 queue, and
+    // Stop the handoff worker first: it may be mid-use of the D3D12 queue, and
     // the game's submitted command buffers may be parked on our events.
     if (g_worker_thread)
     {
         InterlockedExchange(&g_worker_stop, 1);
         SetEvent(g_worker_wake);
         if (WaitForSingleObject(g_worker_thread, 2000) != WAIT_OBJECT_0)
-            Log("[bridge] the sync worker did not stop within 2 s");
+            Log("[bridge] the handoff worker did not stop within 2 s");
         CloseHandle(g_worker_thread); g_worker_thread = nullptr; g_worker_tid = 0;
     }
     if (g_worker_wake)        { CloseHandle(g_worker_wake);        g_worker_wake = nullptr; }
     if (g_worker_fence_event) { CloseHandle(g_worker_fence_event); g_worker_fence_event = nullptr; }
     g_wq_head = g_wq_tail = 0;
-    const bool was_sync = g_sync_active;
-    g_sync_active = false;
-    g_worker_healthy = false;
+    const bool handoff_was_ready = g_handoff_ready;
+    g_handoff_ready = false;
 
     // Unpark any WaitEvents still on the GPU, then give those command buffers
     // a bounded moment to retire before their events (and everything else)
     // are destroyed: the fence where a submit was seen, ev_done otherwise.
     if (g_bridge.device && g_disp)
-        for (int i = 0; i < Bridge::kFrames; ++i)
+        for (int i = 0; i < ActiveFrameCount(); ++i)
         {
             Bridge::VkFrame &fr = g_bridge.vkframe[i];
             if (fr.ev_output && g_disp->SetEvent) g_disp->SetEvent(g_bridge.device, fr.ev_output);
@@ -2210,7 +2204,7 @@ static void D3D12ReleaseResources()
     if (g_bridge.device && g_disp)
     {
         const ULONGLONG t0 = GetTickCount64();
-        for (int i = 0; i < Bridge::kFrames; ++i)
+        for (int i = 0; i < ActiveFrameCount(); ++i)
         {
             Bridge::VkFrame &fr = g_bridge.vkframe[i];
             if (fr.submitted && fr.retire)
@@ -2218,7 +2212,7 @@ static void D3D12ReleaseResources()
                 g_disp->WaitForFences(g_bridge.device, 1, &fr.retire, VK_TRUE, 1000ull * 1000 * 1000);
                 fr.submitted = false;
             }
-            else if (was_sync && fr.in_flight && !fr.abandoned && fr.ev_done && g_disp->GetEventStatus)
+            else if (handoff_was_ready && fr.in_flight && !fr.abandoned && fr.ev_done && g_disp->GetEventStatus)
                 while (g_disp->GetEventStatus(g_bridge.device, fr.ev_done) == VK_EVENT_RESET &&
                        GetTickCount64() - t0 < 1000)
                     Sleep(1);
@@ -2227,18 +2221,18 @@ static void D3D12ReleaseResources()
         }
     }
 
+    D3D12StopPipelineSubmitter();
     D3D12DrainGpu();
     VkDevice dev = g_bridge.device;
 
     if (g_bridge.feature && g_bridge.release_feature)
     { g_bridge.release_feature(g_bridge.feature); g_bridge.feature = nullptr; }
 
-    D3D12ReleaseMultiGpuFrameResources();
     for (int i = 0; i < SLOT_COUNT; ++i) VkReleaseSharedTex(i);
 
     if (dev && g_disp)
     {
-        for (int i = 0; i < Bridge::kFrames; ++i)
+        for (int i = 0; i < ActiveFrameCount(); ++i)
         {
             Bridge::VkFrame &fr = g_bridge.vkframe[i];
             if (fr.retire)            { g_disp->DestroyFence(dev, fr.retire, nullptr);         fr.retire = VK_NULL_HANDLE; }
@@ -2250,7 +2244,7 @@ static void D3D12ReleaseResources()
             fr.ev_inputs = VK_NULL_HANDLE; fr.ev_output = VK_NULL_HANDLE; fr.ev_done = VK_NULL_HANDLE;
             if (fr.game_depth_view && g_disp->DestroyImageView)
             { g_disp->DestroyImageView(dev, fr.game_depth_view, nullptr); fr.game_depth_view = VK_NULL_HANDLE; }
-            fr.copy_out = VK_NULL_HANDLE; fr.submitted = false; fr.depth_scratch_size = 0;
+            fr.submitted = false; fr.depth_scratch_size = 0;
             fr.cmd = VK_NULL_HANDLE; fr.primary = VK_NULL_HANDLE;
             fr.in_flight = false; fr.matching = false; fr.judged = false;
             InterlockedExchange(&fr.worker_done, 0);
@@ -2258,19 +2252,12 @@ static void D3D12ReleaseResources()
         }
         DestroyDepthPipeline();
         for (int direction = 0; direction < CROSS_COUNT; ++direction)
-        {
-            if (g_mgpu.cross_vk[direction])
-            { g_disp->DestroyBuffer(dev, g_mgpu.cross_vk[direction], nullptr); g_mgpu.cross_vk[direction] = VK_NULL_HANDLE; }
-            if (g_mgpu.cross_vk_memory[direction])
-            { g_disp->FreeMemory(dev, g_mgpu.cross_vk_memory[direction], nullptr); g_mgpu.cross_vk_memory[direction] = VK_NULL_HANDLE; }
-        }
+            VkReleaseCrossDirection(direction);
         g_mgpu.direct_vulkan_upload = false;
         g_mgpu.direct_vulkan_download = false;
-        if (g_bridge.vk_pool) { g_disp->DestroyCommandPool(dev, g_bridge.vk_pool, nullptr); g_bridge.vk_pool = VK_NULL_HANDLE; }
-        if (g_bridge.sem_in)  { g_disp->DestroySemaphore(dev, g_bridge.sem_in,  nullptr);   g_bridge.sem_in  = VK_NULL_HANDLE; }
-        if (g_bridge.sem_out) { g_disp->DestroySemaphore(dev, g_bridge.sem_out, nullptr);   g_bridge.sem_out = VK_NULL_HANDLE; }
     }
-    g_bridge.vk_ready = false;
+
+    D3D12ReleaseMultiGpuFrameResources();
 
     if (g_shared_fence_in)  { CloseHandle(g_shared_fence_in);  g_shared_fence_in  = nullptr; }
     if (g_shared_fence_out) { CloseHandle(g_shared_fence_out); g_shared_fence_out = nullptr; }
@@ -2280,24 +2267,34 @@ static void D3D12ReleaseResources()
     REL(timing_readback); REL(timing_heap);
     g_bridge.timing_frequency = 0;
     REL(list);
-    for (int i = 0; i < Bridge::kFrames; ++i) REL(alloc[i]);
+    for (int i = 0; i < Bridge::kMaxFrames; ++i) REL(alloc[i]);
     REL(queue); REL(adapter3); REL(dev12);
     #undef REL
     if (g_bridge.fence_event) { CloseHandle(g_bridge.fence_event); g_bridge.fence_event = nullptr; }
 
     #define MREL(x) if (g_mgpu.x) { g_mgpu.x->Release(); g_mgpu.x = nullptr; }
-    MREL(game_fence); MREL(game_list); MREL(game_alloc); MREL(game_queue);
-    MREL(neural_download_list); MREL(neural_download_alloc);
-    MREL(neural_copy_list); MREL(neural_copy_alloc); MREL(neural_copy_queue); MREL(game_dev);
+    MREL(game_fence); MREL(game_queue); MREL(neural_copy_queue); MREL(game_dev);
     #undef MREL
+    for (int slot = 0; slot < Bridge::kMaxFrames; ++slot)
+    {
+        if (g_mgpu.pipeline_list[slot]) { g_mgpu.pipeline_list[slot]->Release(); g_mgpu.pipeline_list[slot] = nullptr; }
+        if (g_mgpu.game_list[slot]) { g_mgpu.game_list[slot]->Release(); g_mgpu.game_list[slot] = nullptr; }
+        if (g_mgpu.game_alloc[slot]) { g_mgpu.game_alloc[slot]->Release(); g_mgpu.game_alloc[slot] = nullptr; }
+        if (g_mgpu.neural_download_list[slot]) { g_mgpu.neural_download_list[slot]->Release(); g_mgpu.neural_download_list[slot] = nullptr; }
+        if (g_mgpu.neural_download_alloc[slot]) { g_mgpu.neural_download_alloc[slot]->Release(); g_mgpu.neural_download_alloc[slot] = nullptr; }
+        if (g_mgpu.neural_copy_list[slot]) { g_mgpu.neural_copy_list[slot]->Release(); g_mgpu.neural_copy_list[slot] = nullptr; }
+        if (g_mgpu.neural_copy_alloc[slot]) { g_mgpu.neural_copy_alloc[slot]->Release(); g_mgpu.neural_copy_alloc[slot] = nullptr; }
+    }
     if (g_mgpu.game_event) { CloseHandle(g_mgpu.game_event); g_mgpu.game_event = nullptr; }
     g_mgpu.active = false; g_mgpu.game_value = 0;
     g_mgpu_pending_neural = 0; g_mgpu_dropped_outputs = 0;
+    g_mgpu_pending_timing_slot = -1; g_mgpu_pending_submitted_at = 0;
+    g_mgpu_pending_gpu_calibration = 0; g_mgpu_pending_cpu_calibration = 0;
+    g_mgpu_pending_submit_qpc = 0;
     g_mgpu_pending_game = 0; g_mgpu_game_repeats = 0; g_mgpu_output_timeout = false;
 
     g_bridge.session_ready = false;
     g_bridge.frame_ready   = false;
-    g_bridge.pending       = false;
     g_bridge.rebuild_busy  = 0;
     g_bridge.probe_cmd = VK_NULL_HANDLE; g_bridge.probe_primary = VK_NULL_HANDLE; g_bridge.probe_matching = false;
     RecountSlots();
@@ -2305,8 +2302,8 @@ static void D3D12ReleaseResources()
 
 // The game is about to destroy a VkDevice (called from the layer, before the
 // real vkDestroyDevice). If it is the device the bridge attached to, everything
-// the bridge holds on it -- imported images and semaphores, the command pool,
-// the per-frame events, and a worker that may still be mid-evaluate -- has to
+// the bridge holds on it -- imported images, per-frame events, and a worker
+// that may still be mid-evaluate -- has to
 // be released while the device is still alive; releasing after it dies is how
 // these bridges hang or crash on quit. The bridge is left re-armable, so a game
 // that simply recreates its device (a resolution or HDR change) is picked up
@@ -2321,11 +2318,10 @@ static void BridgeDeviceLost(VkDevice dev)
     g_bridge.device     = VK_NULL_HANDLE;
     g_bridge.phys       = VK_NULL_HANDLE;
     g_bridge.instance   = VK_NULL_HANDLE;
-    g_bridge.pending    = false;
     g_bridge.vk_slot    = 0;
     g_bridge.vk_queue_flags = 0;
     g_disp              = nullptr;
-    g_sync_init_done    = false;   // the events are re-created on the next device
+    g_handoff_init_done    = false;   // the events are re-created on the next device
     g_depth_pipe_failed = false;
     FrameUnlock();
 }

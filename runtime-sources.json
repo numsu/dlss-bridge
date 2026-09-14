@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "dlss_neural_runtime": {
+    "name": "NVIDIA DLSS Neural Rendering runtime",
+    "version": "Merserk DLSS 5 Visual Enhancer v7.0 bundle",
+    "filename": "nvngx_dlssnr.dll",
+    "release_page": "https://github.com/Merserk/dlss5-visual-enhancer/releases/tag/v7.0",
+    "url": "https://github.com/Merserk/dlss5-visual-enhancer/releases/download/v7.0/DLSS.5.Visual.Enhancer.v7.0.zip",
+    "archive_size": 543166673,
+    "archive_sha256": "995a3c8ec73cac1dce8b329279b2ec66f4b9f52048b7d119dcb46c6b7e0914cb",
+    "archive_member": "bin/runtime/dlssnr/nvngx_dlssnr.dll",
+    "sha256": "6eb209e764f39872625debd6abaf45e2bb6322f6f270f781f70c059ae30b3927",
+    "license": "NVIDIA RTX SDK License",
+    "license_url": "https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt"
+  }
+}
