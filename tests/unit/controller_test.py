@@ -109,6 +109,21 @@ finally:
     module.acquire_model = original_acquire_model
 
 
+# Steam profile validation must execute before any external configuration access.
+original_steam_running = module.steam_running
+module.steam_running = lambda: False
+try:
+    args = type("Args", (), {"profile": "../unsafe", "appid": "275850"})()
+    try:
+        module.cmd_steam_configure(args)
+    except SystemExit as exc:
+        assert "bundled profile name" in str(exc)
+    else:
+        raise AssertionError("unsafe Steam profile name was accepted")
+finally:
+    module.steam_running = original_steam_running
+
+
 components = module.component_inventory()
 assert any(c["id"] == "ngx-vulkan" and c["state"] == "integrated" for c in components)
 assert any(c["id"] == "ngx-d3d12" and c["state"] == "planned" for c in components)
