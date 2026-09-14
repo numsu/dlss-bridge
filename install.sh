@@ -16,8 +16,7 @@ case ${1:-} in
     exit 2
     ;;
 esac
-repository=${DLSS_BRIDGE_REPOSITORY:-@GITHUB_REPOSITORY@}
-case "$repository" in *@*) echo "This installer does not contain a release repository." >&2; exit 2;; esac
+repository=${DLSS_BRIDGE_REPOSITORY:-numsu/dlss-bridge}
 version=${DLSS_BRIDGE_VERSION:-latest}
 case "$version" in
   latest) release_path=releases/latest/download ;;

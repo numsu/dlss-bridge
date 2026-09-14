@@ -462,8 +462,8 @@ extern "C" __declspec(dllexport) const char *NAME        = "dlss5-vk-bridge";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Lets a D3D12-only DLSS 5 add-on run the Super Resolution pass of a Vulkan game: "
     "a private D3D12 NGX session fed from the game's Vulkan frame through shared textures.";
-extern "C" __declspec(dllexport) const char *WEBSITE     = "https://github.com/AlanBacker/dlss5-vk-bridge";
-extern "C" __declspec(dllexport) const char *ISSUES      = "https://github.com/AlanBacker/dlss5-vk-bridge/issues";
+extern "C" __declspec(dllexport) const char *WEBSITE     = "https://github.com/numsu/dlss-bridge";
+extern "C" __declspec(dllexport) const char *ISSUES      = "https://github.com/numsu/dlss-bridge/issues";
 
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_module)
 {

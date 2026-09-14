@@ -51,7 +51,7 @@ Wine.
 Run the installer from the latest release:
 
 ```bash
-curl -fsSL https://github.com/@GITHUB_REPOSITORY@/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/numsu/dlss-bridge/releases/latest/download/install.sh | sh
 ```
 
 The default installation paths are:
@@ -145,7 +145,7 @@ Exit every game launched through DLSS Bridge before updating.
 On Linux, rerun the installation command:
 
 ```bash
-curl -fsSL https://github.com/@GITHUB_REPOSITORY@/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/numsu/dlss-bridge/releases/latest/download/install.sh | sh
 ```
 
 The installer verifies the release checksum and replaces the application
@@ -156,7 +156,7 @@ previously managed. A runtime supplied manually by the user is preserved.
 To install a particular Linux release, set its tag:
 
 ```bash
-curl -fsSL https://github.com/@GITHUB_REPOSITORY@/releases/download/vVERSION/install.sh |
+curl -fsSL https://github.com/numsu/dlss-bridge/releases/download/vVERSION/install.sh |
   DLSS_BRIDGE_VERSION=vVERSION sh
 ```
 
@@ -168,7 +168,7 @@ updates the existing installation. User state remains under `%LOCALAPPDATA%`.
 On Linux:
 
 ```bash
-curl -fsSL https://github.com/@GITHUB_REPOSITORY@/releases/latest/download/install.sh |
+curl -fsSL https://github.com/numsu/dlss-bridge/releases/latest/download/install.sh |
   sh -s -- --uninstall
 ```
 

@@ -53,9 +53,6 @@ install -m0644 "$root/docs/installation.md" "$output/docs/installation.md"
 install -m0644 "$root/docs/dependencies.md" "$output/docs/dependencies.md"
 install -m0644 "$root/docs/known-limitations.md" "$output/docs/known-limitations.md"
 install -m0644 "$root/docs/portable-architecture.md" "$output/docs/portable-architecture.md"
-if [[ -n ${GITHUB_REPOSITORY:-} ]]; then
-  sed -i "s|@GITHUB_REPOSITORY@|${GITHUB_REPOSITORY}|g" "$output/docs/installation.md"
-fi
 cat >"$output/RUNTIME-SOURCE.txt" <<'EOF'
 The NVIDIA nvngx_dlssnr.dll runtime is not redistributed in this package.
 The installer downloads it from the pinned upstream release recorded in

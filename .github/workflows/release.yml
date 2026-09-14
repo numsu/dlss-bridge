@@ -9,14 +9,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - name: Build Linux package and shared Windows payload
         env:
           VERSION: ${{ github.ref_name }}
         run: packaging/build-linux-package.sh dist
-      - name: Embed repository in published installer
-        run: sed "s|@GITHUB_REPOSITORY@|${{ github.repository }}|g" install.sh > dist/install.sh
+      - name: Stage installer
+        run: cp install.sh dist/install.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux-release

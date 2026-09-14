@@ -26,7 +26,7 @@ generation is not supported by the current in-frame execution contract.
 Linux:
 
 ```bash
-curl -fsSL https://github.com/@GITHUB_REPOSITORY@/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/numsu/dlss-bridge/releases/latest/download/install.sh | sh
 ```
 
 Windows:
