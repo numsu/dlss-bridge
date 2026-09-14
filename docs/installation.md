@@ -69,6 +69,9 @@ fails if the download, extraction, or verification does not complete. The
 source URL, version, hashes, and NVIDIA license URL are recorded in
 `runtime-sources.json`.
 
+For automation, `dlss-bridge acquire-runtime --json` returns the structured
+runtime acquisition result.
+
 ## Install on Windows
 
 Download `dlss-bridge-windows-x86_64-setup.exe` from the latest release and run

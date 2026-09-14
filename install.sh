@@ -33,6 +33,7 @@ mkdir -p "$tmp/unpacked" "$prefix/bin" "$prefix/libexec"
 tar -xzf "$tmp/$artifact" -C "$tmp/unpacked"
 # Acquire and validate the required runtime before changing the installed
 # application. A failed setup therefore leaves the previous version intact.
+echo "Downloading and verifying the neural runtime..."
 python3 "$tmp/unpacked/libexec/dlss-bridge/controller/dlss_bridge.py" acquire-runtime
 if [ -d "$prefix/libexec/dlss-bridge" ]; then action=Updated; else action=Installed; fi
 new="$prefix/libexec/.dlss-bridge.new.$$"

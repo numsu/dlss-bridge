@@ -1,5 +1,7 @@
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -85,6 +87,27 @@ with tempfile.TemporaryDirectory() as temporary:
         assert f"DeferredDLSS={deferred}" in configured
         assert "WorkingScale=0.75" in configured
         assert "Passes=2" in configured
+
+# Runtime acquisition is concise for people and structured only on request.
+original_acquire_model = module.acquire_model
+module.acquire_model = lambda _manifest, _force: {
+    "status": "installed",
+    "installed": "/state/models/nvngx_dlssnr.dll",
+    "sha256": "abc",
+}
+try:
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        module.cmd_acquire_runtime(type("Args", (), {"force": False, "json": False})())
+    assert output.getvalue() == "Neural runtime downloaded and verified.\n"
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        module.cmd_acquire_runtime(type("Args", (), {"force": False, "json": True})())
+    assert json.loads(output.getvalue())["status"] == "installed"
+finally:
+    module.acquire_model = original_acquire_model
+
 
 components = module.component_inventory()
 assert any(c["id"] == "ngx-vulkan" and c["state"] == "integrated" for c in components)

@@ -284,12 +284,26 @@ def resolve_from_args(args: argparse.Namespace) -> dict[str, str | int]:
 
 
 def cmd_import_model(args: argparse.Namespace) -> int:
-    print(json.dumps(import_model(Path(args.path)), indent=2))
+    result = import_model(Path(args.path))
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Neural runtime imported: {result['installed']}")
     return 0
 
 
 def cmd_acquire_runtime(args: argparse.Namespace) -> int:
-    print(json.dumps(acquire_model(ROOT / "runtime-sources.json", args.force), indent=2))
+    result = acquire_model(ROOT / "runtime-sources.json", args.force)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    messages = {
+        "installed": "Neural runtime downloaded and verified.",
+        "updated": "Neural runtime updated and verified.",
+        "current": "Neural runtime is already installed and verified.",
+        "preserved-user-runtime": "Existing user-provided neural runtime preserved.",
+    }
+    print(messages.get(result["status"], "Neural runtime is ready."))
     return 0
 
 
@@ -328,12 +342,14 @@ def parser() -> argparse.ArgumentParser:
     probe.set_defaults(func=cmd_probe)
     model = commands.add_parser("import-model", help="install a user-supplied NVIDIA neural runtime")
     model.add_argument("path")
+    model.add_argument("--json", action="store_true", help="print a machine-readable result")
     model.set_defaults(func=cmd_import_model)
     acquire = commands.add_parser(
         "acquire-runtime", help="download and verify the pinned NVIDIA neural runtime"
     )
     acquire.add_argument("--force", action="store_true",
                          help="replace an existing user-supplied runtime")
+    acquire.add_argument("--json", action="store_true", help="print a machine-readable result")
     acquire.set_defaults(func=cmd_acquire_runtime)
 
     launch = commands.add_parser("launch", aliases=["run"])
