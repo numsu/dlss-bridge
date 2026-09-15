@@ -90,7 +90,7 @@ def configure_neural_runtime(ini: Path, runtime: dict[str, str]) -> None:
         "DeferredDLSS": deferred,
         "WorkingScale": runtime["neural_working_scale"],
         "Passes": runtime["neural_passes"],
-        # F24 is reserved for the bridge's internal Ctrl+Shift+F11 translation.
+        # F24 is reserved for the bridge's internal Ctrl+Shift+N translation.
         "ToggleKey": "0x87",
     }
     lines = ini.read_text(encoding="utf-8-sig").splitlines()

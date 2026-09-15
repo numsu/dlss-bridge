@@ -65,7 +65,7 @@ selection, conflicts, removal, and troubleshooting.
 
 ## Toggle neural rendering in game
 
-Press **Ctrl+Shift+F11** to toggle the neural pass. Capture, transport, and the
+Press **Ctrl+Shift+N** to toggle the neural pass. Capture, transport, and the
 private DLSS upscaler remain active, so this provides a direct visual and
 performance comparison without rebuilding the session or returning to the
 game's original upscaler. The session log records each transition.

@@ -143,7 +143,7 @@ launch without DLSS Bridge; no disable flag is needed.
 
 ## Toggle neural rendering while playing
 
-Press **Ctrl+Shift+F11** to switch the neural pass on or off. The binding works
+Press **Ctrl+Shift+N** to switch the neural pass on or off. The binding works
 in native Windows and in Windows games running through Proton. DLSS Bridge
 continues its private DLSS, frame capture, transport, and reinsertion path in
 both modes; only neural processing changes. This makes the toggle suitable for

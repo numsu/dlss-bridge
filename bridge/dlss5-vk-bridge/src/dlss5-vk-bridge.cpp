@@ -242,7 +242,7 @@ static bool BeginNeuralTogglePulse()
     const bool chord =
         (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
         (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 &&
-        (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+        (GetAsyncKeyState('N') & 0x8000) != 0;
     if (!chord)
     {
         InterlockedExchange(&g_toggle_chord_down, 0);
@@ -255,12 +255,12 @@ static bool BeginNeuralTogglePulse()
     input.ki.wVk = static_cast<WORD>(kNeuralToggleVirtualKey);
     if (SendInput(1, &input, sizeof(input)) != 1)
     {
-        Warn("[control] Ctrl+Shift+F11 was pressed, but the neural toggle signal failed (Win32 %lu)",
+        Warn("[control] Ctrl+Shift+N was pressed, but the neural toggle signal failed (Win32 %lu)",
              GetLastError());
         return false;
     }
     const LONG enabled = InterlockedCompareExchange(&g_neural_pass_enabled, 0, 0);
-    Log("[control] Ctrl+Shift+F11: neural rendering %s", enabled ? "disabling" : "enabling");
+    Log("[control] Ctrl+Shift+N: neural rendering %s", enabled ? "disabling" : "enabling");
     return true;
 }
 
