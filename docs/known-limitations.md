@@ -113,8 +113,9 @@ paths.
 - The controller `probe` command verifies installation/model state and reports
   GPU inventory. Feature creation, transport usability, and visual correctness
   can only be validated inside a game process today.
-- There is no runtime hotkey or control channel. Attachment is selected per
-  launch by adding or omitting the command prefix.
+- `Ctrl+Shift+F11` toggles only the neural pass while the private DLSS and
+  transport path remain active. The state is logged; there is no on-screen
+  indicator or external runtime control channel yet.
 
 ## Telemetry and validation
 

@@ -68,7 +68,7 @@ for invalid_scale in (float("nan"), float("inf")):
         raise AssertionError(f"controller accepted invalid scale {invalid_scale}")
 
 with tempfile.TemporaryDirectory() as temporary:
-    template = "[DlssNr]\nRunBeforeSR=true\nDeferredDLSS=false\nWorkingScale=1\nPasses=1\n"
+    template = "[DlssNr]\nRunBeforeSR=true\nDeferredDLSS=false\nWorkingScale=1\nPasses=1\nToggleKey=auto\n"
     expected = {
         "before_sr": ("true", "false"),
         "after_sr": ("false", "false"),
@@ -87,6 +87,7 @@ with tempfile.TemporaryDirectory() as temporary:
         assert f"DeferredDLSS={deferred}" in configured
         assert "WorkingScale=0.75" in configured
         assert "Passes=2" in configured
+        assert "ToggleKey=0x87" in configured
 
 # Runtime acquisition is concise for people and structured only on request.
 original_acquire_model = module.acquire_model
@@ -160,7 +161,7 @@ with tempfile.TemporaryDirectory() as temporary:
     (optiscaler / "OptiScaler.dll").write_bytes(b"opti")
     (optiscaler / "OptiScaler.ini").write_text(
         "[DlssNr]\nEnabled=true\nRunBeforeSR=false\nDeferredDLSS=true\n"
-        "WorkingScale=0.5\nPasses=3\n"
+        "WorkingScale=0.5\nPasses=3\nToggleKey=auto\n"
     )
     (optiscaler / "nvngx.dll_dlssnr.dll").write_bytes(b"forwarder")
     (backend / "backend.dll").write_bytes(b"backend")
@@ -192,6 +193,7 @@ with tempfile.TemporaryDirectory() as temporary:
     assert "DeferredDLSS=false" in session_ini
     assert "WorkingScale=1" in session_ini
     assert "Passes=1" in session_ini
+    assert "ToggleKey=0x87" in session_ini
     bridge_cfg = (launch.directory / "dlss5-vk-bridge.cfg").read_text()
     assert "neural_placement" not in bridge_cfg
     assert "neural_working_scale" not in bridge_cfg

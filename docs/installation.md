@@ -141,6 +141,17 @@ For each launch, the controller:
 No step writes to the game directory or Wine prefix. Omit the command prefix to
 launch without DLSS Bridge; no disable flag is needed.
 
+## Toggle neural rendering while playing
+
+Press **Ctrl+Shift+F11** to switch the neural pass on or off. The binding works
+in native Windows and in Windows games running through Proton. DLSS Bridge
+continues its private DLSS, frame capture, transport, and reinsertion path in
+both modes; only neural processing changes. This makes the toggle suitable for
+comparing image quality and performance in the same scene.
+
+The bridge records the selected state in the session log. It does not currently
+display an on-screen status indicator.
+
 ## Select a GPU
 
 The default `auto` policy uses another compatible NVIDIA GPU when one is

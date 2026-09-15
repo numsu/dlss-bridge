@@ -1866,8 +1866,10 @@ static void D3D12RunEvaluatePipelined(UINT64 timeline, LONG *result, int transpo
     NVSDK_NGX_Result evaluated = NGX_SUCCESS;
     static const char kMark[] = "ngx evaluate";
     list->BeginEvent(1, kMark, sizeof(kMark));
+    const bool toggle_pulse = BeginNeuralTogglePulse();
     evaluated = SafeEvaluate(g_bridge.eval_feature, list,
                              g_bridge.feature, g_bridge.params, &code);
+    EndNeuralTogglePulse(toggle_pulse);
     list->EndEvent();
 
     Barrier(list, NeuralTex(SLOT_COLOR),  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -2050,7 +2052,9 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
     NVSDK_NGX_Result re = NGX_SUCCESS;
     static const char kMark[] = "ngx evaluate";
     g_bridge.list->BeginEvent(1, kMark, sizeof(kMark));
+    const bool toggle_pulse = BeginNeuralTogglePulse();
     re = SafeEvaluate(g_bridge.eval_feature, g_bridge.list, g_bridge.feature, g_bridge.params, &code);
+    EndNeuralTogglePulse(toggle_pulse);
     g_bridge.list->EndEvent();
 
     Barrier(g_bridge.list, NeuralTex(SLOT_COLOR),  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);

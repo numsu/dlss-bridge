@@ -184,6 +184,15 @@ static int ActiveFrameCount()
 // private path. A failed strict frame repeats the last neural image.
 static volatile LONG g_neural_only_latched;
 
+// OptiScaler owns the neural pass inside the private D3D12 evaluate. It accepts
+// one virtual key, so reserve F24 as an internal signal and expose a chord that
+// is available on ordinary keyboards and unlikely to overlap a game binding.
+// The pulse surrounds one evaluate, which makes the mode transition occur at a
+// frame boundary without stopping capture, transport, or private DLSS.
+static volatile LONG g_toggle_chord_down;
+static volatile LONG g_neural_pass_enabled = 1;
+static const int kNeuralToggleVirtualKey = VK_F24;
+
 // ---------------------------------------------------------------------------
 // logging (8 MB cap, matches the DX11 bridge)
 // ---------------------------------------------------------------------------
@@ -227,6 +236,48 @@ static void LogV(const char *tag, const char *fmt, va_list ap)
 
 static void Log(const char *fmt, ...)  { va_list ap; va_start(ap, fmt); LogV("",      fmt, ap); va_end(ap); }
 static void Warn(const char *fmt, ...) { va_list ap; va_start(ap, fmt); LogV(" WARN:", fmt, ap); va_end(ap); }
+
+static bool BeginNeuralTogglePulse()
+{
+    const bool chord =
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
+        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 &&
+        (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    if (!chord)
+    {
+        InterlockedExchange(&g_toggle_chord_down, 0);
+        return false;
+    }
+    if (InterlockedExchange(&g_toggle_chord_down, 1) != 0) return false;
+
+    INPUT input = {};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = static_cast<WORD>(kNeuralToggleVirtualKey);
+    if (SendInput(1, &input, sizeof(input)) != 1)
+    {
+        Warn("[control] Ctrl+Shift+F11 was pressed, but the neural toggle signal failed (Win32 %lu)",
+             GetLastError());
+        return false;
+    }
+    const LONG enabled = InterlockedCompareExchange(&g_neural_pass_enabled, 0, 0);
+    Log("[control] Ctrl+Shift+F11: neural rendering %s", enabled ? "disabling" : "enabling");
+    return true;
+}
+
+static void EndNeuralTogglePulse(bool active)
+{
+    if (!active) return;
+    INPUT input = {};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = static_cast<WORD>(kNeuralToggleVirtualKey);
+    input.ki.dwFlags = KEYEVENTF_KEYUP;
+    if (SendInput(1, &input, sizeof(input)) != 1)
+        Warn("[control] neural toggle key release failed (Win32 %lu)", GetLastError());
+    const LONG previous = InterlockedCompareExchange(&g_neural_pass_enabled, 0, 0);
+    InterlockedExchange(&g_neural_pass_enabled, previous ? 0 : 1);
+    Log("[control] neural rendering is now %s; private DLSS and frame transport remain active",
+        previous ? "disabled" : "enabled");
+}
 
 static bool LoadConfig()
 {

@@ -63,6 +63,13 @@ in user state.
 See [Installation and updates](docs/installation.md) for requirements, GPU
 selection, conflicts, removal, and troubleshooting.
 
+## Toggle neural rendering in game
+
+Press **Ctrl+Shift+F11** to toggle the neural pass. Capture, transport, and the
+private DLSS upscaler remain active, so this provides a direct visual and
+performance comparison without rebuilding the session or returning to the
+game's original upscaler. The session log records each transition.
+
 ## GPU selection
 
 Automatic selection prefers another compatible NVIDIA GPU and uses the game GPU
