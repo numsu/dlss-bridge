@@ -558,6 +558,8 @@ static void WorkerRunSlot(int slot)
     Bridge::VkFrame &fr = g_bridge.vkframe[slot];
     const UINT64 v = fr.value;
     LONG result = 0;
+    LARGE_INTEGER worker_started = {}, inputs_ready = {}, evaluate_done = {};
+    QueryPerformanceCounter(&worker_started);
 
     // There is no host-blocking wait on a VkEvent, so this poll is forced.
     // Keep it polite: pause-spin through the expected sub-frame wait, yield
@@ -583,6 +585,7 @@ static void WorkerRunSlot(int slot)
         else for (int i = 0; i < 64; ++i) YieldProcessor();
     }
 
+    QueryPerformanceCounter(&inputs_ready);
     if (result == 0)
     {
         // This frame's own scalars (its jitter above all): the next frame
@@ -592,6 +595,7 @@ static void WorkerRunSlot(int slot)
         // signal satisfies the queue Wait inside the evaluate core.
         g_bridge.fence_in->Signal(v);
         D3D12RunEvaluateCore(v, &result, fr.transport_slot);
+        QueryPerformanceCounter(&evaluate_done);
         if (result == 0 && g_bridge.fence_out->GetCompletedValue() < v)
         {
             g_bridge.fence_out->SetEventOnCompletion(v, g_worker_fence_event);
@@ -608,10 +612,38 @@ static void WorkerRunSlot(int slot)
     fr.result = result;
     MemoryBarrier();
     InterlockedExchange(&fr.worker_done, 1);
+    if (fr.host_done) SetEvent(fr.host_done);
+
+    // Log only after releasing the game queue. The three spans separate
+    // Vulkan input arrival from private evaluation and the final fence wait.
+    const double total_ms = CpuElapsedMs(worker_started);
+    if ((total_ms >= 20.0 || result != 0) && inputs_ready.QuadPart)
+    {
+        LARGE_INTEGER frequency = {};
+        if (QueryPerformanceFrequency(&frequency) && frequency.QuadPart)
+        {
+            const double scale = 1000.0 / (double)frequency.QuadPart;
+            const double input_ms = (double)(inputs_ready.QuadPart - worker_started.QuadPart) * scale;
+            const double evaluate_ms = evaluate_done.QuadPart ?
+                (double)(evaluate_done.QuadPart - inputs_ready.QuadPart) * scale : 0.0;
+            Log("[stall] frame %llu handoff %.3fms (input %.3fms, evaluate %.3fms, fence %.3fms), result=%ld",
+                (unsigned long long)v, total_ms, input_ms, evaluate_ms,
+                total_ms - input_ms - evaluate_ms, result);
+        }
+    }
 }
 
 static DWORD WINAPI BridgeWorkerProc(void *)
 {
+    // Keep the worker identifiable to debuggers and host-side profilers. The
+    // API is resolved dynamically so the bridge remains loadable on older
+    // Windows versions that do not export SetThreadDescription.
+    using SetThreadDescriptionFn = HRESULT (WINAPI *)(HANDLE, PCWSTR);
+    if (HMODULE kernel = GetModuleHandleW(L"kernel32.dll"))
+        if (auto set_description = reinterpret_cast<SetThreadDescriptionFn>(
+                GetProcAddress(kernel, "SetThreadDescription")))
+            set_description(GetCurrentThread(), L"dlss-bridge-worker");
+
     for (;;)
     {
         WaitForSingleObject(g_worker_wake, INFINITE);
@@ -646,6 +678,9 @@ static void EnsureInFrameHandoff()
             g_disp->CreateEvent(dev, &eci, nullptr, &fr.ev_output) != VK_SUCCESS ||
             g_disp->CreateEvent(dev, &eci, nullptr, &fr.ev_done)   != VK_SUCCESS)
         { Warn("vkCreateEvent failed while creating the in-frame handoff"); return; }
+        fr.host_done = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+        if (!fr.host_done)
+        { Warn("host completion event creation failed while creating the in-frame handoff"); return; }
     }
     g_wq_head = g_wq_tail = 0;
     g_worker_wake        = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1805,6 +1840,7 @@ static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *
     fr.transport_slot = slot;
     fr.cmd       = cmd;
     fr.primary   = VK_NULL_HANDLE;
+    fr.submit_queue = VK_NULL_HANDLE;
     fr.matching  = false;
     InterlockedExchange(&fr.abandoned, 0);
 
@@ -1826,6 +1862,7 @@ static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *
     fr.result    = 0;
     fr.judged    = false;
     fr.in_flight = true;
+    if (fr.host_done) ResetEvent(fr.host_done);
     InterlockedExchange(&fr.worker_done, 0);
     g_bridge.vk_slot = (slot + 1) % ActiveFrameCount();
     RecountSlots();
@@ -1974,6 +2011,14 @@ static uint32_t BridgeMatchSubmit(uint32_t count, const VkSubmitInfo *submits)
     FrameUnlock();
     return mask;
 }
+static UINT64 BridgeSubmitTimeline(uint32_t slots)
+{
+    UINT64 newest = 0;
+    for (int i = 0; i < ActiveFrameCount(); ++i)
+        if ((slots & (1u << i)) && g_bridge.vkframe[i].value > newest)
+            newest = g_bridge.vkframe[i].value;
+    return newest;
+}
 static uint32_t BridgeMatchSubmit2(uint32_t count, const VkSubmitInfo2 *submits)
 {
     uint32_t mask = 0;
@@ -2065,6 +2110,7 @@ static void NoteMatchedQueue(VkQueue queue, uint32_t family, bool tracked, bool 
 static void SyncSlotSubmitted(VkQueue queue, uint32_t family, bool tracked, int slot)
 {
     Bridge::VkFrame &fr = g_bridge.vkframe[slot];
+    fr.submit_queue = queue;
     NoteMatchedQueue(queue, family, tracked, fr.primary != VK_NULL_HANDLE);
     // A host that learns of the submit before it goes down (the add-on) must
     // not queue anything: a fence submitted ahead of the sandwich would signal
@@ -2095,6 +2141,43 @@ static void BridgeOnGameSubmitDone(VkQueue queue, uint32_t family, bool tracked,
     }
     RecountSlots();
     FrameUnlock();
+}
+
+// The submitted Vulkan sandwich cannot finish until its worker signals
+// ev_output. Entering NVIDIA's presentation path before that point can invert
+// an internal driver mutex with the private D3D12/vkd3d command recorder:
+// present waits for the sandwich while the producer waits for present's lock.
+// Wait on our own host event first. This does not introduce a new dependency;
+// it moves an existing GPU wait outside the driver and leaves every frame and
+// every neural evaluation intact.
+static void BridgeWaitBeforePresent(VkQueue queue)
+{
+    if (!g_handoff_ready || queue == VK_NULL_HANDLE) return;
+
+    HANDLE pending[Bridge::kMaxFrames] = {};
+    UINT64 values[Bridge::kMaxFrames] = {};
+    int count = 0;
+    FrameLock();
+    for (int i = 0; i < ActiveFrameCount(); ++i)
+    {
+        Bridge::VkFrame &fr = g_bridge.vkframe[i];
+        if (!fr.in_flight || fr.submit_queue != queue || fr.worker_done || !fr.host_done)
+            continue;
+        pending[count] = fr.host_done;
+        values[count] = fr.value;
+        ++count;
+    }
+    FrameUnlock();
+    if (!count) return;
+
+    const ULONGLONG started = GetTickCount64();
+    for (int i = 0; i < count; ++i)
+        WaitForSingleObject(pending[i], INFINITE);
+    const ULONGLONG elapsed = GetTickCount64() - started;
+    if (elapsed >= 8)
+        Log("[present-gate] waited %llums for %d submitted bridge frame(s), newest=%llu queue=%p thread=%lu",
+            (unsigned long long)elapsed, count,
+            (unsigned long long)values[count - 1], queue, GetCurrentThreadId());
 }
 
 // The game begins a command buffer. One the bridge has work in that was never
@@ -2199,6 +2282,7 @@ static void D3D12ReleaseResources()
         for (int i = 0; i < ActiveFrameCount(); ++i)
         {
             Bridge::VkFrame &fr = g_bridge.vkframe[i];
+            if (fr.host_done) SetEvent(fr.host_done);
             if (fr.ev_output && g_disp->SetEvent) g_disp->SetEvent(g_bridge.device, fr.ev_output);
         }
     if (g_bridge.device && g_disp)
@@ -2242,10 +2326,11 @@ static void D3D12ReleaseResources()
             if (fr.ev_output && g_disp->DestroyEvent) { g_disp->DestroyEvent(dev, fr.ev_output, nullptr); }
             if (fr.ev_done   && g_disp->DestroyEvent) { g_disp->DestroyEvent(dev, fr.ev_done,   nullptr); }
             fr.ev_inputs = VK_NULL_HANDLE; fr.ev_output = VK_NULL_HANDLE; fr.ev_done = VK_NULL_HANDLE;
+            if (fr.host_done) { CloseHandle(fr.host_done); fr.host_done = nullptr; }
             if (fr.game_depth_view && g_disp->DestroyImageView)
             { g_disp->DestroyImageView(dev, fr.game_depth_view, nullptr); fr.game_depth_view = VK_NULL_HANDLE; }
             fr.submitted = false; fr.depth_scratch_size = 0;
-            fr.cmd = VK_NULL_HANDLE; fr.primary = VK_NULL_HANDLE;
+            fr.cmd = VK_NULL_HANDLE; fr.primary = VK_NULL_HANDLE; fr.submit_queue = VK_NULL_HANDLE;
             fr.in_flight = false; fr.matching = false; fr.judged = false;
             InterlockedExchange(&fr.worker_done, 0);
             InterlockedExchange(&fr.abandoned, 0);

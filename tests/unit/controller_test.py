@@ -163,7 +163,6 @@ with tempfile.TemporaryDirectory() as temporary:
         "[DlssNr]\nEnabled=true\nRunBeforeSR=false\nDeferredDLSS=true\n"
         "WorkingScale=0.5\nPasses=3\nToggleKey=auto\n"
     )
-    (optiscaler / "nvngx.dll_dlssnr.dll").write_bytes(b"forwarder")
     (backend / "backend.dll").write_bytes(b"backend")
     game_exe = game / "Game.exe"
     game_exe.write_bytes(b"game")
@@ -194,6 +193,7 @@ with tempfile.TemporaryDirectory() as temporary:
     assert "WorkingScale=1" in session_ini
     assert "Passes=1" in session_ini
     assert "ToggleKey=0x87" in session_ini
+    assert not (launch.directory / "nvngx.dll_dlssnr.dll").exists()
     bridge_cfg = (launch.directory / "dlss5-vk-bridge.cfg").read_text()
     assert "neural_placement" not in bridge_cfg
     assert "neural_working_scale" not in bridge_cfg

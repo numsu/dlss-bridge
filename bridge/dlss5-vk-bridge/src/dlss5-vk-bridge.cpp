@@ -190,7 +190,7 @@ static volatile LONG g_neural_only_latched;
 // The pulse surrounds one evaluate, which makes the mode transition occur at a
 // frame boundary without stopping capture, transport, or private DLSS.
 static volatile LONG g_toggle_chord_down;
-static volatile LONG g_neural_pass_enabled = 1;
+static volatile LONG g_neural_effect_visible = 1;
 static const int kNeuralToggleVirtualKey = VK_F24;
 
 // ---------------------------------------------------------------------------
@@ -259,8 +259,9 @@ static bool BeginNeuralTogglePulse()
              GetLastError());
         return false;
     }
-    const LONG enabled = InterlockedCompareExchange(&g_neural_pass_enabled, 0, 0);
-    Log("[control] Ctrl+Shift+N: neural rendering %s", enabled ? "disabling" : "enabling");
+    const LONG enabled = InterlockedCompareExchange(&g_neural_effect_visible, 0, 0);
+    Log("[control] Ctrl+Shift+N: requesting neural effect %s",
+        enabled ? "hidden" : "visible");
     return true;
 }
 
@@ -273,10 +274,10 @@ static void EndNeuralTogglePulse(bool active)
     input.ki.dwFlags = KEYEVENTF_KEYUP;
     if (SendInput(1, &input, sizeof(input)) != 1)
         Warn("[control] neural toggle key release failed (Win32 %lu)", GetLastError());
-    const LONG previous = InterlockedCompareExchange(&g_neural_pass_enabled, 0, 0);
-    InterlockedExchange(&g_neural_pass_enabled, previous ? 0 : 1);
-    Log("[control] neural rendering is now %s; private DLSS and frame transport remain active",
-        previous ? "disabled" : "enabled");
+    const LONG previous = InterlockedCompareExchange(&g_neural_effect_visible, 0, 0);
+    InterlockedExchange(&g_neural_effect_visible, previous ? 0 : 1);
+    Log("[control] neural A/B input delivered; requested effect=%s; model and private DLSS remain warm",
+        previous ? "hidden" : "visible");
 }
 
 static bool LoadConfig()
@@ -343,6 +344,13 @@ static bool NoteVkFeatureCreate(int feature)
     return true;
 }
 
+// Implemented by vk_interop.inc after the host-specific Vulkan wrappers. A
+// submitted game frame waits on the bridge's output event on the GPU. Keep
+// vkQueuePresentKHR out of the driver until the worker has produced that
+// output, otherwise NVIDIA's present path and the private D3D12 recorder can
+// acquire the driver's internal locks in opposite order.
+static void BridgeWaitBeforePresent(VkQueue queue);
+
 // ---------------------------------------------------------------------------
 // the three halves (order matters: D3D12 session, then the host, then interop)
 //
@@ -351,6 +359,7 @@ static bool NoteVkFeatureCreate(int feature)
 // and a handful of kHost* traits.
 // ---------------------------------------------------------------------------
 #include "d3d12_session.inc"
+#include "frame_pacing.inc"
 #if defined(DLSS5VK_HOOK_HOST)
 #include "hook_host.inc"
 #elif defined(DLSS5VK_ADDON_HOST)
@@ -632,6 +641,8 @@ static NVSDK_NGX_Result ForwardVkEvaluateVia(int idx, VkCommandBuffer cmd,
 static NVSDK_NGX_Result BridgedVkEvaluate(int idx, VkCommandBuffer cmd, const NVSDK_NGX_Handle *feat,
                                           const NVSDK_NGX_Parameter *p, PFN_NVSDK_NGX_ProgressCallback cb)
 {
+    LARGE_INTEGER evaluate_started = {}, forwarded_done = {}, capture_done = {};
+    QueryPerformanceCounter(&evaluate_started);
     ++g_ngx_nest;
     const bool outer = (g_ngx_nest == 1);
 
@@ -668,6 +679,7 @@ static NVSDK_NGX_Result BridgedVkEvaluate(int idx, VkCommandBuffer cmd, const NV
     }
     else
         r = ForwardVkEvaluateVia(idx, cmd, feat, p, cb);
+    QueryPerformanceCounter(&forwarded_done);
     if (outer && !g_bridge.disabled)
     {
         FaultInfo fi;
@@ -679,7 +691,24 @@ static NVSDK_NGX_Result BridgedVkEvaluate(int idx, VkCommandBuffer cmd, const NV
           LogFaultSite(&fi);
           BridgeDisable("the bridge frame path raised an exception"); }
     }
+    QueryPerformanceCounter(&capture_done);
     --g_ngx_nest;
+    const double elapsed = CpuElapsedMs(evaluate_started);
+    if (outer && elapsed >= 8.0)
+    {
+        LARGE_INTEGER frequency = {};
+        if (QueryPerformanceFrequency(&frequency) && frequency.QuadPart)
+        {
+            const double scale = 1000.0 / (double)frequency.QuadPart;
+            Log("[stall] game-thread NGX evaluate %.3fms (game call %.3fms, bridge capture %.3fms, setup %.3fms) bridge-frame=%llu thread=%lu",
+                elapsed,
+                (double)(forwarded_done.QuadPart - evaluate_started.QuadPart) * scale,
+                (double)(capture_done.QuadPart - forwarded_done.QuadPart) * scale,
+                elapsed - (double)(capture_done.QuadPart - evaluate_started.QuadPart) * scale,
+                (unsigned long long)g_bridge.timeline, GetCurrentThreadId());
+        }
+    }
+    if (outer) NoteNgxPace(feat, evaluate_started);
     return r;
 }
 

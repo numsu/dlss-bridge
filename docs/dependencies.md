@@ -8,7 +8,7 @@ source of truth for changing versions.
 
 | Name | Why it exists | Version | Upstream |
 | --- | --- | --- | --- |
-| OptiScaler DLSS-NR PreSR Multipass | Hosts the private D3D12 NGX call and invokes the neural-rendering add-on. Packaging applies the repository's Vulkan-call patch so the bridge owns the Vulkan execution point. | 0.7.7 | [wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.7.7) |
+| OptiScaler DLSS-NR PreSR Multipass | Hosts the private D3D12 NGX call and invokes the neural-rendering add-on. Packaging disables its native Vulkan model backend so the bridge owns the Vulkan execution point. | 0.8.3 | [wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.8.3) |
 | NVIDIA DLSS Neural Rendering runtime | Provides `nvngx_dlssnr.dll`, the neural model runtime loaded in each isolated session. Setup downloads it separately because it is governed by NVIDIA's license. | DLSS 5 Visual Enhancer 7.0 bundle | [Merserk/dlss5-visual-enhancer](https://github.com/Merserk/dlss5-visual-enhancer/releases/tag/v7.0) |
 
 ## Source and build dependencies

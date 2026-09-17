@@ -55,6 +55,26 @@ static NVSDK_NGX_Result SafeEvaluate(PFN_D3D12EvaluateFeature fn, ID3D12Graphics
     __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
 }
 
+// NGX/OptiScaler records work on the CPU before the D3D12 queue sees it.
+// GPU timestamps alone cannot reveal a stall in this part of the frame.
+static double CpuElapsedMs(const LARGE_INTEGER &started)
+{
+    LARGE_INTEGER finished = {}, frequency = {};
+    if (!started.QuadPart || !QueryPerformanceCounter(&finished) ||
+        !QueryPerformanceFrequency(&frequency) || !frequency.QuadPart)
+        return 0.0;
+    return (double)(finished.QuadPart - started.QuadPart) * 1000.0 /
+           (double)frequency.QuadPart;
+}
+
+static void ReportSlowCpuStage(const char *stage, const LARGE_INTEGER &started)
+{
+    const double elapsed = CpuElapsedMs(started);
+    if (elapsed >= 8.0)
+        Log("[stall] %s blocked the frame worker for %.3fms bridge-frame=%llu thread=%lu",
+            stage, elapsed, (unsigned long long)g_bridge.timeline, GetCurrentThreadId());
+}
+
 // NGX answers in hex; names taken from nvsdk_ngx_defs.h so a report does not
 // need the header to be read.
 static const char *NgxResultName(NVSDK_NGX_Result r)
@@ -106,6 +126,12 @@ static ULONGLONG      g_mgpu_pending_submitted_at;
 static UINT64         g_mgpu_pending_gpu_calibration;
 static UINT64         g_mgpu_pending_cpu_calibration;
 static UINT64         g_mgpu_pending_submit_qpc;
+
+static void NeuralTimingRetireSlot(int slot);
+static void NeuralTimingFlush();
+static bool D3D12TimingReadPipeline(int slot, double *upload_ms,
+                                    double *neural_ms, double *download_ms,
+                                    UINT64 *gpu_start, UINT64 *gpu_end);
 
 static void NgxAddModuleDir(HMODULE m, unsigned int *n)
 {
@@ -329,8 +355,12 @@ static bool D3D12BeginCommands()
     const UINT64 retire = g_bridge.alloc_fence[slot];
     if (retire != 0 && g_bridge.fence_gpu->GetCompletedValue() < retire)
     {
+        LARGE_INTEGER wait_started = {};
+        QueryPerformanceCounter(&wait_started);
         g_bridge.fence_gpu->SetEventOnCompletion(retire, g_bridge.fence_event);
-        if (WaitForSingleObject(g_bridge.fence_event, 2000) != WAIT_OBJECT_0 ||
+        const DWORD wait_result = WaitForSingleObject(g_bridge.fence_event, 2000);
+        ReportSlowCpuStage("D3D12 command allocator retirement", wait_started);
+        if (wait_result != WAIT_OBJECT_0 ||
             g_bridge.fence_gpu->GetCompletedValue() < retire)
         {
             Log("[bridge] the GPU did not retire allocator slot %d within 2 s.", slot);
@@ -338,6 +368,7 @@ static bool D3D12BeginCommands()
             return false;
         }
     }
+    NeuralTimingRetireSlot(slot);
     if (g_bridge.alloc[slot] == nullptr) return false;
     if (FAILED(g_bridge.alloc[slot]->Reset())) return false;
     return SUCCEEDED(g_bridge.list->Reset(g_bridge.alloc[slot], nullptr));
@@ -346,12 +377,15 @@ static bool D3D12BeginCommands()
 // Submits, records which fence value retires the allocator, advances the ring.
 static UINT64 D3D12EndCommands()
 {
+    LARGE_INTEGER submission_started = {};
+    QueryPerformanceCounter(&submission_started);
     g_bridge.list->Close();
     ID3D12CommandList *lists[] = { g_bridge.list };
     g_bridge.queue->ExecuteCommandLists(1, lists);
 
     const UINT64 v = ++g_bridge.gpu_value;
     g_bridge.queue->Signal(g_bridge.fence_gpu, v);
+    ReportSlowCpuStage("D3D12 close/submit/signal", submission_started);
     g_bridge.alloc_fence[g_bridge.frame_slot] = v;
     g_bridge.frame_slot = (g_bridge.frame_slot + 1) % ActiveFrameCount();
     return v;
@@ -456,6 +490,7 @@ static bool D3D12BeginPipelineCommands(int slot,
         if (!D3D12WaitNeural(retire, "pipeline command allocator", 2000))
             return false;
     }
+    NeuralTimingRetireSlot(slot);
     if (FAILED(g_bridge.alloc[slot]->Reset()) ||
         FAILED(g_mgpu.pipeline_list[slot]->Reset(g_bridge.alloc[slot], nullptr)))
         return false;
@@ -592,6 +627,137 @@ static double ProfilePercentile(const double *values, unsigned count, double fra
     }
     unsigned index = (unsigned)((count - 1) * fraction + 0.5);
     return sorted[index];
+}
+
+// Timestamp samples are tagged when their command list is submitted and read
+// only after the allocator fence proves that the query data has retired. This
+// keeps telemetry out of the frame's critical path on the same-GPU route.
+static constexpr unsigned kNeuralTimingSamples = 64;
+
+struct NeuralTimingWindow
+{
+    double ms[kNeuralTimingSamples];
+    unsigned count;
+    bool have_state;
+    bool enabled;
+    unsigned windows_since_report;
+    double latest_p50[2];
+    bool have_latest_p50[2];
+};
+static NeuralTimingWindow g_neural_timing = {};
+static bool g_neural_timing_pending[Bridge::kMaxFrames] = {};
+static bool g_neural_timing_state[Bridge::kMaxFrames] = {};
+static bool g_neural_timing_pipeline[Bridge::kMaxFrames] = {};
+static SRWLOCK g_neural_timing_lock = SRWLOCK_INIT;
+
+static void NeuralTimingReportWindow()
+{
+    if (g_neural_timing.count < 16) return;
+    const double p50 = ProfilePercentile(
+        g_neural_timing.ms, g_neural_timing.count, .50);
+    const double p95 = ProfilePercentile(
+        g_neural_timing.ms, g_neural_timing.count, .95);
+    const double p99 = ProfilePercentile(
+        g_neural_timing.ms, g_neural_timing.count, .99);
+    const unsigned state = g_neural_timing.enabled ? 1u : 0u;
+    Log("[telemetry] private evaluate effect=%s samples=%u GPU-ms p50=%.3f p95=%.3f p99=%.3f",
+        g_neural_timing.enabled ? "visible" : "hidden", g_neural_timing.count,
+        p50, p95, p99);
+    g_neural_timing.latest_p50[state] = p50;
+    g_neural_timing.have_latest_p50[state] = true;
+    if (g_neural_timing.have_latest_p50[0] &&
+        g_neural_timing.have_latest_p50[1])
+    {
+        Log("[telemetry] neural effect visible-minus-hidden p50=%.3fms "
+            "(visible=%.3fms hidden=%.3fms; model and private DLSS run in both states)",
+            g_neural_timing.latest_p50[1] - g_neural_timing.latest_p50[0],
+            g_neural_timing.latest_p50[1], g_neural_timing.latest_p50[0]);
+    }
+}
+
+static void NeuralTimingAdd(bool enabled, double ms)
+{
+    if (ms <= 0.0 || ms > 10000.0) return;
+    AcquireSRWLockExclusive(&g_neural_timing_lock);
+    if (g_neural_timing.have_state && g_neural_timing.enabled != enabled)
+    {
+        NeuralTimingReportWindow();
+        g_neural_timing.count = 0;
+        g_neural_timing.windows_since_report = 0;
+    }
+    g_neural_timing.have_state = true;
+    g_neural_timing.enabled = enabled;
+    g_neural_timing.ms[g_neural_timing.count++] = ms;
+    if (g_neural_timing.count == _countof(g_neural_timing.ms))
+    {
+        // File logging is synchronous. Keep an initial baseline and then one
+        // periodic window per ten seconds, while retaining an immediate
+        // state-change window for the in-game visual comparison.
+        const unsigned state = g_neural_timing.enabled ? 1u : 0u;
+        if (!g_neural_timing.have_latest_p50[state] ||
+            ++g_neural_timing.windows_since_report >= 10)
+        {
+            NeuralTimingReportWindow();
+            g_neural_timing.windows_since_report = 0;
+        }
+        g_neural_timing.count = 0;
+    }
+    ReleaseSRWLockExclusive(&g_neural_timing_lock);
+}
+
+static void NeuralTimingSubmit(int slot, bool enabled, bool pipeline)
+{
+    if (!g_bridge.timing_heap || slot < 0 || slot >= ActiveFrameCount()) return;
+    AcquireSRWLockExclusive(&g_neural_timing_lock);
+    g_neural_timing_state[slot] = enabled;
+    g_neural_timing_pipeline[slot] = pipeline;
+    g_neural_timing_pending[slot] = true;
+    ReleaseSRWLockExclusive(&g_neural_timing_lock);
+}
+
+static void NeuralTimingConsume(int slot, double ms)
+{
+    if (slot < 0 || slot >= ActiveFrameCount()) return;
+    AcquireSRWLockExclusive(&g_neural_timing_lock);
+    const bool pending = g_neural_timing_pending[slot];
+    const bool enabled = g_neural_timing_state[slot];
+    g_neural_timing_pending[slot] = false;
+    ReleaseSRWLockExclusive(&g_neural_timing_lock);
+    if (pending) NeuralTimingAdd(enabled, ms);
+}
+
+static void NeuralTimingRetireSlot(int slot)
+{
+    if (slot < 0 || slot >= ActiveFrameCount()) return;
+    AcquireSRWLockExclusive(&g_neural_timing_lock);
+    const bool pending = g_neural_timing_pending[slot];
+    const bool enabled = g_neural_timing_state[slot];
+    const bool pipeline = g_neural_timing_pipeline[slot];
+    g_neural_timing_pending[slot] = false;
+    ReleaseSRWLockExclusive(&g_neural_timing_lock);
+    if (!pending) return;
+    double neural_ms = 0.0;
+    if (pipeline)
+    {
+        double upload_ms = 0.0, download_ms = 0.0;
+        D3D12TimingReadPipeline(slot, &upload_ms, &neural_ms, &download_ms,
+                                nullptr, nullptr);
+    }
+    else
+    {
+        neural_ms = D3D12TimingReadNeural(slot);
+    }
+    NeuralTimingAdd(enabled, neural_ms);
+}
+
+static void NeuralTimingFlush()
+{
+    AcquireSRWLockExclusive(&g_neural_timing_lock);
+    NeuralTimingReportWindow();
+    g_neural_timing = {};
+    for (int i = 0; i < Bridge::kMaxFrames; ++i)
+        g_neural_timing_pending[i] = false;
+    ReleaseSRWLockExclusive(&g_neural_timing_lock);
 }
 
 static void ProfileRepeat(UINT64 timeline, int transport_slot)
@@ -773,7 +939,14 @@ static void D3D12DrainGpu()
         if (WaitForSingleObject(g_bridge.fence_event, 5000) != WAIT_OBJECT_0)
             Log("[bridge] timed out draining the D3D12 queue before teardown");
     }
-    for (int i = 0; i < ActiveFrameCount(); ++i) g_bridge.alloc_fence[i] = 0;
+    const UINT64 completed = g_bridge.fence_gpu->GetCompletedValue();
+    for (int i = 0; i < ActiveFrameCount(); ++i)
+    {
+        if (g_bridge.alloc_fence[i] && completed >= g_bridge.alloc_fence[i])
+            NeuralTimingRetireSlot(i);
+        g_bridge.alloc_fence[i] = 0;
+    }
+    NeuralTimingFlush();
 }
 
 static void Barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *res,
@@ -1132,7 +1305,15 @@ static bool GameEndAndWait(int slot, const char *which, DWORD timeout)
 
 static bool D3D12WaitNeural(UINT64 value, const char *stage, DWORD timeout = 4000)
 {
+    LARGE_INTEGER wait_started = {};
+    QueryPerformanceCounter(&wait_started);
     const bool ok = WaitFence(g_bridge.fence_gpu, value, g_bridge.fence_event, timeout, stage);
+    const double waited = CpuElapsedMs(wait_started);
+    if (waited >= 8.0)
+        Log("[stall] %s D3D12 fence wait %.3fms target=%llu completed=%llu bridge-frame=%llu",
+            stage, waited, (unsigned long long)value,
+            (unsigned long long)(g_bridge.fence_gpu ? g_bridge.fence_gpu->GetCompletedValue() : 0),
+            (unsigned long long)g_bridge.timeline);
     if (!ok)
     {
         const UINT64 completed = g_bridge.fence_gpu ? g_bridge.fence_gpu->GetCompletedValue() : 0;
@@ -1830,6 +2011,7 @@ static void D3D12RunEvaluatePipelined(UINT64 timeline, LONG *result, int transpo
         g_mgpu.next_present_sequence = wanted + 1;
 
         const double neural_gpu_ms = D3D12TimingReport(source.producer_timing_slot);
+        NeuralTimingConsume(source.producer_timing_slot, neural_gpu_ms);
         ProfileAdd(0.0, (double)waited, neural_gpu_ms, 0.0, (double)waited);
     }
 
@@ -1866,9 +2048,14 @@ static void D3D12RunEvaluatePipelined(UINT64 timeline, LONG *result, int transpo
     NVSDK_NGX_Result evaluated = NGX_SUCCESS;
     static const char kMark[] = "ngx evaluate";
     list->BeginEvent(1, kMark, sizeof(kMark));
+    const bool neural_effect_visible_for_evaluate =
+        InterlockedCompareExchange(&g_neural_effect_visible, 0, 0) != 0;
     const bool toggle_pulse = BeginNeuralTogglePulse();
+    LARGE_INTEGER optiscaler_started = {};
+    QueryPerformanceCounter(&optiscaler_started);
     evaluated = SafeEvaluate(g_bridge.eval_feature, list,
                              g_bridge.feature, g_bridge.params, &code);
+    ReportSlowCpuStage("OptiScaler/NGX EvaluateFeature", optiscaler_started);
     EndNeuralTogglePulse(toggle_pulse);
     list->EndEvent();
 
@@ -1887,6 +2074,8 @@ static void D3D12RunEvaluatePipelined(UINT64 timeline, LONG *result, int transpo
         *result = 4;
         return;
     }
+    if (!code && evaluated == NGX_SUCCESS)
+        NeuralTimingSubmit(timing_slot, neural_effect_visible_for_evaluate, true);
 
     producer.producer_fence = fence;
     producer.producer_timeline = timeline;
@@ -1961,6 +2150,7 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
                                             &upload_ms, &neural_ms, &download_ms,
                                             &gpu_start, &gpu_end))
                 {
+                    NeuralTimingConsume(g_mgpu_pending_timing_slot, neural_ms);
                     const double gpu_ms = upload_ms + neural_ms + download_ms;
                     const ULONGLONG retired_at = GetTickCount64();
                     const ULONGLONG wall_ms = g_mgpu_pending_submitted_at
@@ -1989,6 +2179,11 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
                         "post-gpu-observation=%.3fms",
                         (unsigned long long)wall_ms, queue_start_ms, gpu_ms,
                         upload_ms, neural_ms, download_ms, observation_ms);
+                }
+                else if (!g_mgpu_pending_timing_unified)
+                {
+                    neural_ms = D3D12TimingReadNeural(g_mgpu_pending_timing_slot);
+                    NeuralTimingConsume(g_mgpu_pending_timing_slot, neural_ms);
                 }
                 g_mgpu_pending_timing_slot = -1;
                 g_mgpu_pending_submitted_at = 0;
@@ -2052,8 +2247,13 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
     NVSDK_NGX_Result re = NGX_SUCCESS;
     static const char kMark[] = "ngx evaluate";
     g_bridge.list->BeginEvent(1, kMark, sizeof(kMark));
+    const bool neural_effect_visible_for_evaluate =
+        InterlockedCompareExchange(&g_neural_effect_visible, 0, 0) != 0;
     const bool toggle_pulse = BeginNeuralTogglePulse();
+    LARGE_INTEGER optiscaler_started = {};
+    QueryPerformanceCounter(&optiscaler_started);
     re = SafeEvaluate(g_bridge.eval_feature, g_bridge.list, g_bridge.feature, g_bridge.params, &code);
+    ReportSlowCpuStage("OptiScaler/NGX EvaluateFeature", optiscaler_started);
     EndNeuralTogglePulse(toggle_pulse);
     g_bridge.list->EndEvent();
 
@@ -2076,6 +2276,8 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
         D3D12TimingStamp(timing_slot, 3);
         D3D12TimingResolve(timing_slot);
         const UINT64 pipeline_value = D3D12EndCommands();
+        if (pipeline_value && !code && re == NGX_SUCCESS)
+            NeuralTimingSubmit(timing_slot, neural_effect_visible_for_evaluate, true);
         const ULONGLONG pipeline_submitted_at = GetTickCount64();
         timing_evaluated = GetTickCount64();
         if (!pipeline_value ||
@@ -2104,6 +2306,7 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
         transport.output_timeline = v;
         transport.output_valid = true;
         const double neural_gpu_ms = D3D12TimingReport(timing_slot);
+        NeuralTimingConsume(timing_slot, neural_gpu_ms);
         const ULONGLONG prof_done = GetTickCount64();
         ProfileAdd((double)(timing_uploaded - timing_start),
                    (double)(timing_evaluated - timing_uploaded), neural_gpu_ms,
@@ -2120,6 +2323,8 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
         UINT64 gpu_calibration = 0, cpu_calibration = 0, submit_qpc = 0;
         D3D12CaptureClockCalibration(&gpu_calibration, &cpu_calibration, &submit_qpc);
         const UINT64 evaluate_value = D3D12EndCommands();
+        if (evaluate_value && !code && re == NGX_SUCCESS)
+            NeuralTimingSubmit(timing_slot, neural_effect_visible_for_evaluate, false);
         const ULONGLONG evaluate_submitted_at = GetTickCount64();
         timing_evaluated = GetTickCount64();
         if (g_mgpu.active)
@@ -2142,6 +2347,7 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
             }
             timing_evaluated = GetTickCount64();
             const double neural_gpu_ms = D3D12TimingReadNeural(timing_slot);
+            NeuralTimingConsume(timing_slot, neural_gpu_ms);
             if (!MultiGpuDownloadOutput(v, evaluate_value, transport_slot))
             {
                 g_bridge.fence_out->Signal(v);

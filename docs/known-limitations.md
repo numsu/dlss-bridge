@@ -51,6 +51,12 @@ paths.
 - The D3D12 NGX interface must come from the exact session-local OptiScaler
   module. A different NGX dispatcher is not accepted because it could bypass
   the neural pass.
+- The packaged OptiScaler DLL is pinned and hash-checked. Packaging disables
+  its native Vulkan neural pass and redirects the visual-toggle handler to
+  `DlssNrApplyModel`; the private D3D12 model stays active. A new release needs
+  an explicit code review and patch update. Version 0.8.3 changed the D3D12
+  neural path substantially; its CPU-side frame pacing in games that stream
+  assets during movement remains unverified.
 - The application/project identity and SDK version come from the game's
   successful Vulkan NGX initialization. These are vendor interfaces without a
   stable public cross-API bridge contract.
@@ -113,15 +119,19 @@ paths.
 - The controller `probe` command verifies installation/model state and reports
   GPU inventory. Feature creation, transport usability, and visual correctness
   can only be validated inside a game process today.
-- `Ctrl+Shift+N` toggles only the neural pass while the private DLSS and
-  transport path remain active. The state is logged; there is no on-screen
-  indicator or external runtime control channel yet.
+- `Ctrl+Shift+N` shows or hides only the neural effect while the model,
+  private DLSS, and transport path remain active. OptiScaler displays the
+  applied visual state. The bridge logs the requested transition, but there is
+  no external runtime control or state-query API yet.
 
 ## Telemetry and validation
 
-- GPU timestamps can be disabled through `[telemetry].gpu_timestamps`. Logs are
-  human-readable; structured per-frame stage data, p50/p95/p99 summaries,
-  output age, and automatic route selection are not implemented.
+- GPU timestamps can be disabled through `[telemetry].gpu_timestamps`. The
+  logs include pipeline and neural-state p50/p95/p99 summaries, fresh-frame
+  rate, repeat rate, and maximum output age. Slow-frame logs separately time
+  the OptiScaler CPU call, D3D12 submission, and Vulkan handoff; GPU timestamps
+  do not cover those CPU waits. Structured per-frame telemetry, export to
+  metrics systems, and automatic route selection are not implemented.
 - Automated tests cover configuration, session isolation, component policy,
   DLL loading, injection timing, and Vulkan-module discovery. They do not
   replace hardware validation for multi-GPU output correctness, device loss,

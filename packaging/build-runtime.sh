@@ -2,11 +2,11 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 output=${1:?usage: packaging/build-runtime.sh OUTPUT_DIRECTORY}
-archive=${OPTISCALER_ARCHIVE:-"$root/runtime/downloads/OptiScaler-DLSSNR-v0.7.7.zip"}
-expected=4a315a3b3ee495631bd7cb1f562f609af577443602e507bfc7a7e6749c296258
+archive=${OPTISCALER_ARCHIVE:-"$root/runtime/downloads/OptiScaler-NR-v0.8.3.zip"}
+expected=3f2d26fb136d964a394bf50896d082156173153a2a55b88e1995277b4dabe3c8
 if [[ ! -f "$archive" ]]; then
  mkdir -p "$(dirname "$archive")"
- curl -fL --retry 3 https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/download/v0.7.7/OptiScaler-DLSSNR-v0.7.7.zip -o "$archive"
+ curl -fL --retry 3 https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/download/v0.8.3/OptiScaler-NR-v0.8.3.zip -o "$archive"
 fi
 printf '%s  %s\n' "$expected" "$archive" | sha256sum -c -
 if [[ ${DLSS_BRIDGE_SKIP_BUILD:-0} != 1 ]]; then
@@ -25,6 +25,10 @@ cp -a "$source_dir/." "$output/payload/optiscaler/"
 python3 "$root/scripts/patch-optiscaler-vulkan-nr.py" "$output/payload/optiscaler/OptiScaler.dll" "$output/payload/optiscaler/OptiScaler.dll.patched"
 mv "$output/payload/optiscaler/OptiScaler.dll.patched" "$output/payload/optiscaler/OptiScaler.dll"
 python3 "$root/packaging/configure_optiscaler.py" "$output/payload/optiscaler/OptiScaler.ini"
+[[ ! -e "$output/payload/optiscaler/nvngx.dll_dlssnr.dll" ]] || {
+  echo "obsolete OptiScaler neural-runtime helper was packaged" >&2
+  exit 1
+}
 rm -rf "$output/payload/optiscaler/docs"
 rm -f "$output/payload/optiscaler/setup_linux.sh" \
       "$output/payload/optiscaler/setup_windows.bat" \
@@ -52,6 +56,7 @@ install -m0644 "$root/scripts/patch-optiscaler-vulkan-nr.py" "$output/licenses/O
 install -m0644 "$root/docs/installation.md" "$output/docs/installation.md"
 install -m0644 "$root/docs/dependencies.md" "$output/docs/dependencies.md"
 install -m0644 "$root/docs/known-limitations.md" "$output/docs/known-limitations.md"
+install -m0644 "$root/docs/diagnostics.md" "$output/docs/diagnostics.md"
 install -m0644 "$root/docs/portable-architecture.md" "$output/docs/portable-architecture.md"
 cat >"$output/RUNTIME-SOURCE.txt" <<'EOF'
 The NVIDIA nvngx_dlssnr.dll runtime is not redistributed in this package.
@@ -61,7 +66,7 @@ stores it in per-user state. Reinstall DLSS Bridge if this file is missing.
 EOF
 cat >"$output/THIRD-PARTY-NOTICES.md" <<'EOF'
 # Third-party notices
-This package contains a modified OptiScaler DLSS-NR v0.7.7 binary from
+This package contains a modified OptiScaler DLSS-NR v0.8.3 binary from
 https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass. The exact,
 hash-checked modification is included as licenses/OptiScaler-binary-patch.py.
 OptiScaler and the bridge are GPL-3.0. Their source and build scripts are

@@ -131,7 +131,7 @@ static bool AddonResolveDispatch(AddonDevice &ad)
     VkDevice dev = ad.device;
     #define GD(name) d->name = (PFN_vk##name)gdpa(dev, "vk" #name)
     GD(DestroyDevice); GD(GetDeviceQueue); GD(GetDeviceQueue2);
-    GD(QueueSubmit); GD(QueueSubmit2);
+    GD(QueueSubmit); GD(QueueSubmit2); GD(QueuePresentKHR);
     if (d->QueueSubmit2 == nullptr)
         d->QueueSubmit2 = (PFN_vkQueueSubmit2)gdpa(dev, "vkQueueSubmit2KHR");
     GD(CreateImage); GD(DestroyImage); GD(GetImageMemoryRequirements); GD(BindImageMemory);

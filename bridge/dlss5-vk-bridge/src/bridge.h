@@ -242,6 +242,8 @@ struct Bridge
         VkCommandBuffer cmd;                // the game command buffer the work went into
         VkCommandBuffer primary;            // the primary that executes `cmd` when it
                                             //   is a secondary (vkCmdExecuteCommands)
+        VkQueue         submit_queue;        // queue that submitted this sandwich
+        HANDLE          host_done;           // worker completion, used before presentation
         UINT64          value;              // this frame's timeline value
         bool            in_flight;          // recorded, not yet seen retired
         bool            matching;           // a submit carrying `cmd` is going down

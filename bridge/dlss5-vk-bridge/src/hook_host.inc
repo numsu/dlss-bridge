@@ -28,6 +28,7 @@ static __declspec(thread) int g_internal_submit;
 static bool     BridgeWantsSubmitMatch();
 static uint32_t BridgeMatchSubmit(uint32_t count, const VkSubmitInfo *submits);
 static uint32_t BridgeMatchSubmit2(uint32_t count, const VkSubmitInfo2 *submits);
+static UINT64   BridgeSubmitTimeline(uint32_t slots);
 static void     BridgeOnGameSubmitDone(VkQueue queue, uint32_t family, bool tracked, uint32_t slots, bool ok);
 static void     BridgeNoteUnmatchedSubmit(uint32_t family, bool tracked);
 static void     BridgeOnCommandBufferBegin(VkCommandBuffer cmd);
@@ -405,7 +406,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL dlss5vk_CreateDevice(
         d->device = *out; d->phys = phys; d->GetDeviceProcAddr = gdpa;
         #define GD(name) d->name = (PFN_vk##name)gdpa(*out, "vk" #name)
         GD(DestroyDevice); GD(GetDeviceQueue); GD(GetDeviceQueue2);
-        GD(QueueSubmit); GD(QueueSubmit2);
+        GD(QueueSubmit); GD(QueueSubmit2); GD(QueuePresentKHR);
         // On a device where synchronization2 comes from VK_KHR_synchronization2
         // rather than core 1.3, only the KHR name resolves -- and this layer
         // intercepts vkQueueSubmit2KHR, so leaving the pointer null would turn
@@ -483,7 +484,7 @@ static void HostCaptureNgxInit(VkInstance instance, VkPhysicalDevice phys, VkDev
         {
             memset(d,0,sizeof(*d)); d->device=dev; d->phys=phys; d->GetDeviceProcAddr=g_next_gdpa;
             #define GD(name) d->name=(PFN_vk##name)g_next_gdpa(dev,"vk" #name)
-            GD(DestroyDevice); GD(GetDeviceQueue); GD(GetDeviceQueue2); GD(QueueSubmit); GD(QueueSubmit2);
+            GD(DestroyDevice); GD(GetDeviceQueue); GD(GetDeviceQueue2); GD(QueueSubmit); GD(QueueSubmit2); GD(QueuePresentKHR);
             if(!d->QueueSubmit2)d->QueueSubmit2=(PFN_vkQueueSubmit2)g_next_gdpa(dev,"vkQueueSubmit2KHR");
             GD(CreateImage); GD(DestroyImage); GD(GetImageMemoryRequirements); GD(BindImageMemory);
             GD(AllocateMemory); GD(FreeMemory); GD(CreateBuffer); GD(DestroyBuffer);
@@ -528,7 +529,11 @@ static void ForgetQueues(VkDevice dev)
 {
     EnterCriticalSection(&g_disp_cs);
     for (LONG i = 0; i < g_queue_count; )
-        if (g_queues[i].device == dev) g_queues[i] = g_queues[--g_queue_count];
+        if (g_queues[i].device == dev)
+        {
+            ForgetPresentPace(g_queues[i].queue);
+            g_queues[i] = g_queues[--g_queue_count];
+        }
         else ++i;
     LeaveCriticalSection(&g_disp_cs);
 }
@@ -581,8 +586,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL dlss5vk_QueueSubmit(
     VkResult r = d->QueueSubmit(queue, count, submits, fence);
     const ULONGLONG submit_elapsed = GetTickCount64() - submit_started;
     if (submit_elapsed >= 8)
-        Log("[vk-submit] game GPU vkQueueSubmit blocked %llums family=%u submits=%u matched-slots=0x%X",
-            (unsigned long long)submit_elapsed, family, count, slots);
+        Log("[vk-submit] game GPU vkQueueSubmit blocked %llums family=%u submits=%u matched-slots=0x%X frame=%llu thread=%lu",
+            (unsigned long long)submit_elapsed, family, count, slots,
+            (unsigned long long)BridgeSubmitTimeline(slots), GetCurrentThreadId());
     if (slots)
         BridgeOnGameSubmitDone(queue, family, tracked, slots, r == VK_SUCCESS);
     else if (r == VK_SUCCESS && BridgeWantsSubmitMatch())
@@ -603,13 +609,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL dlss5vk_QueueSubmit2(
     VkResult r = d->QueueSubmit2(queue, count, submits, fence);
     const ULONGLONG submit_elapsed = GetTickCount64() - submit_started;
     if (submit_elapsed >= 8)
-        Log("[vk-submit] game GPU vkQueueSubmit2 blocked %llums family=%u submits=%u matched-slots=0x%X",
-            (unsigned long long)submit_elapsed, family, count, slots);
+        Log("[vk-submit] game GPU vkQueueSubmit2 blocked %llums family=%u submits=%u matched-slots=0x%X frame=%llu thread=%lu",
+            (unsigned long long)submit_elapsed, family, count, slots,
+            (unsigned long long)BridgeSubmitTimeline(slots), GetCurrentThreadId());
     if (slots)
         BridgeOnGameSubmitDone(queue, family, tracked, slots, r == VK_SUCCESS);
     else if (r == VK_SUCCESS && BridgeWantsSubmitMatch())
         BridgeNoteUnmatchedSubmit(family, tracked);
     return r;
+}
+
+// The game's submitted command buffer already waits for the bridge output on
+// the GPU. Complete the corresponding CPU handoff before entering the driver
+// so presentation cannot hold a driver lock needed by the producer.
+static VKAPI_ATTR VkResult VKAPI_CALL dlss5vk_QueuePresentKHR(
+    VkQueue queue, const VkPresentInfoKHR *info)
+{
+    DeviceDispatch *d = DispatchForQueue(queue, nullptr, nullptr);
+    if (!d || !d->QueuePresentKHR) d = DispatchForKey(queue);
+    if (!d || !d->QueuePresentKHR) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    BridgeWaitBeforePresent(queue);
+    LARGE_INTEGER started = {}, finished = {};
+    QueryPerformanceCounter(&started);
+    VkResult result = d->QueuePresentKHR(queue, info);
+    QueryPerformanceCounter(&finished);
+    NotePresentPace(queue, info, result, started, finished);
+    return result;
 }
 
 // ---- command-buffer lifetime ----------------------------------------------
@@ -673,6 +698,9 @@ dlss5vk_GetDeviceProcAddr(VkDevice dev, const char *pName)
     INTERCEPT(GetDeviceQueue);
     INTERCEPT(GetDeviceQueue2);
     INTERCEPT(QueueSubmit);
+    if (strcmp(pName, "vkQueuePresentKHR") == 0)
+        return d->QueuePresentKHR ? (PFN_vkVoidFunction)dlss5vk_QueuePresentKHR :
+            (d->GetDeviceProcAddr ? d->GetDeviceProcAddr(dev, pName) : nullptr);
     INTERCEPT(BeginCommandBuffer);
     INTERCEPT(CmdExecuteCommands);
     // Claim vkQueueSubmit2/KHR only when there is a real pointer to forward
@@ -732,9 +760,21 @@ static bool IsSystemModulePath(const wchar_t *path)
         (path[length] == L'\\' || path[length] == L'/');
 }
 
+static bool IsApplicationPath(const wchar_t *path)
+{
+    if (!path || !g_application_root[0]) return false;
+    const size_t root_length = wcslen(g_application_root);
+    return _wcsnicmp(path, g_application_root, root_length) == 0;
+}
+
 static void RegisterApplicationModule(HMODULE module, const wchar_t *path)
 {
-    if (!module || IsSystemModulePath(path)) return;
+    // Only code shipped with the game needs its loader calls redirected. In
+    // particular, never rewrite the isolated neural runtime: OptiScaler 0.8.x
+    // temporarily owns some of its loader imports while the direct NR backend
+    // is active, and a concurrent replacement breaks that ownership chain.
+    if (!module || IsSystemModulePath(path) ||
+        (module != GetModuleHandleW(nullptr) && !IsApplicationPath(path))) return;
     const LONG count = g_application_module_count;
     for (LONG i = 0; i < count; ++i) if (g_application_modules[i] == module) return;
     if (count < static_cast<LONG>(_countof(g_application_modules))) {
@@ -756,15 +796,21 @@ static bool IsApplicationModule(HMODULE module, const wchar_t *path)
     if (module == GetModuleHandleW(nullptr)) return true;
     for (LONG i = 0; i < g_application_module_count; ++i)
         if (g_application_modules[i] == module) return true;
-    if (!path || !g_application_root[0]) return false;
-    const size_t root_length = wcslen(g_application_root);
-    return _wcsnicmp(path, g_application_root, root_length) == 0;
+    return IsApplicationPath(path);
 }
 
 static void PatchLoadedApplicationModule(HMODULE module)
 {
     wchar_t path[MAX_PATH] = {};
     if (!module || !GetModuleFileNameW(module, path, MAX_PATH) || IsSystemModulePath(path)) return;
+    if (module != GetModuleHandleW(nullptr) && !IsApplicationPath(path))
+    {
+        static volatile LONG outside_report_count = 0;
+        const LONG report = InterlockedIncrement(&outside_report_count);
+        if (report <= 8)
+            Log("[iat-host] module outside the game root left untouched: %ls", path);
+        return;
+    }
     EnterCriticalSection(&g_iat_cs);
     RegisterApplicationModule(module, path);
     PatchLoaderIat(module, path);
@@ -789,6 +835,7 @@ static void *VulkanReplacement(const char *name)
     if (strcmp(name, "vkGetDeviceQueue") == 0) return (void *)dlss5vk_GetDeviceQueue;
     if (strcmp(name, "vkGetDeviceQueue2") == 0) return (void *)dlss5vk_GetDeviceQueue2;
     if (strcmp(name, "vkQueueSubmit") == 0) return (void *)dlss5vk_QueueSubmit;
+    if (strcmp(name, "vkQueuePresentKHR") == 0) return (void *)dlss5vk_QueuePresentKHR;
     if (strcmp(name, "vkQueueSubmit2") == 0 || strcmp(name, "vkQueueSubmit2KHR") == 0)
         return (void *)dlss5vk_QueueSubmit2;
     if (strcmp(name, "vkBeginCommandBuffer") == 0) return (void *)dlss5vk_BeginCommandBuffer;
@@ -804,7 +851,7 @@ static FARPROC WINAPI GetProcAddressAndPatch(HMODULE module, LPCSTR name)
     FARPROC resolved = real ? real(module, name) : nullptr;
     if (reinterpret_cast<uintptr_t>(name) <= 0xffff) return resolved;
     if (!EnsureRealLoader() || module != g_real_vulkan) return resolved;
-    void *replacement = VulkanReplacement(name);
+    void *replacement = resolved ? VulkanReplacement(name) : nullptr;
     return replacement ? reinterpret_cast<FARPROC>(replacement) : resolved;
 }
 
@@ -938,6 +985,7 @@ static unsigned PatchVulkanIat(HMODULE module, const wchar_t *module_name)
         { "vkGetDeviceQueue",      (void *)dlss5vk_GetDeviceQueue },
         { "vkGetDeviceQueue2",     (void *)dlss5vk_GetDeviceQueue2 },
         { "vkQueueSubmit",         (void *)dlss5vk_QueueSubmit },
+        { "vkQueuePresentKHR",      (void *)dlss5vk_QueuePresentKHR },
         { "vkQueueSubmit2",        (void *)dlss5vk_QueueSubmit2 },
         { "vkQueueSubmit2KHR",     (void *)dlss5vk_QueueSubmit2 },
         { "vkBeginCommandBuffer",  (void *)dlss5vk_BeginCommandBuffer },

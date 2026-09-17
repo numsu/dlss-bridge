@@ -33,6 +33,7 @@ struct DeviceDispatch
     PFN_vkGetDeviceQueue2             GetDeviceQueue2;
     PFN_vkQueueSubmit                 QueueSubmit;
     PFN_vkQueueSubmit2                QueueSubmit2;
+    PFN_vkQueuePresentKHR              QueuePresentKHR;
     PFN_vkCreateImage                 CreateImage;
     PFN_vkDestroyImage                DestroyImage;
     PFN_vkGetImageMemoryRequirements  GetImageMemoryRequirements;

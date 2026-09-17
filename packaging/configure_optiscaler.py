@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import sys
-VALUES={'VulkanUpscaler':'dlss','Enabled':'true','ToggleKey':'0x87','Passes':'1','WorkingScale':'1.0','FinishedPicture':'false','ResidualAcrossRR':'false','ResidualFG':'false','AutoCapture':'false','RunBeforeSR':'true','DeferredDLSS':'false'}
+VALUES={'VulkanUpscaler':'dlss','Enabled':'true','ToggleKey':'0x87','Passes':'1','WorkingScale':'1.0','FinishedPicture':'false','ResidualAcrossRR':'false','AutoCapture':'false','RunBeforeSR':'true','DeferredDLSS':'false'}
 if len(sys.argv)!=2: raise SystemExit(f'usage: {sys.argv[0]} OptiScaler.ini')
 p=Path(sys.argv[1]); lines=p.read_text(encoding='utf-8-sig').splitlines(); section=''; seen=set(); out=[]
 for line in lines:

@@ -143,14 +143,20 @@ launch without DLSS Bridge; no disable flag is needed.
 
 ## Toggle neural rendering while playing
 
-Press **Ctrl+Shift+N** to switch the neural pass on or off. The binding works
+Press **Ctrl+Shift+N** to show or hide the neural effect. The binding works
 in native Windows and in Windows games running through Proton. DLSS Bridge
-continues its private DLSS, frame capture, transport, and reinsertion path in
-both modes; only neural processing changes. This makes the toggle suitable for
-comparing image quality and performance in the same scene.
+continues its private DLSS, neural model, frame capture, transport, and
+reinsertion path in both modes; only composition of the neural result changes.
+This provides an immediate image-quality comparison without cold-starting the
+model or rebuilding its feature.
 
-The bridge records the selected state in the session log. It does not currently
-display an on-screen status indicator.
+OptiScaler displays the applied state on screen. The bridge records the requested
+transition in the session log. It reports private-evaluate p50, p95, and p99
+GPU time every 64 successful evaluations, and also reports a state window when
+the toggle changes after at least 16 samples. Once both states have been measured,
+it reports the visible-minus-hidden p50 difference. The model and Super
+Resolution remain active in both measurements, so this difference should be
+close to zero and verifies that the A/B toggle did not disturb the hot path.
 
 ## Select a GPU
 

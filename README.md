@@ -65,10 +65,12 @@ selection, conflicts, removal, and troubleshooting.
 
 ## Toggle neural rendering in game
 
-Press **Ctrl+Shift+N** to toggle the neural pass. Capture, transport, and the
-private DLSS upscaler remain active, so this provides a direct visual and
-performance comparison without rebuilding the session or returning to the
-game's original upscaler. The session log records each transition.
+Press **Ctrl+Shift+N** to show or hide the neural effect. Capture, transport, and the
+private DLSS upscaler and neural model remain active, so this provides an
+immediate visual comparison without rebuilding the feature or returning to the
+game's original upscaler. OptiScaler displays the applied state on screen. The
+session log records each request and reports state-separated GPU timing once it
+has enough completed samples.
 
 ## GPU selection
 

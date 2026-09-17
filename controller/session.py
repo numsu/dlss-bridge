@@ -132,8 +132,7 @@ def prepare_session(
     launcher = bridge / "dlss-bridge-launcher.exe"
     hook = bridge / "dlss5-vk-hook.dll"
     model = model_path()
-    required = [launcher, hook, optiscaler / "OptiScaler.dll",
-                optiscaler / "nvngx.dll_dlssnr.dll", model]
+    required = [launcher, hook, optiscaler / "OptiScaler.dll", model]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         hint = "\nReinstall DLSS Bridge to restore the neural runtime." if str(model) in missing else ""
