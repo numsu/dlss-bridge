@@ -1,0 +1,12 @@
+# Untested profile: bg3_dx11.exe resolves to the D3D11 capture path, but no
+# hardware run has validated the Divinity D3D11 NGX contract yet. Prefer the
+# Vulkan bg3.toml profile until this one is validated.
+schema = 1
+
+[match]
+executable = "bg3_dx11.exe"
+graphics_api = "d3d11"
+
+[capture]
+adapter = "d3d11"
+max_viewports = 2

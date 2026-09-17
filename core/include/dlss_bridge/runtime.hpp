@@ -28,6 +28,7 @@ struct RuntimeConfig {
     int neural_pipeline_frames;
     int latency_budget_ms;
     int gpu_timestamps;
+    int max_viewports;
     ExecutionMode execution_mode;
     OutputTransport output_transport;
     NeuralQueueMode neural_queue_mode;

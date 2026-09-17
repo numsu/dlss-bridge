@@ -72,12 +72,14 @@ static void NotePresentPace(VkQueue queue, const VkPresentInfoKHR *info,
             (unsigned long long)g_bridge.timeline);
     // 30 FPS's ordinary 33 ms interval is summarized instead of logged on
     // every frame. Individual records are reserved for real long gaps.
+    UINT64 completed = 0;
+    for (int i = 0; i < MAX_VIEWPORTS; ++i) completed += g_bridge.viewports[i].frames_done;
     if (interval >= 50.0 || blocked >= 25.0 || result < 0)
         Log("[pace] present #%llu queue=%p interval=%.3fms call=%.3fms result=%d swapchains=%u bridge-frame=%llu completed=%llu",
             (unsigned long long)sequence, queue, interval, blocked, (int)result,
             info ? info->swapchainCount : 0,
             (unsigned long long)g_bridge.timeline,
-            (unsigned long long)g_bridge.frames_done);
+            (unsigned long long)completed);
     if (report_window)
         Log("[pace] queue=%p presents=%llu interval avg/max=%.3f/%.3fms gaps>=25/50ms=%llu/%llu call avg/max=%.3f/%.3fms calls>=8ms=%llu bridge-frame=%llu completed=%llu",
             queue, (unsigned long long)window.count,
@@ -86,7 +88,7 @@ static void NotePresentPace(VkQueue queue, const VkPresentInfoKHR *info,
             window.call_sum / 128.0, window.call_max,
             (unsigned long long)window.calls_8,
             (unsigned long long)g_bridge.timeline,
-            (unsigned long long)g_bridge.frames_done);
+            (unsigned long long)completed);
 }
 
 // Evaluate cadence is a backup clock for engines that resolve present outside

@@ -6,12 +6,14 @@ namespace dlss_bridge {
 
 static const ComponentDescriptor kComponents[] = {
     { ComponentKind::Host,      "injected-vulkan",            VulkanFrames, 0 },
+    { ComponentKind::Host,      "injected-d3d11",             D3D11Frames, 0 },
     { ComponentKind::Host,      "vulkan-windows",             VulkanFrames, 0 },
     { ComponentKind::Host,      "reshade-addon",              VulkanFrames, 0 },
-    { ComponentKind::Capture,   "ngx-vulkan",                 TemporalInputs, VulkanFrames },
-    { ComponentKind::Executor,  "ngx-d3d12",                  D3D12Execution, TemporalInputs },
-    { ComponentKind::Transport, "same-adapter-external-image", SameAdapter, VulkanFrames | D3D12Execution },
-    { ComponentKind::Transport, "directional-host-staging",    CrossAdapter, VulkanFrames | D3D12Execution },
+    { ComponentKind::Capture,   "ngx-vulkan",                 (TemporalInputs | MultiViewport), VulkanFrames },
+    { ComponentKind::Capture,   "d3d11",                      (TemporalInputs | MultiViewport), D3D11Frames },
+    { ComponentKind::Executor,  "ngx-d3d12",                  (D3D12Execution | MultiViewport), TemporalInputs },
+    { ComponentKind::Transport, "same-adapter-external-image", (SameAdapter | MultiViewport), TemporalInputs | D3D12Execution },
+    { ComponentKind::Transport, "directional-host-staging",    (CrossAdapter | MultiViewport), TemporalInputs | D3D12Execution },
 };
 
 const ComponentDescriptor *FindIntegratedComponent(ComponentKind kind, const char *id)
@@ -42,9 +44,11 @@ bool RuntimeComposition::Configure(const char *host_id)
 {
     *this = {};
     host = FindIntegratedComponent(ComponentKind::Host, host_id);
-    capture = FindIntegratedComponent(ComponentKind::Capture, "ngx-vulkan");
-    executor = FindIntegratedComponent(ComponentKind::Executor, "ngx-d3d12");
     if (!RequirementsMet(host, 0)) return false;
+    const bool d3d11 = host->provides & D3D11Frames;
+    capture = FindIntegratedComponent(ComponentKind::Capture, d3d11 ? "d3d11" : "ngx-vulkan");
+    if (!capture) return false;
+    executor = FindIntegratedComponent(ComponentKind::Executor, "ngx-d3d12");
     if (!RequirementsMet(capture, host->provides)) return false;
     return RequirementsMet(executor, host->provides | capture->provides);
 }

@@ -12,6 +12,8 @@ enum ComponentCapability : uint32_t {
     SameAdapter        = 1u << 2,
     CrossAdapter       = 1u << 3,
     TemporalInputs     = 1u << 4,
+    D3D11Frames        = 1u << 5,
+    MultiViewport      = 1u << 6,
 };
 
 struct ComponentDescriptor {

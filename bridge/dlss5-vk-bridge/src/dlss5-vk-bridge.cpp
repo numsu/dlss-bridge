@@ -179,9 +179,40 @@ static int ActiveFrameCount()
     return g_cfg.ring_slots;
 }
 
+static int ActiveViewportCount()
+{
+    const int n = g_cfg.max_viewports;
+    if (n < 1) return 1;
+    if (n > MAX_VIEWPORTS) return MAX_VIEWPORTS;
+    return n;
+}
+
+// Per-viewport NGX handle -> viewport index. The first evaluate from an unseen
+// handle claims a free viewport when max_viewports allows; beyond that the
+// frame is forwarded untouched. Viewport 0 preserves the original
+// single-feature behavior when max_viewports == 1.
+static int ResolveViewport(const NVSDK_NGX_Handle *handle)
+{
+    if (!handle) return -1;
+    for (int i = 0; i < ActiveViewportCount(); ++i)
+        if (g_bridge.viewports[i].game_handle == handle) return i;
+    for (int i = 0; i < ActiveViewportCount(); ++i)
+        if (g_bridge.viewports[i].game_handle == nullptr)
+        {
+            g_bridge.viewports[i].game_handle = handle;
+            if (i > 0)
+                Log("[bridge] split-screen viewport %d claimed by game handle=%p", i, (void *)handle);
+            return i;
+        }
+    return -1;
+}
+
 // Once the first private neural frame completes, strict mode never executes
 // the game-side upscaler again. Startup calls only establish and seed the
 // private path. A failed strict frame repeats the last neural image.
+// Latched per viewport (BridgeViewport::neural_latched) so split-screen
+// histories warm independently; the global below mirrors "any viewport
+// latched" for legacy telemetry.
 static volatile LONG g_neural_only_latched;
 
 // OptiScaler owns the neural pass inside the private D3D12 evaluate. It accepts
@@ -316,7 +347,7 @@ static bool LoadConfig()
     }
     fclose(f);
     if (!g_cfg.Valid())
-    { Warn("[cfg] neural_pipeline_frames must be smaller than ring_slots"); return false; }
+    { Warn("[cfg] invalid runtime policy (neural_pipeline_frames must be smaller than ring_slots; max_viewports 1..4)"); return false; }
     Log("[cfg] verbose=%d execution_mode=%s "
         "compute_adapter=%s ring_slots=%d neural_pipeline_frames=%d latency_budget_ms=%d "
         "output_transport=%s neural_queue_mode=%s gpu_timestamps=%d",
@@ -326,7 +357,7 @@ static bool LoadConfig()
         g_cfg.latency_budget_ms,
         dlss_bridge::OutputTransportName(g_cfg.output_transport),
         dlss_bridge::NeuralQueueModeName(g_cfg.neural_queue_mode), g_cfg.gpu_timestamps);
-    Log("[cfg] active frame/transport ring slots=%d", ActiveFrameCount());
+    Log("[cfg] active frame/transport ring slots=%d viewports=%d", ActiveFrameCount(), ActiveViewportCount());
     return true;
 }
 
@@ -360,6 +391,7 @@ static void BridgeWaitBeforePresent(VkQueue queue);
 // ---------------------------------------------------------------------------
 #include "d3d12_session.inc"
 #include "frame_pacing.inc"
+#include "d3d11_host.inc"
 #if defined(DLSS5VK_HOOK_HOST)
 #include "hook_host.inc"
 #elif defined(DLSS5VK_ADDON_HOST)
@@ -368,6 +400,7 @@ static void BridgeWaitBeforePresent(VkQueue queue);
 #include "vk_layer.inc"
 #endif
 #include "vk_interop.inc"
+#include "d3d11_interop.inc"
 
 // ---------------------------------------------------------------------------
 // NGX Vulkan evaluate hook
@@ -400,6 +433,12 @@ static Hook      g_init_ext2_hooks[kMaxHooks]; // NVSDK_NGX_VULKAN_Init_Ext2
 static int       g_init_ext2_count;
 static Hook      g_init_project_hooks[kMaxHooks]; // NVSDK_NGX_VULKAN_Init_ProjectID
 static int       g_init_project_count;
+static Hook      g_d3d11_eval_hooks[kMaxHooks];   // NVSDK_NGX_D3D11_EvaluateFeature
+static int       g_d3d11_eval_count;
+static Hook      g_d3d11_create_hooks[kMaxHooks]; // NVSDK_NGX_D3D11_CreateFeature
+static int       g_d3d11_create_count;
+static int       g_lift_d3d11_eval_depth;
+static int       g_lift_d3d11_create_depth;
 static __declspec(thread) int g_ngx_nest;
 
 static void WriteCode(void *dst, const void *src, size_t n)
@@ -582,6 +621,8 @@ static void AuditHooksAtFault()
     bad += AuditHookArray("evaluate", g_eval_hooks,    g_eval_count,    g_lift_eval_depth   > 0);
     bad += AuditHookArray("create",   g_create_hooks,  g_create_count,  g_lift_create_depth > 0);
     bad += AuditHookArray("create1",  g_create1_hooks, g_create1_count, g_lift_create_depth > 0);
+    bad += AuditHookArray("d3d11-evaluate", g_d3d11_eval_hooks, g_d3d11_eval_count, g_lift_d3d11_eval_depth > 0);
+    bad += AuditHookArray("d3d11-create", g_d3d11_create_hooks, g_d3d11_create_count, g_lift_d3d11_create_depth > 0);
     if (bad == 0)
         Log("[hook]   audit: every hooked entry point is loaded and in the expected "
             "state; the fault is not a patch-integrity problem");
@@ -668,8 +709,10 @@ static NVSDK_NGX_Result BridgedVkEvaluate(int idx, VkCommandBuffer cmd, const NV
     // Once strict mode latches, the game evaluate stays suppressed. Frames that
     // cannot enter the worker ring repeat the last completed neural image; an
     // NGX failure here prevents the game from submitting that repeat command.
+    // Skip state is per-viewport so split-screen histories latch independently.
     const bool rr_frame = BridgeRayReconstructionInput(p) != nullptr;
-    const bool skip_game = outer && !rr_frame && BridgeSkipGameEvaluate(p);
+    const int skip_vp = (!rr_frame && feat) ? ResolveViewport(feat) : -1;
+    const bool skip_game = outer && !rr_frame && skip_vp >= 0 && BridgeSkipGameEvaluateVp(skip_vp, p);
     NVSDK_NGX_Result r = NGX_SUCCESS;
     if (skip_game)
     {
@@ -967,6 +1010,191 @@ static void *const g_init_project_detours[kMaxHooks] = {
 };
 
 // ---------------------------------------------------------------------------
+// NGX D3D11 hooks: bg3_dx11.exe and other Direct3D 11 titles.
+//
+// Same 14-byte absolute-jump patching and lift-all-while-forwarding contract
+// as Vulkan. The D3D11 evaluate is synchronous on the game's immediate
+// context, so the bridged frame runs inline (see d3d11_interop.inc) rather
+// than through the Vulkan submit-split worker. Hook tables are separate so a
+// mixed-API process can bridge Vulkan and D3D11 viewports concurrently.
+// ---------------------------------------------------------------------------
+static void LiftD3d11EvalHooks()
+{
+    if (++g_lift_d3d11_eval_depth != 1) return;
+    for (int i = 0; i < g_d3d11_eval_count; ++i) HookRestore(&g_d3d11_eval_hooks[i]);
+}
+static void UnliftD3d11EvalHooks()
+{
+    if (--g_lift_d3d11_eval_depth != 0) return;
+    for (int i = 0; i < g_d3d11_eval_count; ++i) HookReinstall(&g_d3d11_eval_hooks[i]);
+}
+static void LiftD3d11CreateHooks()
+{
+    if (++g_lift_d3d11_create_depth != 1) return;
+    for (int i = 0; i < g_d3d11_create_count; ++i) HookRestore(&g_d3d11_create_hooks[i]);
+}
+static void UnliftD3d11CreateHooks()
+{
+    if (--g_lift_d3d11_create_depth != 0) return;
+    for (int i = 0; i < g_d3d11_create_count; ++i) HookReinstall(&g_d3d11_create_hooks[i]);
+}
+
+static NVSDK_NGX_Result SafeCallD3d11Evaluate(PFN_NGX_D3D11_Evaluate fn,
+    ID3D11DeviceContext *ctx, const NVSDK_NGX_Handle *feat,
+    const NVSDK_NGX_Parameter *p, FaultInfo *fi)
+{
+    memset(fi, 0, sizeof(*fi));
+    __try { return fn(ctx, feat, p, nullptr); }
+    __except (FaultCapture(fi, GetExceptionInformation()))
+    {
+        if (fi->code == kStatusStackOverflow) _resetstkoflw();
+        return NGX_FAIL;
+    }
+}
+
+static NVSDK_NGX_Result ForwardD3d11EvaluateVia(int idx, ID3D11DeviceContext *ctx,
+    const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Parameter *p)
+{
+    Hook &h = g_d3d11_eval_hooks[idx];
+    if (reinterpret_cast<uintptr_t>(h.target) < 0x10000) return NGX_FAIL;
+    EnterCriticalSection(&g_hook_cs);
+    LiftD3d11EvalHooks();
+    FaultInfo fi;
+    NVSDK_NGX_Result r = SafeCallD3d11Evaluate(
+        reinterpret_cast<PFN_NGX_D3D11_Evaluate>(h.target), ctx, feat, p, &fi);
+    if (fi.code) AuditHooksAtFault();
+    UnliftD3d11EvalHooks();
+    LeaveCriticalSection(&g_hook_cs);
+    if (fi.code)
+    {
+        Log("[hook] forwarded NGX D3D11 evaluate raised 0x%08X", fi.code);
+        LogFaultSite(&fi);
+        BridgeDisable("the game's NGX D3D11 evaluate faulted while forwarding");
+    }
+    return r;
+}
+
+static NVSDK_NGX_Result BridgedD3d11Evaluate(int idx, ID3D11DeviceContext *ctx,
+    const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Parameter *p,
+    PFN_NVSDK_NGX_ProgressCallback cb)
+{
+    (void)cb;
+    ++g_ngx_nest;
+    const bool outer = (g_ngx_nest == 1);
+    if (outer && g_release_deferred)
+    {
+        InterlockedExchange(&g_release_deferred, 0);
+        FrameLock();
+        D3D12ReleaseResources();
+        FrameUnlock();
+    }
+    if (outer && g_bridge.disabled) { --g_ngx_nest; return NGX_FAIL; }
+    const int vp = feat ? ResolveViewport(feat) : -1;
+    const bool skip_game = outer && vp >= 0 && BridgeD3D11SkipGameEvaluate(vp, p);
+    NVSDK_NGX_Result r = NGX_SUCCESS;
+    if (!skip_game)
+        r = ForwardD3d11EvaluateVia(idx, ctx, feat, p);
+    else
+    {
+        static bool said = false;
+        if (!said) { said = true;
+            Log("[policy] vp%d (d3d11) skipping game-side evaluate; private neural result authoritative", vp); }
+    }
+    if (outer && !g_bridge.disabled && r == NGX_SUCCESS)
+    {
+        FaultInfo fi;
+        memset(&fi, 0, sizeof(fi));
+        __try { BridgeD3D11Frame(ctx, feat, p); }
+        __except (FaultCapture(&fi, GetExceptionInformation()))
+        { BridgeFrameUnlockAll();
+          Log("[bridge] d3d11 frame path faulted 0x%08X; disabling", fi.code);
+          BridgeDisable("the d3d11 bridge frame path raised"); }
+    }
+    --g_ngx_nest;
+    return r;
+}
+
+#define D3D11_EVAL_DETOUR(N) \
+    static NVSDK_NGX_Result Detour_D3D11_Eval_##N(ID3D11DeviceContext *c, const NVSDK_NGX_Handle *f, \
+        const NVSDK_NGX_Parameter *p, PFN_NVSDK_NGX_ProgressCallback cb) \
+    { return BridgedD3d11Evaluate(N, c, f, p, cb); }
+D3D11_EVAL_DETOUR(0) D3D11_EVAL_DETOUR(1) D3D11_EVAL_DETOUR(2)  D3D11_EVAL_DETOUR(3)
+D3D11_EVAL_DETOUR(4) D3D11_EVAL_DETOUR(5) D3D11_EVAL_DETOUR(6)  D3D11_EVAL_DETOUR(7)
+D3D11_EVAL_DETOUR(8) D3D11_EVAL_DETOUR(9) D3D11_EVAL_DETOUR(10) D3D11_EVAL_DETOUR(11)
+
+static void *const g_d3d11_eval_detours[kMaxHooks] = {
+    (void *)Detour_D3D11_Eval_0, (void *)Detour_D3D11_Eval_1, (void *)Detour_D3D11_Eval_2,  (void *)Detour_D3D11_Eval_3,
+    (void *)Detour_D3D11_Eval_4, (void *)Detour_D3D11_Eval_5, (void *)Detour_D3D11_Eval_6,  (void *)Detour_D3D11_Eval_7,
+    (void *)Detour_D3D11_Eval_8, (void *)Detour_D3D11_Eval_9, (void *)Detour_D3D11_Eval_10, (void *)Detour_D3D11_Eval_11,
+};
+
+static NVSDK_NGX_Result SafeCallD3d11Create(PFN_NGX_D3D11_Create fn,
+    ID3D11DeviceContext *ctx, int feature, NVSDK_NGX_Parameter *p,
+    NVSDK_NGX_Handle **out, FaultInfo *fi)
+{
+    memset(fi, 0, sizeof(*fi));
+    __try { return fn(ctx, feature, p, out); }
+    __except (FaultCapture(fi, GetExceptionInformation()))
+    {
+        if (fi->code == kStatusStackOverflow) _resetstkoflw();
+        return NGX_FAIL;
+    }
+}
+
+static NVSDK_NGX_Result ForwardD3d11CreateVia(Hook *h, ID3D11DeviceContext *ctx,
+    int feature, NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
+{
+    if (reinterpret_cast<uintptr_t>(h->target) < 0x10000) return NGX_FAIL;
+    EnterCriticalSection(&g_hook_cs);
+    LiftD3d11EvalHooks();
+    LiftD3d11CreateHooks();
+    FaultInfo fi;
+    NVSDK_NGX_Result r = SafeCallD3d11Create(
+        reinterpret_cast<PFN_NGX_D3D11_Create>(h->target), ctx, feature, p, out, &fi);
+    if (fi.code) AuditHooksAtFault();
+    UnliftD3d11CreateHooks();
+    UnliftD3d11EvalHooks();
+    LeaveCriticalSection(&g_hook_cs);
+    if (fi.code) BridgeDisable("the game's NGX D3D11 feature creation faulted");
+    return r;
+}
+
+static NVSDK_NGX_Result BridgedD3d11Create(int idx, ID3D11DeviceContext *ctx, int feature,
+    NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
+{
+    if (NoteVkFeatureCreate(feature))
+    { if (out) *out = nullptr; return NGX_FAIL_FEATURE_NOT_SUPPORTED; }
+    // Ensure the runtime composition covers D3D11 before the first create.
+    if (!g_components.capture || strcmp(g_components.capture->id, "d3d11") != 0)
+    {
+        dlss_bridge::RuntimeComposition dual{};
+        if (dual.Configure(D3D11HostId()) && dual.SelectTransport(false))
+        {
+            g_components = dual;
+            Log("[components] D3D11 capture activated (host injected-d3d11)");
+        }
+    }
+    NVSDK_NGX_Result result = ForwardD3d11CreateVia(
+        &g_d3d11_create_hooks[idx], ctx, feature, p, out);
+    if (result == NGX_SUCCESS && out) CaptureFeatureContract(feature, p, *out);
+    return result;
+}
+
+#define D3D11_CREATE_DETOUR(N) \
+    static NVSDK_NGX_Result Detour_D3D11_Create_##N(ID3D11DeviceContext *c, int ft, \
+        NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **o) \
+    { return BridgedD3d11Create(N, c, ft, p, o); }
+D3D11_CREATE_DETOUR(0) D3D11_CREATE_DETOUR(1) D3D11_CREATE_DETOUR(2)  D3D11_CREATE_DETOUR(3)
+D3D11_CREATE_DETOUR(4) D3D11_CREATE_DETOUR(5) D3D11_CREATE_DETOUR(6)  D3D11_CREATE_DETOUR(7)
+D3D11_CREATE_DETOUR(8) D3D11_CREATE_DETOUR(9) D3D11_CREATE_DETOUR(10) D3D11_CREATE_DETOUR(11)
+
+static void *const g_d3d11_create_detours[kMaxHooks] = {
+    (void *)Detour_D3D11_Create_0, (void *)Detour_D3D11_Create_1, (void *)Detour_D3D11_Create_2,  (void *)Detour_D3D11_Create_3,
+    (void *)Detour_D3D11_Create_4, (void *)Detour_D3D11_Create_5, (void *)Detour_D3D11_Create_6,  (void *)Detour_D3D11_Create_7,
+    (void *)Detour_D3D11_Create_8, (void *)Detour_D3D11_Create_9, (void *)Detour_D3D11_Create_10, (void *)Detour_D3D11_Create_11,
+};
+
+// ---------------------------------------------------------------------------
 // module discovery: hook every real NGX module that exports the Vulkan evaluate
 // ---------------------------------------------------------------------------
 static const wchar_t *ModuleName(HMODULE m)
@@ -996,6 +1224,9 @@ static bool EntryIsOwnDetourJump(const void *entry)
     for (int i = 0; i < kMaxHooks; ++i)
         if (dst == g_init_ext_detours[i] || dst == g_init_ext2_detours[i] ||
             dst == g_init_project_detours[i]) return true;
+    for (int i = 0; i < kMaxHooks; ++i)
+        if (dst == g_d3d11_eval_detours[i] || dst == g_d3d11_create_detours[i])
+            return true;
     return false;
 }
 
@@ -1030,8 +1261,11 @@ static void TryHookModule(HMODULE m)
     auto init_ext = GetProcAddress(m, "NVSDK_NGX_VULKAN_Init_Ext");
     auto init_ext2 = GetProcAddress(m, "NVSDK_NGX_VULKAN_Init_Ext2");
     auto init_project = GetProcAddress(m, "NVSDK_NGX_VULKAN_Init_ProjectID");
+    auto d3d11_eval = GetProcAddress(m, "NVSDK_NGX_D3D11_EvaluateFeature");
+    auto d3d11_create = GetProcAddress(m, "NVSDK_NGX_D3D11_CreateFeature");
     if ((eval == nullptr || create == nullptr) && init_ext == nullptr &&
-        init_ext2 == nullptr && init_project == nullptr) return;
+        init_ext2 == nullptr && init_project == nullptr &&
+        d3d11_eval == nullptr && d3d11_create == nullptr) return;
 
     EnterCriticalSection(&g_hook_cs);
     if (eval && create)
@@ -1048,6 +1282,12 @@ static void TryHookModule(HMODULE m)
     if (init_project)
         InstallOne(g_init_project_hooks, &g_init_project_count, g_init_project_detours,
                    (void *)init_project, "Init_ProjectID", m);
+    if (d3d11_eval)
+        InstallOne(g_d3d11_eval_hooks, &g_d3d11_eval_count, g_d3d11_eval_detours,
+                   (void *)d3d11_eval, "D3D11_EvaluateFeature", m);
+    if (d3d11_create)
+        InstallOne(g_d3d11_create_hooks, &g_d3d11_create_count, g_d3d11_create_detours,
+                   (void *)d3d11_create, "D3D11_CreateFeature", m);
     LeaveCriticalSection(&g_hook_cs);
 }
 
@@ -1136,7 +1376,8 @@ static BOOL CALLBACK InitializeRuntimeOnce(PINIT_ONCE, PVOID, PVOID *)
     }
     if (!LoadLocalOptiScaler()) return FALSE;
 #if defined(DLSS5VK_HOOK_HOST)
-    Log("dlss5-vk-bridge " DLSS5VK_VERSION_STRING " initialized -- injected Vulkan host.");
+    Log("dlss5-vk-bridge " DLSS5VK_VERSION_STRING " initialized -- injected Vulkan+D3D11 host "
+        "(capture ngx-vulkan + d3d11, %d viewport(s)).", ActiveViewportCount());
     InstallVulkanHooks();
     CreateThread(nullptr, 0, VulkanHookWatch, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, NgxWatch, nullptr, 0, nullptr);

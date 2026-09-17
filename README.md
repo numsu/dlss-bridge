@@ -10,7 +10,7 @@ The validated Linux path uses a Vulkan NGX title through Proton with two RTX
 
 ## Supported path
 
-The current release supports 64-bit Windows Vulkan games that expose NVIDIA
+The validated release path is 64-bit Windows Vulkan games that expose NVIDIA
 NGX:
 
 - Steam Proton on Linux
@@ -18,7 +18,11 @@ NGX:
 - Same-GPU or secondary-GPU neural execution
 - RTX 3000, 4000, and 5000 series cards when runtime capability checks pass
 
-Native Linux games and Direct3D-only capture are planned backends. Frame
+Direct3D 11 capture and multi-viewport split-screen (`capture.max_viewports`
+up to 4) are implemented but untested — see `docs/known-limitations.md`.
+`profiles/bg3-dx11.toml` is experimental; prefer `profiles/bg3.toml`.
+
+Native Linux games and Direct3D 12-only capture are planned backends. Frame
 generation is not supported by the current in-frame execution contract.
 
 ## Install

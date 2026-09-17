@@ -6,7 +6,10 @@ register a system-wide Vulkan layer.
 
 ## Compatibility
 
-The current release supports 64-bit Windows Vulkan games that expose NVIDIA NGX.
+The validated release path is 64-bit Windows Vulkan games that expose NVIDIA
+NGX Super Resolution. Direct3D 11 capture and multi-viewport
+(`capture.max_viewports` up to 4) are implemented but untested — no
+hardware-validated game run exists yet.
 
 | Host | Game runtime | Attachment method |
 | --- | --- | --- |
@@ -19,11 +22,14 @@ on the game's NVIDIA GPU or another NVIDIA GPU. RTX 3000, 4000, and 5000 series
 cards are selected through runtime capability checks rather than a generation
 allowlist.
 
-Native Linux games, Direct3D-only games, launchers that move rendering into an
+Native Linux games, Direct3D 12-only games, launchers that move rendering into an
 unrelated child process, Streamline capture, frame generation, and system-wide
-automatic injection are not supported in this release. Avoid injection in
-protected multiplayer games unless the game and its anti-cheat system explicitly
-permit it.
+automatic injection are not supported in this release. Baldur's Gate 3 is
+supported through `bg3.exe` (Vulkan, `profiles/bg3.toml`) and `bg3_dx11.exe`
+(Direct3D 11, `profiles/bg3-dx11.toml`); bypass the Larian launcher with
+`--skip-launcher` so the bridge injects the game executable directly. Avoid
+injection in protected multiplayer games unless the game and its anti-cheat
+system explicitly permit it.
 
 ## Requirements
 

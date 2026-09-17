@@ -84,7 +84,7 @@ PROFILE_KEYS = {
     "telemetry": {"gpu_timestamps"},
     "bridge": {"verbose"},
     "match": {"executable", "graphics_api"},
-    "capture": {"adapter"},
+    "capture": {"adapter", "max_viewports"},
 }
 
 
@@ -105,11 +105,24 @@ def validate_profile(data: dict[str, Any], source: str = "profile") -> None:
     if kind != "neural_rendering":
         raise SystemExit(f"{source}: unsupported feature.kind: {kind}")
     adapter = data.get("capture", {}).get("adapter", "ngx_vulkan")
-    if adapter != "ngx_vulkan":
+    if adapter not in ("ngx_vulkan", "d3d11"):
         raise SystemExit(f"{source}: capture.adapter is not integrated: {adapter}")
     graphics_api = data.get("match", {}).get("graphics_api", "vulkan")
-    if graphics_api != "vulkan":
+    if graphics_api not in ("vulkan", "d3d11"):
         raise SystemExit(f"{source}: unsupported match.graphics_api: {graphics_api}")
+    expected_api = "d3d11" if adapter == "d3d11" else "vulkan"
+    if "match" in data and "graphics_api" in data.get("match", {}) and graphics_api != expected_api:
+        raise SystemExit(
+            f"{source}: match.graphics_api {graphics_api!r} does not match "
+            f"capture.adapter {adapter!r} (expected {expected_api!r})"
+        )
+    if "capture" in data and "max_viewports" in data.get("capture", {}):
+        try:
+            viewports = int(data["capture"]["max_viewports"])
+        except (TypeError, ValueError):
+            raise SystemExit(f"{source}: capture.max_viewports must be an integer 1..4")
+        if not 1 <= viewports <= 4:
+            raise SystemExit(f"{source}: capture.max_viewports must be between 1 and 4")
 
 
 def resolved_runtime(data: dict[str, Any]) -> dict[str, str | int]:
@@ -149,6 +162,9 @@ def resolved_runtime(data: dict[str, Any]) -> dict[str, str | int]:
         raise SystemExit(f"invalid transport.neural_queue: {neural_queue_mode}")
     if not 1 <= budget <= 125:
         raise SystemExit("transport.latency_budget_ms must be between 1 and 125")
+    viewports = int(data.get("capture", {}).get("max_viewports", 1))
+    if not 1 <= viewports <= 4:
+        raise SystemExit("capture.max_viewports must be between 1 and 4")
     return {
         "verbose": bool_int(bridge.get("verbose", False)),
         "execution_mode": mode,
@@ -162,6 +178,7 @@ def resolved_runtime(data: dict[str, Any]) -> dict[str, str | int]:
         "neural_working_scale": format(working_scale, ".6g"),
         "neural_passes": passes,
         "gpu_timestamps": bool_int(telemetry.get("gpu_timestamps", True)),
+        "max_viewports": viewports,
     }
 
 

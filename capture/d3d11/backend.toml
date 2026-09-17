@@ -1,6 +1,12 @@
+# Integrated implementation, hardware validation pending: the D3D11 capture
+# path compiles and passes native checks but has no end-to-end game validation
+# yet. See docs/known-limitations.md.
 schema = 1
 kind = "capture"
 id = "d3d11"
-state = "planned"
+state = "integrated"
 apis = ["d3d11"]
 features = ["super_resolution", "neural_rendering"]
+implementation = "bridge/dlss5-vk-bridge/src/d3d11_interop.inc"
+linkage = "static"
+abi = 1

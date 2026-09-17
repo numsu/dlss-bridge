@@ -208,9 +208,27 @@ static void BridgeDisable(const char *why)
     D3D12ReleaseResources();
 }
 
+// Per-viewport failure: drop this viewport's feature so the next frame rebuilds
+// it, without disturbing other split-screen viewports. After repeated viewport
+// failures the viewport is parked (frame_ready stays false) and its frames are
+// forwarded untouched; only device-level failures disable the whole bridge.
+static void ViewportFail(int vp, const char *what)
+{
+    if (vp < 0 || vp >= MAX_VIEWPORTS) return;
+    BridgeViewport &v = g_bridge.viewports[vp];
+    v.frame_ready = false;
+    if (++v.consecutive_fails >= 3)
+    {
+        Log("[bridge] viewport %d parked after repeated failures (%s); other viewports continue.", vp, what);
+    }
+}
+
 static void BridgeFail(const char *what)
 {
-    g_bridge.frame_ready = false;
+    // Legacy single-viewport entry: viewport 0. Shared bring-up failures still
+    // escalate to a process-wide disable after 3 strikes to preserve the
+    // original fail-closed contract.
+    ViewportFail(0, what);
     if (++g_bridge.consecutive_fails >= 3)
     {
         Log("[bridge] disabled after repeated failures (%s); evaluation now fails closed.", what);
@@ -979,9 +997,11 @@ static void Barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *res,
 // ALLOW_SIMULTANEOUS_ACCESS (so the two APIs need no cross-API state
 // transitions) and an NT shared handle is exported for Vulkan to import. Depth
 // and the Output always carry a UAV; Output because DLSS writes it through one.
-static bool D3D12MakeSharedTexture(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
+// Textures are per-viewport so split-screen histories never alias.
+static bool D3D12MakeSharedTextureVp(int vp, int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
 {
-    SharedTex &t = g_bridge.tex[slot];
+    if (vp < 0 || vp >= MAX_VIEWPORTS) return false;
+    SharedTex &t = g_bridge.viewports[vp].tex[slot];
 
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1014,8 +1034,8 @@ static bool D3D12MakeSharedTexture(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bo
         t.tex12->SetName(n);
     }
     t.w = w; t.h = h; t.fmt12 = fmt;
-    Log("[bridge] %-6s %ux%u fmt=%u  D3D12 shared texture created (handle=%p)",
-        kSlotName[slot], w, h, fmt, t.nt_handle);
+    Log("[bridge] vp%d %-6s %ux%u fmt=%u  D3D12 shared texture created (handle=%p)",
+        vp, kSlotName[slot], w, h, fmt, t.nt_handle);
     return true;
 }
 
@@ -1030,18 +1050,22 @@ static bool D3D12CreateSharedFence(ID3D12Fence **out, HANDLE *handle)
     return true;
 }
 
-static ID3D12Resource *NeuralTex(int slot)
+static ID3D12Resource *NeuralTexVp(int vp, int slot)
 {
-    return g_mgpu.active ? g_mgpu.neural_tex[slot] : g_bridge.tex[slot].tex12;
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
+    if (slot < 0 || slot >= SLOT_COUNT) return nullptr;
+    return g_mgpu.active ? g_mgpu.neural_tex[vp][slot] : g_bridge.viewports[vp].tex[slot].tex12;
 }
 
 static void D3D12ReleaseMultiGpuFrameResources()
 {
+    for (int v = 0; v < MAX_VIEWPORTS; ++v)
+        for (int i = 0; i < SLOT_COUNT; ++i)
+        {
+            if (g_mgpu.neural_tex[v][i]) { g_mgpu.neural_tex[v][i]->Release(); g_mgpu.neural_tex[v][i] = nullptr; }
+        }
     for (int i = 0; i < SLOT_COUNT; ++i)
-    {
-        if (g_mgpu.neural_tex[i]) { g_mgpu.neural_tex[i]->Release(); g_mgpu.neural_tex[i] = nullptr; }
         g_mgpu.plane[i] = {};
-    }
     for (int slot = 0; slot < Bridge::kMaxFrames; ++slot)
     {
         CrossFrameTransport &fr = g_mgpu.frame[slot];
@@ -1075,8 +1099,9 @@ static void D3D12ReleaseMultiGpuFrameResources()
     g_mgpu.host_bytes = 0;
 }
 
-static bool D3D12MakeNeuralTexture(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
+static bool D3D12MakeNeuralTextureVp(int vp, int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
 {
+    if (vp < 0 || vp >= MAX_VIEWPORTS) return false;
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {};
@@ -1086,8 +1111,8 @@ static bool D3D12MakeNeuralTexture(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bo
     rd.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
     HRESULT hr = g_bridge.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
         D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
-        reinterpret_cast<void **>(&g_mgpu.neural_tex[slot]));
-    if (FAILED(hr)) Log("[mgpu] %s neural texture creation failed 0x%08X", kSlotName[slot], hr);
+        reinterpret_cast<void **>(&g_mgpu.neural_tex[vp][slot]));
+    if (FAILED(hr)) Log("[mgpu] vp%d %s neural texture creation failed 0x%08X", vp, kSlotName[slot], hr);
     return SUCCEEDED(hr);
 }
 
@@ -1140,10 +1165,12 @@ static bool D3D12MakeNeuralStaging(CrossFrameTransport &fr, int slot, int direct
 static bool D3D12BuildCrossBuffer()
 {
     if (!g_mgpu.active) return true;
+    // Multi-viewport multi-GPU currently requires uniform per-slot geometry:
+    // footprints are derived from viewport 0 and shared across viewports.
     UINT64 cursor = 0;
     for (int i = 0; i < SLOT_COUNT; ++i)
     {
-        D3D12_RESOURCE_DESC td = g_mgpu.neural_tex[i]->GetDesc();
+        D3D12_RESOURCE_DESC td = g_mgpu.neural_tex[0][i]->GetDesc();
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
         UINT rows = 0; UINT64 row_bytes = 0, total = 0;
         g_bridge.dev12->GetCopyableFootprints(&td, 0, 1, cursor, &fp, &rows, &row_bytes, &total);
@@ -1678,9 +1705,12 @@ static bool D3D12InitSession(const uint8_t luid[VK_LUID_SIZE], bool luid_valid)
         if (!D3D12CreateSharedFence(&g_bridge.fence_in,  &g_shared_fence_in))  goto fail;
         if (!D3D12CreateSharedFence(&g_bridge.fence_out, &g_shared_fence_out)) goto fail;
 
-        NVSDK_NGX_Result rp = SafeAllocParams(g_bridge.alloc_params, &g_bridge.params, &code);
-        if (code || rp != NGX_SUCCESS || g_bridge.params == nullptr)
-        { Log("[bridge] AllocateParameters failed 0x%08X, %s", rp, NgxResultName(rp)); goto fail; }
+        for (int vp = 0; vp < ActiveViewportCount(); ++vp)
+        {
+            NVSDK_NGX_Result rp = SafeAllocParams(g_bridge.alloc_params, &g_bridge.viewports[vp].params, &code);
+            if (code || rp != NGX_SUCCESS || g_bridge.viewports[vp].params == nullptr)
+            { Log("[bridge] AllocateParameters(vp%d) failed 0x%08X, %s", vp, rp, NgxResultName(rp)); goto fail; }
+        }
 
         if (g_bridge.queue) g_bridge.queue->SetName(L"dlss5-vk-bridge NGX queue");
         if (g_bridge.list)  g_bridge.list->SetName(L"dlss5-vk-bridge NGX list");
@@ -1720,57 +1750,66 @@ static void D3D12LogCreateFailureDetail()
     D3D12QueryNgxCaps();
 }
 
-static bool D3D12CreateDlssFeature(const FeatureCreateContract &contract)
+static bool D3D12CreateDlssFeatureVp(const FeatureCreateContract &contract, int vp)
 {
-    if (g_bridge.feature && g_bridge.release_feature)
-    { g_bridge.release_feature(g_bridge.feature); g_bridge.feature = nullptr; }
+    if (vp < 0 || vp >= MAX_VIEWPORTS) return false;
+    BridgeViewport &state = g_bridge.viewports[vp];
+    if (state.feature && g_bridge.release_feature)
+    { g_bridge.release_feature(state.feature); state.feature = nullptr; }
+    if (!state.params)
+    {
+        DWORD acode = 0;
+        NVSDK_NGX_Result arp = SafeAllocParams(g_bridge.alloc_params, &state.params, &acode);
+        if (acode || arp != NGX_SUCCESS || !state.params)
+        { Log("[bridge] vp%d AllocateParameters failed 0x%08X", vp, arp); return false; }
+    }
 
-    g_bridge.params->Set("Width",     contract.width);
-    g_bridge.params->Set("Height",    contract.height);
-    g_bridge.params->Set("OutWidth",  contract.out_width);
-    g_bridge.params->Set("OutHeight", contract.out_height);
-    g_bridge.params->Set("PerfQualityValue", contract.quality);
-    g_bridge.params->Set("DLSS.Feature.Create.Flags", contract.flags);
+    state.params->Set("Width",     contract.width);
+    state.params->Set("Height",    contract.height);
+    state.params->Set("OutWidth",  contract.out_width);
+    state.params->Set("OutHeight", contract.out_height);
+    state.params->Set("PerfQualityValue", contract.quality);
+    state.params->Set("DLSS.Feature.Create.Flags", contract.flags);
     if (contract.has_output_subrects)
-        g_bridge.params->Set("DLSS.Enable.Output.Subrects", contract.output_subrects);
-    g_bridge.feature_flags = contract.flags;
+        state.params->Set("DLSS.Enable.Output.Subrects", contract.output_subrects);
+    state.feature_flags = contract.flags;
 
     // These masks describe the single-node private D3D12 device rather than a
     // game policy, so they are determined by the executor.
-    g_bridge.params->Set("CreationNodeMask", 1u);
-    g_bridge.params->Set("VisibilityNodeMask", 1u);
-    Log("[bridge] exact create contract: %ux%u -> %ux%u quality=%u flags=0x%X%s",
-        contract.width, contract.height, contract.out_width, contract.out_height,
+    state.params->Set("CreationNodeMask", 1u);
+    state.params->Set("VisibilityNodeMask", 1u);
+    Log("[bridge] vp%d exact create contract: %ux%u -> %ux%u quality=%u flags=0x%X%s",
+        vp, contract.width, contract.height, contract.out_width, contract.out_height,
         contract.quality, contract.flags,
         contract.has_output_subrects ? " with output-subrect policy" : "");
 
-    g_bridge.feature = nullptr;
-    if (!D3D12BeginCommands()) { Log("[bridge] could not start a command list for create"); return false; }
+    state.feature = nullptr;
+    if (!D3D12BeginCommands()) { Log("[bridge] vp%d could not start a command list for create", vp); return false; }
 
     DWORD code = 0;
     NVSDK_NGX_Result rf = SafeCreateFeature(g_bridge.create_feature, g_bridge.list,
-                                            g_bridge.params, &g_bridge.feature, &code);
-    const UINT64 v = D3D12EndCommands();
+                                            state.params, &state.feature, &code);
+    const UINT64 fence_value = D3D12EndCommands();
 
-    if (g_bridge.fence_gpu->GetCompletedValue() < v)
+    if (g_bridge.fence_gpu->GetCompletedValue() < fence_value)
     {
-        g_bridge.fence_gpu->SetEventOnCompletion(v, g_bridge.fence_event);
+        g_bridge.fence_gpu->SetEventOnCompletion(fence_value, g_bridge.fence_event);
         if (WaitForSingleObject(g_bridge.fence_event, 4000) != WAIT_OBJECT_0)
-        { Log("[bridge] feature creation did not complete within 4 s"); BridgeDisable("creating the DLSS feature stalled"); return false; }
+        { Log("[bridge] vp%d feature creation did not complete within 4 s", vp); BridgeDisable("creating the DLSS feature stalled"); return false; }
     }
     if (code)
     { Warn("creating the DLSS feature crashed (0x%08X)", code); BridgeDisable("the DLSS feature crashed"); return false; }
-    if (rf != NGX_SUCCESS || g_bridge.feature == nullptr)
+    if (rf != NGX_SUCCESS || state.feature == nullptr)
     {
-        Log("[bridge] exact CreateFeature contract failed 0x%08X, %s", rf, NgxResultName(rf));
+        Log("[bridge] vp%d exact CreateFeature contract failed 0x%08X, %s", vp, rf, NgxResultName(rf));
         D3D12LogCreateFailureDetail();
         return false;
     }
 
-    Log("[bridge] feature ready: render %ux%u -> output %ux%u handle=%p",
-        g_bridge.render_w, g_bridge.render_h, g_bridge.ngx_out_w, g_bridge.ngx_out_h,
-        (void *)g_bridge.feature);
-    g_bridge.need_reset = true;
+    Log("[bridge] vp%d feature ready: render %ux%u -> output %ux%u handle=%p",
+        vp, state.render_w, state.render_h, state.ngx_out_w, state.ngx_out_h,
+        (void *)state.feature);
+    state.need_reset = true;
     return true;
 }
 
@@ -1800,8 +1839,9 @@ static bool UnifiedNeuralQueueActive()
     return supported;
 }
 
-static void RecordMultiGpuUpload(ID3D12GraphicsCommandList *list, int transport_slot)
+static void RecordMultiGpuUploadVp(ID3D12GraphicsCommandList *list, int transport_slot, int vp)
 {
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
     CrossFrameTransport &fr = g_mgpu.frame[transport_slot];
     const int inputs[] = { SLOT_COLOR, SLOT_DEPTH, SLOT_MV };
     ID3D12Resource *source = g_mgpu.direct_vulkan_upload
@@ -1811,11 +1851,11 @@ static void RecordMultiGpuUpload(ID3D12GraphicsCommandList *list, int transport_
                 D3D12_RESOURCE_STATE_COPY_SOURCE);
     for (int input : inputs)
     {
-        Barrier(list, g_mgpu.neural_tex[input], D3D12_RESOURCE_STATE_COMMON,
+        Barrier(list, g_mgpu.neural_tex[vp][input], D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_DEST);
         CopyCrossToTexture(list, source,
-                           g_mgpu.neural_tex[input], g_mgpu.plane[input]);
-        Barrier(list, g_mgpu.neural_tex[input], D3D12_RESOURCE_STATE_COPY_DEST,
+                           g_mgpu.neural_tex[vp][input], g_mgpu.plane[input]);
+        Barrier(list, g_mgpu.neural_tex[vp][input], D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_COMMON);
     }
     if (!g_mgpu.direct_vulkan_upload)
@@ -1823,19 +1863,20 @@ static void RecordMultiGpuUpload(ID3D12GraphicsCommandList *list, int transport_
                 D3D12_RESOURCE_STATE_COMMON);
 }
 
-static void RecordMultiGpuDownload(ID3D12GraphicsCommandList *list, int transport_slot)
+static void RecordMultiGpuDownloadVp(ID3D12GraphicsCommandList *list, int transport_slot, int vp)
 {
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
     CrossFrameTransport &fr = g_mgpu.frame[transport_slot];
     ID3D12Resource *destination = g_mgpu.direct_vulkan_download
         ? fr.neural_staging[CROSS_DOWNLOAD] : fr.neural_buffer[CROSS_DOWNLOAD];
     if (!g_mgpu.direct_vulkan_download)
         Barrier(list, destination, D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_DEST);
-    Barrier(list, g_mgpu.neural_tex[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON,
+    Barrier(list, g_mgpu.neural_tex[vp][SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_STATE_COPY_SOURCE);
-    CopyTextureToCross(list, g_mgpu.neural_tex[SLOT_OUTPUT],
+    CopyTextureToCross(list, g_mgpu.neural_tex[vp][SLOT_OUTPUT],
                        destination, g_mgpu.plane[SLOT_OUTPUT]);
-    Barrier(list, g_mgpu.neural_tex[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COPY_SOURCE,
+    Barrier(list, g_mgpu.neural_tex[vp][SLOT_OUTPUT], D3D12_RESOURCE_STATE_COPY_SOURCE,
             D3D12_RESOURCE_STATE_COMMON);
     if (!g_mgpu.direct_vulkan_download)
         Barrier(list, destination, D3D12_RESOURCE_STATE_COPY_DEST,
@@ -1861,8 +1902,9 @@ static bool PrepareNeuralUpload(int transport_slot)
     return true;
 }
 
-static bool MultiGpuUploadInputs(int transport_slot, UINT64 *upload_value)
+static bool MultiGpuUploadInputsVp(int transport_slot, int vp, UINT64 *upload_value)
 {
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
     *upload_value = 0;
     CrossFrameTransport &fr = g_mgpu.frame[transport_slot];
     if (fr.generation != g_mgpu.transport_generation) return false;
@@ -1876,11 +1918,11 @@ static bool MultiGpuUploadInputs(int transport_slot, UINT64 *upload_value)
                 D3D12_RESOURCE_STATE_COPY_DEST);
         for (int input : inputs)
         {
-            Barrier(list, g_bridge.tex[input].tex12, D3D12_RESOURCE_STATE_COMMON,
+            Barrier(list, g_bridge.viewports[vp].tex[input].tex12, D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_COPY_SOURCE);
-            CopyTextureToCross(list, g_bridge.tex[input].tex12,
+            CopyTextureToCross(list, g_bridge.viewports[vp].tex[input].tex12,
                                fr.game_buffer[CROSS_UPLOAD], g_mgpu.plane[input]);
-            Barrier(list, g_bridge.tex[input].tex12, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            Barrier(list, g_bridge.viewports[vp].tex[input].tex12, D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_COMMON);
         }
         Barrier(list, fr.game_buffer[CROSS_UPLOAD], D3D12_RESOURCE_STATE_COPY_DEST,
@@ -1888,7 +1930,7 @@ static bool MultiGpuUploadInputs(int transport_slot, UINT64 *upload_value)
         if (!GameEndAndWait(transport_slot, "game adapter input copy", 60)) return false;
     }
     if (!NeuralCopyBegin(transport_slot)) return false;
-    RecordMultiGpuUpload(g_mgpu.neural_copy_list[transport_slot], transport_slot);
+    RecordMultiGpuUploadVp(g_mgpu.neural_copy_list[transport_slot], transport_slot, vp);
     *upload_value = NeuralCopyEnd(transport_slot);
     fr.upload_fence = *upload_value;
     return *upload_value != 0;
@@ -1919,9 +1961,10 @@ static bool PublishVulkanOutput(int transport_slot)
 // The caller must qualify evaluate_value before invoking this function. Once a
 // download has been submitted its target allocation is immutable until the
 // copy fence completes; Vulkan is never released to read an in-flight write.
-static bool MultiGpuDownloadOutput(UINT64 timeline, UINT64 pipeline_value,
-                                   int transport_slot)
+static bool MultiGpuDownloadOutputVp(UINT64 timeline, UINT64 pipeline_value,
+                                   int transport_slot, int vp)
 {
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
     CrossFrameTransport &fr = g_mgpu.frame[transport_slot];
     if (fr.generation != g_mgpu.transport_generation) return false;
 
@@ -1939,11 +1982,11 @@ static bool MultiGpuDownloadOutput(UINT64 timeline, UINT64 pipeline_value,
     ID3D12GraphicsCommandList *list = g_mgpu.game_list[transport_slot];
     Barrier(list, fr.game_buffer[CROSS_DOWNLOAD], D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_STATE_COPY_SOURCE);
-    Barrier(list, g_bridge.tex[SLOT_OUTPUT].tex12, D3D12_RESOURCE_STATE_COMMON,
+    Barrier(list, g_bridge.viewports[vp].tex[SLOT_OUTPUT].tex12, D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_STATE_COPY_DEST);
     CopyCrossToTexture(list, fr.game_buffer[CROSS_DOWNLOAD],
-                       g_bridge.tex[SLOT_OUTPUT].tex12, g_mgpu.plane[SLOT_OUTPUT]);
-    Barrier(list, g_bridge.tex[SLOT_OUTPUT].tex12, D3D12_RESOURCE_STATE_COPY_DEST,
+                       g_bridge.viewports[vp].tex[SLOT_OUTPUT].tex12, g_mgpu.plane[SLOT_OUTPUT]);
+    Barrier(list, g_bridge.viewports[vp].tex[SLOT_OUTPUT].tex12, D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_COMMON);
     Barrier(list, fr.game_buffer[CROSS_DOWNLOAD], D3D12_RESOURCE_STATE_COPY_SOURCE,
             D3D12_RESOURCE_STATE_COMMON);
@@ -1966,8 +2009,9 @@ static int NeuralPipelineFrames()
 // neural_pipeline_frames admissions behind the current frame. It never picks
 // an arbitrary last result and never advances presentation past an incomplete
 // producer: a genuine throughput deficit becomes explicit backpressure.
-static void D3D12RunEvaluatePipelined(UINT64 timeline, LONG *result, int transport_slot)
+static void D3D12RunEvaluatePipelinedVp(UINT64 timeline, LONG *result, int transport_slot, int vp)
 {
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
     *result = 0;
     CrossFrameTransport &producer = g_mgpu.frame[transport_slot];
     if (producer.generation != g_mgpu.transport_generation ||
@@ -2057,13 +2101,13 @@ static void D3D12RunEvaluatePipelined(UINT64 timeline, LONG *result, int transpo
 
     const int timing_slot = transport_slot;
     D3D12TimingStampOn(list, timing_slot, 0);
-    RecordMultiGpuUpload(list, transport_slot);
+    RecordMultiGpuUploadVp(list, transport_slot, vp);
     D3D12TimingStampOn(list, timing_slot, 1);
 
-    Barrier(list, NeuralTex(SLOT_COLOR),  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(list, NeuralTex(SLOT_DEPTH),  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(list, NeuralTex(SLOT_MV),     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(list, NeuralTex(SLOT_OUTPUT), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(list, NeuralTexVp(vp, SLOT_COLOR),  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(list, NeuralTexVp(vp, SLOT_DEPTH),  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(list, NeuralTexVp(vp, SLOT_MV),     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(list, NeuralTexVp(vp, SLOT_OUTPUT), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     DWORD code = 0;
     NVSDK_NGX_Result evaluated = NGX_SUCCESS;
@@ -2075,17 +2119,17 @@ static void D3D12RunEvaluatePipelined(UINT64 timeline, LONG *result, int transpo
     LARGE_INTEGER optiscaler_started = {};
     QueryPerformanceCounter(&optiscaler_started);
     evaluated = SafeEvaluate(g_bridge.eval_feature, list,
-                             g_bridge.feature, g_bridge.params, &code);
+                             g_bridge.viewports[vp].feature, g_bridge.viewports[vp].params, &code);
     ReportSlowCpuStage("OptiScaler/NGX EvaluateFeature", optiscaler_started);
     EndNeuralTogglePulse(toggle_pulse);
     list->EndEvent();
 
-    Barrier(list, NeuralTex(SLOT_COLOR),  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    Barrier(list, NeuralTex(SLOT_DEPTH),  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    Barrier(list, NeuralTex(SLOT_MV),     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    Barrier(list, NeuralTex(SLOT_OUTPUT), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    Barrier(list, NeuralTexVp(vp, SLOT_COLOR),  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    Barrier(list, NeuralTexVp(vp, SLOT_DEPTH),  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    Barrier(list, NeuralTexVp(vp, SLOT_MV),     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    Barrier(list, NeuralTexVp(vp, SLOT_OUTPUT), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     D3D12TimingStampOn(list, timing_slot, 2);
-    RecordMultiGpuDownload(list, transport_slot);
+    RecordMultiGpuDownloadVp(list, transport_slot, vp);
     D3D12TimingStampOn(list, timing_slot, 3);
     D3D12TimingResolveOn(list, timing_slot);
 
@@ -2108,23 +2152,24 @@ static void D3D12RunEvaluatePipelined(UINT64 timeline, LONG *result, int transpo
 
     if (code)
     {
-        Log("[bridge] evaluate raised 0x%08X", code);
+        Log("[bridge] vp%d evaluate raised 0x%08X", vp, code);
         *result = 2;
     }
     else if (evaluated != NGX_SUCCESS)
     {
-        Log("[bridge] evaluate failed 0x%08X, %s", evaluated,
+        Log("[bridge] vp%d evaluate failed 0x%08X, %s", vp, evaluated,
             NgxResultName(evaluated));
         *result = 1;
     }
 }
 
-static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
+static void D3D12RunEvaluateCoreVp(UINT64 v, LONG *result, int transport_slot, int vp)
 {
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
     if (g_mgpu.active && UnifiedNeuralQueueActive() &&
         g_mgpu.direct_vulkan_upload && g_mgpu.direct_vulkan_download)
     {
-        D3D12RunEvaluatePipelined(v, result, transport_slot);
+        D3D12RunEvaluatePipelinedVp(v, result, transport_slot, vp);
         return;
     }
     *result = 0;
@@ -2230,10 +2275,10 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
             }
             timing_slot = g_bridge.frame_slot;
             D3D12TimingStamp(timing_slot, 0);
-            RecordMultiGpuUpload(g_bridge.list, transport_slot);
+            RecordMultiGpuUploadVp(g_bridge.list, transport_slot, vp);
             D3D12TimingStamp(timing_slot, 1);
         }
-        else if (!MultiGpuUploadInputs(transport_slot, &upload_value))
+        else if (!MultiGpuUploadInputsVp(transport_slot, vp, &upload_value))
         {
             g_bridge.fence_out->Signal(v);
             *result = g_mgpu_pending_game ? 32 : 4;
@@ -2259,10 +2304,10 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
         D3D12TimingStamp(timing_slot, 0);
     }
 
-    Barrier(g_bridge.list, NeuralTex(SLOT_COLOR),  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(g_bridge.list, NeuralTex(SLOT_DEPTH),  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(g_bridge.list, NeuralTex(SLOT_MV),     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(g_bridge.list, NeuralTex(SLOT_OUTPUT), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(g_bridge.list, NeuralTexVp(vp, SLOT_COLOR),  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(g_bridge.list, NeuralTexVp(vp, SLOT_DEPTH),  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(g_bridge.list, NeuralTexVp(vp, SLOT_MV),     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(g_bridge.list, NeuralTexVp(vp, SLOT_OUTPUT), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     DWORD code = 0;
     NVSDK_NGX_Result re = NGX_SUCCESS;
@@ -2273,27 +2318,27 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
     const bool toggle_pulse = BeginNeuralTogglePulse();
     LARGE_INTEGER optiscaler_started = {};
     QueryPerformanceCounter(&optiscaler_started);
-    re = SafeEvaluate(g_bridge.eval_feature, g_bridge.list, g_bridge.feature, g_bridge.params, &code);
+    re = SafeEvaluate(g_bridge.eval_feature, g_bridge.list, g_bridge.viewports[vp].feature, g_bridge.viewports[vp].params, &code);
     ReportSlowCpuStage("OptiScaler/NGX EvaluateFeature", optiscaler_started);
     EndNeuralTogglePulse(toggle_pulse);
     g_bridge.list->EndEvent();
 
-    Barrier(g_bridge.list, NeuralTex(SLOT_COLOR),  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    Barrier(g_bridge.list, NeuralTex(SLOT_DEPTH),  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    Barrier(g_bridge.list, NeuralTex(SLOT_MV),     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    Barrier(g_bridge.list, NeuralTex(SLOT_OUTPUT), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    Barrier(g_bridge.list, NeuralTexVp(vp, SLOT_COLOR),  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    Barrier(g_bridge.list, NeuralTexVp(vp, SLOT_DEPTH),  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    Barrier(g_bridge.list, NeuralTexVp(vp, SLOT_MV),     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    Barrier(g_bridge.list, NeuralTexVp(vp, SLOT_OUTPUT), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     if (unified) D3D12TimingStamp(timing_slot, 2);
     else
     {
         D3D12TimingStamp(timing_slot, 1);
         if (g_mgpu.active)
-            RecordMultiGpuDownload(g_bridge.list, transport_slot);
+            RecordMultiGpuDownloadVp(g_bridge.list, transport_slot, vp);
         D3D12TimingResolveNeural(timing_slot);
     }
 
     if (g_mgpu.active && unified)
     {
-        RecordMultiGpuDownload(g_bridge.list, transport_slot);
+        RecordMultiGpuDownloadVp(g_bridge.list, transport_slot, vp);
         D3D12TimingStamp(timing_slot, 3);
         D3D12TimingResolve(timing_slot);
         const UINT64 pipeline_value = D3D12EndCommands();
@@ -2369,7 +2414,7 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
             timing_evaluated = GetTickCount64();
             const double neural_gpu_ms = D3D12TimingReadNeural(timing_slot);
             NeuralTimingConsume(timing_slot, neural_gpu_ms);
-            if (!MultiGpuDownloadOutput(v, evaluate_value, transport_slot))
+            if (!MultiGpuDownloadOutputVp(v, evaluate_value, transport_slot, vp))
             {
                 g_bridge.fence_out->Signal(v);
                 *result = g_mgpu_pending_game ? 32 : 4;
@@ -2410,6 +2455,6 @@ static void D3D12RunEvaluateCore(UINT64 v, LONG *result, int transport_slot)
         }
     }
 
-    if (code)              { Log("[bridge] evaluate raised 0x%08X", code); *result = 2; return; }
-    if (re != NGX_SUCCESS) { Log("[bridge] evaluate failed 0x%08X, %s", re, NgxResultName(re)); *result = 1; return; }
+    if (code)              { Log("[bridge] vp%d evaluate raised 0x%08X", vp, code); *result = 2; return; }
+    if (re != NGX_SUCCESS) { Log("[bridge] vp%d evaluate failed 0x%08X, %s", vp, re, NgxResultName(re)); *result = 1; return; }
 }

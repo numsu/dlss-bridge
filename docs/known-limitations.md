@@ -6,14 +6,21 @@ paths.
 
 ## Game and API coverage
 
-- The integrated capture path is a 64-bit Windows Vulkan process using NVIDIA
-  NGX, on native Windows or through Proton. Native Linux Vulkan, Direct3D
+- The validated capture path is a 64-bit Windows Vulkan process using NVIDIA
+  NGX, on native Windows or through Proton. Direct3D 11 capture is
+  implemented but untested: it builds, links, and passes native checks, with
+  no end-to-end hardware validation yet. Native Linux Vulkan, Direct3D 12
   capture, Streamline capture, and final-frame processing are planned.
 - The game must expose color, output, depth, motion vectors, temporal scalars,
   and a complete feature-creation contract through NGX.
-- One Super Resolution feature history is bridged per process. Multiple active
-  features, simultaneous viewports, multiple Vulkan devices, and child
-  renderer processes are not supported.
+- Up to four concurrent Super Resolution histories are bridged per process,
+  keyed by game NGX handle identity (`capture.max_viewports`, default 1).
+  Each viewport owns a private D3D12 feature, shared textures, latch, and
+  telemetry; the D3D12 device, queues, and worker stay shared. Multiple Vulkan
+  devices and child renderer processes are not supported.
+- Split-screen notes: viewports interleave on the shared worker while temporal
+  order is preserved within each viewport. Multi-GPU multi-viewport requires
+  uniform per-slot geometry (footprints derive from viewport 0).
 - Frame Generation creation is rejected. Ray Reconstruction evaluations are
   left untouched because neither feature uses the implemented Super Resolution
   contract.
@@ -137,6 +144,9 @@ paths.
 - Automated tests cover configuration, session isolation, component policy,
   DLL loading, injection timing, and Vulkan-module discovery. They do not
   replace hardware validation for multi-GPU output correctness, device loss,
-  dynamic resolution, or uncommon engine contracts.
+  dynamic resolution, or uncommon engine contracts. The D3D11 capture/host
+  path and the multi-viewport (split-screen) executor have no hardware
+  validation yet: treat `profiles/bg3-dx11.toml` and any `max_viewports > 1`
+  configuration as experimental until a passing game log exists.
 - Native Windows installer execution and upgrade behavior still require a
   release-environment smoke test.

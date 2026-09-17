@@ -64,7 +64,8 @@ bool ParseAdapterSelector(const char *text, AdapterSelector *out)
 RuntimeConfig::RuntimeConfig()
     : verbose(0),
       ring_slots(3), neural_pipeline_frames(2),
-      latency_budget_ms(16), gpu_timestamps(1), execution_mode(ExecutionMode::Auto),
+      latency_budget_ms(16), gpu_timestamps(1), max_viewports(1),
+      execution_mode(ExecutionMode::Auto),
       output_transport(OutputTransport::Native), neural_queue_mode(NeuralQueueMode::Split),
       compute_adapter{}
 {
@@ -97,6 +98,11 @@ bool RuntimeConfig::Apply(const char *key, const char *value)
         if (!ParseInt(value, &n) || (n != 0 && n != 1)) return false;
         gpu_timestamps = n;
     }
+    else if (EqualNoCase(key, "max_viewports")) {
+        if (!ParseInt(value, &n)) return false;
+        if (n < 1 || n > 4) return false;
+        max_viewports = n;
+    }
     else if (EqualNoCase(key, "execution_mode")) {
         if (EqualNoCase(value, "auto")) execution_mode = ExecutionMode::Auto;
         else if (EqualNoCase(value, "same_gpu")) execution_mode = ExecutionMode::SameGpu;
@@ -122,7 +128,8 @@ bool RuntimeConfig::Valid() const
 {
     return ring_slots >= 2 && ring_slots <= 8 &&
         neural_pipeline_frames >= 1 && neural_pipeline_frames < ring_slots &&
-        latency_budget_ms >= 1 && latency_budget_ms <= 125;
+        latency_budget_ms >= 1 && latency_budget_ms <= 125 &&
+        max_viewports >= 1 && max_viewports <= 4;
 }
 
 const char *ExecutionModeName(ExecutionMode mode)

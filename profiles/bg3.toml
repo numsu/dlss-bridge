@@ -1,0 +1,9 @@
+schema = 1
+
+[match]
+executable = "bg3.exe"
+graphics_api = "vulkan"
+
+[capture]
+adapter = "ngx_vulkan"
+max_viewports = 2

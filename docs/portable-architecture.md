@@ -1,9 +1,9 @@
 # Portable architecture
 
-DLSS Bridge attaches to a 64-bit Windows Vulkan process, captures its NVIDIA
-NGX temporal-upscaling contract, executes the corresponding private D3D12 NGX
-operation through the configured neural host, and reinserts the result before
-the game records downstream rendering.
+DLSS Bridge attaches to a 64-bit Windows Vulkan or Direct3D 11 process,
+captures its NVIDIA NGX temporal-upscaling contract, executes the
+corresponding private D3D12 NGX operation through the configured neural host,
+and reinserts the result before the game records downstream rendering.
 
 The same package supports native Windows and Windows games launched through
 Proton. The launcher creates an isolated user-state directory and injects the
@@ -12,17 +12,22 @@ bridge without changing the game directory or Wine prefix.
 ## Current execution path
 
 ```text
-game NGX Vulkan create
-  -> capture exact feature creation contract
+game NGX Vulkan/D3D11 create
+  -> capture exact feature creation contract (per viewport, keyed by NGX handle)
 
 game NGX Vulkan evaluate
   -> capture color, depth, motion vectors, output, and temporal scalars
   -> copy inputs in the game command buffer
-  -> signal the ordered worker
+  -> signal the ordered worker (order preserved per viewport)
   -> private D3D12 NGX evaluate through session-local OptiScaler
   -> return the completed output
   -> copy output back in the same game command buffer
   -> game post-processing, UI, and presentation
+
+game NGX D3D11 evaluate (implemented, untested — no hardware-validated run yet)
+  -> copy inputs via the immediate context to per-viewport shared textures
+  -> private D3D12 NGX evaluate (same per-viewport features as Vulkan)
+  -> copy neural output back via the immediate context
 ```
 
 There is one in-frame execution path. If its synchronization objects cannot be
@@ -34,10 +39,15 @@ latched.
 
 The runtime composes four statically linked component kinds:
 
-- **Host:** obtains process and Vulkan lifecycle boundaries.
-- **Capture:** recognizes NVIDIA NGX Vulkan feature creation and evaluation.
-- **Executor:** owns the private D3D12 device, NGX session, and neural call.
-- **Transport:** moves the temporal resources between the game and executor.
+- **Host:** obtains process and graphics lifecycle boundaries
+  (`injected-vulkan`, `injected-d3d11`, Vulkan layer, ReShade add-on).
+- **Capture:** recognizes NVIDIA NGX feature creation and evaluation
+  (`ngx-vulkan`, `d3d11`).
+- **Executor:** owns the private D3D12 device, per-viewport NGX sessions, and
+  neural calls.
+- **Transport:** moves the temporal resources between the game and executor
+  (`vulkan-d3d12`, `d3d11-d3d12`; same-adapter NT sharing or directional host
+  staging).
 
 The compiled component registry validates that the selected host, capture,
 executor, and transport capabilities are compatible. `backend.toml` files are
@@ -61,12 +71,14 @@ have received less hardware validation.
 
 ## Feature contracts
 
-A successful NGX Vulkan feature create records the handle and mandatory
-creation values: input and output dimensions, quality, and feature flags.
-Optional output-subrect policy is preserved when present. Evaluation is
-accepted only for a handle with a complete captured contract. The D3D12
-executor uses that contract once and does not invent quality modes, flags, or
-retry mutations.
+A successful NGX feature create records the handle and mandatory creation
+values: input and output dimensions, quality, and feature flags. Optional
+output-subrect policy is preserved when present. Evaluation is accepted only
+for a handle with a complete captured contract. The D3D12 executor creates one
+private feature per viewport from that viewport's contract and does not invent
+quality modes, flags, or retry mutations. Viewports are resolved by NGX handle
+identity up to `capture.max_viewports`; beyond that, frames are forwarded
+untouched.
 
 Frame Generation and Ray Reconstruction are separate contracts. Frame
 Generation creation is rejected while the bridge is attached. Ray
@@ -90,9 +102,10 @@ Vulkan host-pointer import succeeds, Vulkan writes and reads the directional
 staging allocations directly. Otherwise the route uses game-adapter D3D12
 helper copies. The active sub-route is reported in the runtime log.
 
-Temporal evaluations remain ordered. More ring slots can absorb scheduling
-variation, but evaluations cannot be reordered without corrupting temporal
-history.
+Temporal evaluations remain ordered within each viewport. More ring slots can
+absorb scheduling variation, but evaluations for one viewport cannot be
+reordered without corrupting its temporal history. Viewports interleave on the
+shared worker and transport ring (slots are exclusive while in flight).
 
 ## Configuration and profiles
 
@@ -110,8 +123,12 @@ errors. The integrated values are:
 
 Bundled profiles with `[match].executable` are applied automatically. Explicit
 `--profile` values are applied afterward. The only integrated feature kind is
-`neural_rendering`, capture adapter is `ngx_vulkan`, and graphics API is
-`vulkan`; other values fail during resolution.
+`neural_rendering`; integrated capture adapters are `ngx_vulkan` and `d3d11`,
+with matching graphics APIs `vulkan` and `d3d11`. Mismatched
+adapter/API pairs and `capture.max_viewports` outside 1..4 fail during
+resolution. `profiles/bg3.toml` (`bg3.exe`/Vulkan) and
+`profiles/bg3-dx11.toml` (`bg3_dx11.exe`/D3D11) both set `max_viewports = 2`
+for split-screen co-op.
 
 Feature placement, working scale, and pass count are written to the
 session-local OptiScaler configuration. The remaining settings become the
@@ -134,14 +151,17 @@ and richer crash-artifact collection remain future work.
 
 Before neural-only mode latches, the game evaluation is forwarded while the
 private resources warm. Every transport slot must contain a completed neural
-result before latching. After latching, the game-side evaluation stays
-suppressed. A busy ring may repeat a completion-qualified neural result. A
+result before a viewport latches. After latching, that viewport's game-side
+evaluation stays suppressed while other viewports warm independently. A busy
+ring may repeat a completion-qualified neural result for the same viewport. A
 missing contract, failed handoff, NGX exception, or permanent executor failure
-is reported and does not silently restore ordinary DLSS.
+is reported and does not silently restore ordinary DLSS. Per-viewport failures
+park only that viewport; device-level failures remain fail-closed for the
+process.
 
 ## Planned extension paths
 
-The repository inventories native Linux Vulkan, Direct3D capture, Streamline
+The repository inventories native Linux Vulkan, Direct3D 12 capture, Streamline
 capture, Vulkan execution, peer memory, and final-frame processing as planned
 components. They require implementations and validation before their manifests
 can be marked integrated. Native Linux execution additionally requires a

@@ -19,6 +19,14 @@
 // timeline semaphores are the whole synchronisation contract.
 
 // ---- cached dispatch / device state ---------------------------------------
+// Forward declarations for viewport-aware helpers defined later in this file
+// but used by the worker (which precedes them). The D3D12-side Vp helpers live
+// in d3d12_session.inc and are already visible.
+static void ApplyFrameScalarsVp(int vp, const FrameScalars *s);
+static void NoteFrameBridgedVp(int vp, UINT64 v);
+static void D3D12RunEvaluateCoreVp(UINT64 v, LONG *result, int transport_slot, int vp);
+static void VkReleaseSharedTexVp(int vp, int slot);
+
 static DeviceDispatch               *g_disp;        // game device dispatch
 
 static void BridgeReleaseVkOutputEarly(int transport_slot)
@@ -160,9 +168,10 @@ static uint32_t PickMemType(uint32_t bits, VkMemoryPropertyFlags want)
     return 0;
 }
 
-static bool VkImportSharedTex(int slot)
+static bool VkImportSharedTexVp(int vp, int slot)
 {
-    SharedTex &t = g_bridge.tex[slot];
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
+    SharedTex &t = g_bridge.viewports[vp].tex[slot];
     VkDevice dev = g_bridge.device;
 
     VkExternalMemoryImageCreateInfo ext = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
@@ -222,8 +231,13 @@ static bool VkImportSharedTex(int slot)
     { Log("[vk] %s: vkBindImageMemory failed", kSlotName[slot]); return false; }
 
     t.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    Log("[vk] %-6s imported as VkImage %p (%ux%u)", kSlotName[slot], (void *)t.image, t.w, t.h);
+    Log("[vk] vp%d %-6s imported as VkImage %p (%ux%u)", vp, kSlotName[slot], (void *)t.image, t.w, t.h);
     return true;
+}
+
+static bool VkImportSharedTex(int slot)
+{
+    return VkImportSharedTexVp(0, slot);
 }
 
 static UINT DxgiBytesPerTexel(DXGI_FORMAT fmt);
@@ -491,8 +505,6 @@ static volatile LONG g_release_deferred;    // teardown was requested ON the wor
 static bool          g_handoff_ready;
 static bool          g_handoff_init_done;
 
-static void ApplyFrameScalars(const FrameScalars *s);
-
 // Recording-order queue of slots: single producer (the game's thread, under
 // g_frame_cs), single consumer (the worker). A slot is queued at most once
 // while in flight, so kFrames + 1 entries can never overflow.
@@ -589,12 +601,15 @@ static void WorkerRunSlot(int slot)
     if (result == 0)
     {
         // This frame's own scalars (its jitter above all): the next frame
-        // may already be recorded and must not lend it its values.
-        ApplyFrameScalars(&fr.scalars);
+        // may already be recorded and must not lend it its values. Scalars and
+        // the D3D12 evaluate are per-viewport so split-screen histories stay
+        // isolated even though the worker queue is shared.
+        const int vp = fr.viewport >= 0 && fr.viewport < MAX_VIEWPORTS ? fr.viewport : 0;
+        ApplyFrameScalarsVp(vp, &fr.scalars);
         // The D3D12 fence is the same object Vulkan imported; a CPU-side
         // signal satisfies the queue Wait inside the evaluate core.
         g_bridge.fence_in->Signal(v);
-        D3D12RunEvaluateCore(v, &result, fr.transport_slot);
+        D3D12RunEvaluateCoreVp(v, &result, fr.transport_slot, vp);
         QueryPerformanceCounter(&evaluate_done);
         if (result == 0 && g_bridge.fence_out->GetCompletedValue() < v)
         {
@@ -741,7 +756,7 @@ static VkPipelineLayout      g_depth_pl;
 static VkPipeline            g_depth_pipe;
 static VkDescriptorPool      g_depth_pool;
 static VkDescriptorSet       g_depth_desc[Bridge::kMaxFrames];
-static VkImageView           g_depth_store_view;   // storage view of the shared image
+static VkImageView           g_depth_store_view[MAX_VIEWPORTS]; // per-viewport storage view of its shared depth image
 static bool                  g_depth_pipe_failed;
 
 static void DestroyDepthPipeline()
@@ -847,22 +862,26 @@ bad:
 // Called from the evaluate hook when the geometry / formats change. Creates the
 // D3D12 shared textures, imports them into Vulkan, binds them into the private
 // NGX parameter block, builds the DLSS feature and the depth staging buffers.
-static bool RebuildResources(const FeatureCreateContract &contract,
+// Per-viewport: only the changing viewport is torn down; other split-screen
+// viewports keep their histories. The shared queue is drained (all viewports
+// stall briefly) because per-viewport GPU isolation would need separate queues.
+static bool RebuildViewportResources(int vp, const FeatureCreateContract &contract,
                              const NVSDK_NGX_Parameter *p, const GameRes &col,
                              const GameRes &out, const GameRes &dep, const GameRes &mv)
 {
-    Log("[bridge] (re)building resources for %ux%u -> %ux%u", col.w, col.h, out.w, out.h);
-    // The caller guarantees no bridged frame is in flight (BridgeSlotsBusy()
-    // == 0): nothing recorded into a game command buffer still references
-    // what is released below, every retire fence is signalled, and every
-    // D3D12 wait the bridge queued has been satisfied -- so the drain below
-    // cannot deadlock. Drop the cached depth views too: the old depth images
-    // may die with the old contract.
+    if (vp < 0 || vp >= MAX_VIEWPORTS) return false;
+    BridgeViewport &v = g_bridge.viewports[vp];
+    Log("[bridge] vp%d (re)building resources for %ux%u -> %ux%u", vp, col.w, col.h, out.w, out.h);
+    // The caller guarantees no bridged frame of this viewport is in flight:
+    // nothing recorded into a game command buffer still references what is
+    // released below. A shared-queue drain stalls all viewports briefly; per-
+    // viewport queues remain future work.
     D3D12DrainGpu();
     if (g_disp && g_bridge.device)
         for (int i = 0; i < ActiveFrameCount(); ++i)
         {
             Bridge::VkFrame &fr = g_bridge.vkframe[i];
+            if (fr.viewport != vp) continue;
             if (fr.submitted && fr.retire)
             {
                 g_disp->ResetFences(g_bridge.device, 1, &fr.retire);
@@ -871,28 +890,23 @@ static bool RebuildResources(const FeatureCreateContract &contract,
             if (fr.game_depth_view && g_disp->DestroyImageView)
             { g_disp->DestroyImageView(g_bridge.device, fr.game_depth_view, nullptr); fr.game_depth_view = VK_NULL_HANDLE; }
         }
-    g_bridge.frame_ready = false;
-    if (g_bridge.feature && g_bridge.release_feature)
-    { g_bridge.release_feature(g_bridge.feature); g_bridge.feature = nullptr; }
-    if (g_depth_store_view && g_disp->DestroyImageView)
-    { g_disp->DestroyImageView(g_bridge.device, g_depth_store_view, nullptr); g_depth_store_view = VK_NULL_HANDLE; }
-    for (int direction = 0; direction < CROSS_COUNT; ++direction)
-        VkReleaseCrossDirection(direction);
-    D3D12ReleaseMultiGpuFrameResources();
-    for (int i = 0; i < SLOT_COUNT; ++i) VkReleaseSharedTex(i);
-    g_mgpu.direct_vulkan_upload = false;
-    g_mgpu.direct_vulkan_download = false;
-    if (InterlockedExchange(&g_neural_only_latched, 0) != 0)
-        Log("[policy] resource contract changed; warming every new transport slot before neural-only relatches");
+    v.frame_ready = false;
+    if (v.feature && g_bridge.release_feature)
+    { g_bridge.release_feature(v.feature); v.feature = nullptr; }
+    if (g_depth_store_view[vp] && g_disp->DestroyImageView)
+    { g_disp->DestroyImageView(g_bridge.device, g_depth_store_view[vp], nullptr); g_depth_store_view[vp] = VK_NULL_HANDLE; }
+    for (int i = 0; i < SLOT_COUNT; ++i) VkReleaseSharedTexVp(vp, i);
+    if (InterlockedExchange(&v.neural_latched, 0) != 0)
+        Log("[policy] vp%d resource contract changed; warming every new transport slot before neural-only relatches", vp);
 
-    g_bridge.width  = col.w; g_bridge.height = col.h;
-    g_bridge.out_width = out.w; g_bridge.out_height = out.h;
+    v.width  = col.w; v.height = col.h;
+    v.out_width = out.w; v.out_height = out.h;
 
     unsigned rw = 0, rh = 0;
     if (!(p && p->Get("DLSS.Render.Subrect.Dimensions.Width",  &rw) == NGX_SUCCESS && rw)) rw = col.w;
     if (!(p && p->Get("DLSS.Render.Subrect.Dimensions.Height", &rh) == NGX_SUCCESS && rh)) rh = col.h;
-    g_bridge.render_w = rw; g_bridge.render_h = rh;
-    g_bridge.ngx_out_w = out.w; g_bridge.ngx_out_h = out.h;
+    v.render_w = rw; v.render_h = rh;
+    v.ngx_out_w = out.w; v.ngx_out_h = out.h;
 
     struct Plan { int slot; UINT w, h; DXGI_FORMAT dxgi; VkFormat vk; bool uav; } plan[SLOT_COUNT];
 
@@ -923,20 +937,20 @@ static bool RebuildResources(const FeatureCreateContract &contract,
 
     for (const Plan &pl : plan)
     {
-        if (!D3D12MakeSharedTexture(pl.slot, pl.w, pl.h, pl.dxgi, pl.uav)) { BridgeFail("shared texture"); return false; }
-        if (g_mgpu.active && !D3D12MakeNeuralTexture(pl.slot, pl.w, pl.h, pl.dxgi, pl.uav))
-        { BridgeFail("neural texture"); return false; }
-        g_bridge.tex[pl.slot].fmtvk = pl.vk;
-        if (!VkImportSharedTex(pl.slot)) { BridgeFail("import texture"); return false; }
-        g_bridge.slot_w[pl.slot] = pl.w; g_bridge.slot_h[pl.slot] = pl.h;
+        if (!D3D12MakeSharedTextureVp(vp, pl.slot, pl.w, pl.h, pl.dxgi, pl.uav)) { ViewportFail(vp, "shared texture"); return false; }
+        if (g_mgpu.active && !D3D12MakeNeuralTextureVp(vp, pl.slot, pl.w, pl.h, pl.dxgi, pl.uav))
+        { ViewportFail(vp, "neural texture"); return false; }
+        v.tex[pl.slot].fmtvk = pl.vk;
+        if (!VkImportSharedTexVp(vp, pl.slot)) { ViewportFail(vp, "import texture"); return false; }
+        v.slot_w[pl.slot] = pl.w; v.slot_h[pl.slot] = pl.h;
     }
 
-    if (!D3D12BuildCrossBuffer()) { BridgeFail("cross-adapter buffer"); return false; }
+    if (!D3D12BuildCrossBuffer()) { ViewportFail(vp, "cross-adapter buffer"); return false; }
     if (g_mgpu.active)
     {
         const bool direct_upload = VkImportCrossBuffer(CROSS_UPLOAD);
         const bool direct_download = VkImportCrossBuffer(CROSS_DOWNLOAD);
-        Log("[transport] secondary-GPU route: upload=%s download=%s",
+        Log("[transport] vp%d secondary-GPU route: upload=%s download=%s", vp,
             direct_upload ? "Vulkan host import" : "D3D12 game-adapter helper copy",
             direct_download ? "Vulkan host import" : "D3D12 game-adapter helper copy");
     }
@@ -945,43 +959,51 @@ static bool RebuildResources(const FeatureCreateContract &contract,
     if (g_disp->CreateImageView)
     {
         VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vi.image            = g_bridge.tex[SLOT_DEPTH].image;
+        vi.image            = v.tex[SLOT_DEPTH].image;
         vi.viewType         = VK_IMAGE_VIEW_TYPE_2D;
         vi.format           = VK_FORMAT_R32_SFLOAT;
         vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        if (g_disp->CreateImageView(g_bridge.device, &vi, nullptr, &g_depth_store_view) != VK_SUCCESS)
-            g_depth_store_view = VK_NULL_HANDLE;
+        if (g_disp->CreateImageView(g_bridge.device, &vi, nullptr, &g_depth_store_view[vp]) != VK_SUCCESS)
+            g_depth_store_view[vp] = VK_NULL_HANDLE;
     }
 
+    if (!v.params)
+    {
+        DWORD acode = 0;
+        if (SafeAllocParams(g_bridge.alloc_params, &v.params, &acode) != NGX_SUCCESS || !v.params)
+        { ViewportFail(vp, "allocate parameters"); return false; }
+    }
     for (int i = 0; i < SLOT_COUNT; ++i)
-        g_bridge.params->Set(kSlotKey[i], NeuralTex(i));
+        v.params->Set(kSlotKey[i], NeuralTexVp(vp, i));
 
     for (int i = 0; i < ActiveFrameCount(); ++i)
         if (!EnsureDepthScratch(i, (VkDeviceSize)plan[SLOT_DEPTH].w * plan[SLOT_DEPTH].h * 4))
-        { Log("[vk] depth staging alloc failed"); BridgeFail("depth staging"); return false; }
+        { Log("[vk] depth staging alloc failed"); ViewportFail(vp, "depth staging"); return false; }
 
-    if (!D3D12CreateDlssFeature(contract)) { BridgeFail("create feature from captured contract"); return false; }
+    if (!D3D12CreateDlssFeatureVp(contract, vp)) { ViewportFail(vp, "create feature from captured contract"); return false; }
 
-    g_bridge.game_fmt[SLOT_COLOR] = col.fmt;
-    g_bridge.game_fmt[SLOT_OUTPUT] = out.fmt;
-    g_bridge.game_fmt[SLOT_DEPTH] = dep.fmt;
-    g_bridge.game_fmt[SLOT_MV] = mv.fmt;
+    v.game_fmt[SLOT_COLOR] = col.fmt;
+    v.game_fmt[SLOT_OUTPUT] = out.fmt;
+    v.game_fmt[SLOT_DEPTH] = dep.fmt;
+    v.game_fmt[SLOT_MV] = mv.fmt;
 
-    g_bridge.frame_ready = true;
-    g_bridge.consecutive_fails = 0;
+    v.frame_ready = true;
+    v.consecutive_fails = 0;
     return true;
 }
 
-static bool ContractChanged(const GameRes &col, const GameRes &out,
+static bool ViewportContractChanged(int vp, const GameRes &col, const GameRes &out,
                             const GameRes &dep, const GameRes &mv)
 {
-    return !g_bridge.frame_ready
-        || g_bridge.slot_w[SLOT_COLOR]  != col.w || g_bridge.slot_h[SLOT_COLOR]  != col.h
-        || g_bridge.slot_w[SLOT_OUTPUT] != out.w || g_bridge.slot_h[SLOT_OUTPUT] != out.h
-        || g_bridge.slot_w[SLOT_DEPTH]  != dep.w || g_bridge.slot_h[SLOT_DEPTH]  != dep.h
-        || g_bridge.slot_w[SLOT_MV]     != mv.w  || g_bridge.slot_h[SLOT_MV]     != mv.h
-        || g_bridge.game_fmt[SLOT_COLOR]  != col.fmt || g_bridge.game_fmt[SLOT_OUTPUT] != out.fmt
-        || g_bridge.game_fmt[SLOT_DEPTH]  != dep.fmt || g_bridge.game_fmt[SLOT_MV]     != mv.fmt;
+    if (vp < 0 || vp >= MAX_VIEWPORTS) return true;
+    const BridgeViewport &v = g_bridge.viewports[vp];
+    return !v.frame_ready
+        || v.slot_w[SLOT_COLOR]  != col.w || v.slot_h[SLOT_COLOR]  != col.h
+        || v.slot_w[SLOT_OUTPUT] != out.w || v.slot_h[SLOT_OUTPUT] != out.h
+        || v.slot_w[SLOT_DEPTH]  != dep.w || v.slot_h[SLOT_DEPTH]  != dep.h
+        || v.slot_w[SLOT_MV]     != mv.w  || v.slot_h[SLOT_MV]     != mv.h
+        || v.game_fmt[SLOT_COLOR]  != col.fmt || v.game_fmt[SLOT_OUTPUT] != out.fmt
+        || v.game_fmt[SLOT_DEPTH]  != dep.fmt || v.game_fmt[SLOT_MV]     != mv.fmt;
 }
 
 // ---- per-frame scalar forwarding ------------------------------------------
@@ -1005,8 +1027,9 @@ static bool GetFloatOr(const NVSDK_NGX_Parameter *g, const char *key, float neut
     *out = has ? v : neutral;
     return has;
 }
-static void CaptureFrameScalars(const NVSDK_NGX_Parameter *g, FrameScalars *s)
+static void CaptureFrameScalarsVp(int vp, const NVSDK_NGX_Parameter *g, FrameScalars *s)
 {
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
     memset(s, 0, sizeof(*s));
     s->has_jitter_x  = GetFloatOr(g, "Jitter.Offset.X", 0.0f, &s->jitter_x);
     s->has_jitter_y  = GetFloatOr(g, "Jitter.Offset.Y", 0.0f, &s->jitter_y);
@@ -1020,15 +1043,18 @@ static void CaptureFrameScalars(const NVSDK_NGX_Parameter *g, FrameScalars *s)
 
     unsigned reset = 0;
     if (g) g->Get("Reset", &reset);
-    if (g_bridge.need_reset) reset = 1;
+    if (g_bridge.viewports[vp].need_reset) reset = 1;
     s->reset = reset;
-    g_bridge.need_reset = false;
+    g_bridge.viewports[vp].need_reset = false;
 
     s->has_frame_dt = GetFloatOr(g, "FrameTimeDeltaInMsec", 0.0f, &s->frame_dt);
 }
-static void ApplyFrameScalars(const FrameScalars *s)
+static void ApplyFrameScalarsVp(int vp, const FrameScalars *s)
 {
-    NVSDK_NGX_Parameter *q = g_bridge.params;
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
+    BridgeViewport &v = g_bridge.viewports[vp];
+    NVSDK_NGX_Parameter *q = v.params;
+    if (!q) return;
 
     // OptiScaler's D3D12 CreateFeature path may initialise or replace entries
     // in the parameter table. Resource bindings installed while constructing
@@ -1037,33 +1063,33 @@ static void ApplyFrameScalars(const FrameScalars *s)
     // per-evaluate inputs anyway, so bind the current neural-device textures at
     // the last possible point, alongside the per-frame scalar values.
     for (int i = 0; i < SLOT_COUNT; ++i)
-        q->Set(kSlotKey[i], NeuralTex(i));
+        q->Set(kSlotKey[i], NeuralTexVp(vp, i));
 
-    static bool logged_resources = false;
-    if (!logged_resources)
+    static bool logged_resources[MAX_VIEWPORTS] = {};
+    if (!logged_resources[vp])
     {
         bool valid = true;
         for (int i = 0; i < SLOT_COUNT; ++i)
         {
             ID3D12Resource *bound = nullptr;
-            if (q->Get(kSlotKey[i], &bound) != NGX_SUCCESS || bound != NeuralTex(i))
+            if (q->Get(kSlotKey[i], &bound) != NGX_SUCCESS || bound != NeuralTexVp(vp, i))
             {
-                Log("[bridge] per-frame %s binding read-back failed: expected=%p actual=%p",
-                    kSlotName[i], (void *)NeuralTex(i), (void *)bound);
+                Log("[bridge] vp%d per-frame %s binding read-back failed: expected=%p actual=%p",
+                    vp, kSlotName[i], (void *)NeuralTexVp(vp, i), (void *)bound);
                 valid = false;
             }
         }
         if (valid)
-            Log("[bridge] per-frame D3D12 resources bound: Color=%p Output=%p Depth=%p MV=%p",
-                (void *)NeuralTex(SLOT_COLOR), (void *)NeuralTex(SLOT_OUTPUT),
-                (void *)NeuralTex(SLOT_DEPTH), (void *)NeuralTex(SLOT_MV));
-        logged_resources = true;
+            Log("[bridge] vp%d per-frame D3D12 resources bound: Color=%p Output=%p Depth=%p MV=%p",
+                vp, (void *)NeuralTexVp(vp, SLOT_COLOR), (void *)NeuralTexVp(vp, SLOT_OUTPUT),
+                (void *)NeuralTexVp(vp, SLOT_DEPTH), (void *)NeuralTexVp(vp, SLOT_MV));
+        logged_resources[vp] = true;
     }
 
-    q->Set("Width",     g_bridge.render_w);
-    q->Set("Height",    g_bridge.render_h);
-    q->Set("DLSS.Render.Subrect.Dimensions.Width",  g_bridge.render_w);
-    q->Set("DLSS.Render.Subrect.Dimensions.Height", g_bridge.render_h);
+    q->Set("Width",     v.render_w);
+    q->Set("Height",    v.render_h);
+    q->Set("DLSS.Render.Subrect.Dimensions.Width",  v.render_w);
+    q->Set("DLSS.Render.Subrect.Dimensions.Height", v.render_h);
     if (s->has_jitter_x)  q->Set("Jitter.Offset.X", s->jitter_x);
     if (s->has_jitter_y)  q->Set("Jitter.Offset.Y", s->jitter_y);
     if (s->has_sharpness) q->Set("Sharpness",       s->sharpness);
@@ -1152,9 +1178,10 @@ static void ComputeWriteTransferReadBarrier(VkCommandBuffer c)
 }
 
 // game colour/MV image -> shared texture (size-compatible copy, or blit).
-static void CopyColorLike(VkCommandBuffer c, const GameRes &src, int slot, bool blit)
+static void CopyColorLikeVp(int vp, VkCommandBuffer c, const GameRes &src, int slot, bool blit)
 {
-    SharedTex &dst = g_bridge.tex[slot];
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
+    SharedTex &dst = g_bridge.viewports[vp].tex[slot];
     const UINT w = umin(src.w, dst.w), h = umin(src.h, dst.h);
 
     VkImgBarrier(c, src.image, src.aspect, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -1187,9 +1214,10 @@ static void CopyColorLike(VkCommandBuffer c, const GameRes &src, int slot, bool 
 
 // game depth image -> shared R32F, via a depth-aspect buffer round-trip (a
 // bit-exact reinterpret, valid for 32-bit float depth).
-static void CopyDepth(VkCommandBuffer c, const GameRes &src, int frame_slot)
+static void CopyDepthVp(int vp, VkCommandBuffer c, const GameRes &src, int frame_slot)
 {
-    SharedTex &dst = g_bridge.tex[SLOT_DEPTH];
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
+    SharedTex &dst = g_bridge.viewports[vp].tex[SLOT_DEPTH];
     const UINT w = umin(src.w, dst.w), h = umin(src.h, dst.h);
     VkBuffer staging = g_bridge.vkframe[frame_slot].depth_scratch;
 
@@ -1243,9 +1271,10 @@ static VkImageView GetSampleableDepthView(Bridge::VkFrame &fr, const GameRes &de
 }
 
 // game depth (any format) -> shared R32F, sampled through a depth-only view.
-static void DispatchDepthConvert(VkCommandBuffer c, VkImageView src_view, UINT sw, UINT sh, int frame_slot)
+static void DispatchDepthConvertVp(int vp, VkCommandBuffer c, VkImageView src_view, UINT sw, UINT sh, int frame_slot)
 {
-    SharedTex &dst = g_bridge.tex[SLOT_DEPTH];
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
+    SharedTex &dst = g_bridge.viewports[vp].tex[SLOT_DEPTH];
     const UINT w = umin(sw, dst.w), h = umin(sh, dst.h);
 
     // Rebind every frame: the game may rotate depth images. The set for this
@@ -1255,7 +1284,7 @@ static void DispatchDepthConvert(VkCommandBuffer c, VkImageView src_view, UINT s
     si.imageView   = src_view;
     si.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     VkDescriptorImageInfo di = {};
-    di.imageView   = g_depth_store_view;
+    di.imageView   = g_depth_store_view[vp];
     di.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     VkWriteDescriptorSet wr[2] = {};
     wr[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1357,11 +1386,12 @@ static void RecordImageToUpload(VkCommandBuffer c, const GameRes &source,
         base_x, base_y, wanted_w, wanted_h);
 }
 
-static void RecordSharedToUpload(VkCommandBuffer c, int input, int transport_slot,
+static void RecordSharedToUploadVp(int vp, VkCommandBuffer c, int input, int transport_slot,
                                  UINT base_x, UINT base_y,
                                  UINT wanted_w, UINT wanted_h)
 {
-    SharedTex &source = g_bridge.tex[input];
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
+    SharedTex &source = g_bridge.viewports[vp].tex[input];
     RecordImageToUploadRaw(c, source.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
         source.w, source.h, g_mgpu.plane[input], transport_slot,
         base_x, base_y, wanted_w, wanted_h);
@@ -1369,48 +1399,51 @@ static void RecordSharedToUpload(VkCommandBuffer c, int input, int transport_slo
 
 // Compatible game images go directly to the frame's cross-adapter upload
 // allocation. A shared image remains only where format conversion is required.
-static void RecordDirectInputCopies(VkCommandBuffer c, int transport_slot,
+static void RecordDirectInputCopiesVp(int vp, VkCommandBuffer c, int transport_slot,
                                     const GameRes &col, const GameRes &dep,
                                     const GameRes &mv, bool color_converted,
                                     bool depth_converted, bool mv_converted,
                                     const FrameScalars &scalars)
 {
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
     if (!g_mgpu.direct_vulkan_upload) return;
-    const UINT rw = g_bridge.render_w, rh = g_bridge.render_h;
-    const bool low_res_mv = (g_bridge.feature_flags & (1u << 1)) != 0;
-    const UINT mv_w = low_res_mv ? rw : g_bridge.ngx_out_w;
-    const UINT mv_h = low_res_mv ? rh : g_bridge.ngx_out_h;
+    const BridgeViewport &v = g_bridge.viewports[vp];
+    const UINT rw = v.render_w, rh = v.render_h;
+    const bool low_res_mv = (v.feature_flags & (1u << 1)) != 0;
+    const UINT mv_w = low_res_mv ? rw : v.ngx_out_w;
+    const UINT mv_h = low_res_mv ? rh : v.ngx_out_h;
 
-    if (color_converted) RecordSharedToUpload(c, SLOT_COLOR, transport_slot,
+    if (color_converted) RecordSharedToUploadVp(vp, c, SLOT_COLOR, transport_slot,
                                                scalars.bases[0], scalars.bases[1], rw, rh);
     else RecordImageToUpload(c, col, g_mgpu.plane[SLOT_COLOR], transport_slot,
                              scalars.bases[0], scalars.bases[1], rw, rh);
 
-    if (depth_converted) RecordSharedToUpload(c, SLOT_DEPTH, transport_slot,
+    if (depth_converted) RecordSharedToUploadVp(vp, c, SLOT_DEPTH, transport_slot,
                                                scalars.bases[2], scalars.bases[3], rw, rh);
     else RecordImageToUpload(c, dep, g_mgpu.plane[SLOT_DEPTH], transport_slot,
                              scalars.bases[2], scalars.bases[3], rw, rh);
 
-    if (mv_converted) RecordSharedToUpload(c, SLOT_MV, transport_slot,
+    if (mv_converted) RecordSharedToUploadVp(vp, c, SLOT_MV, transport_slot,
                                             scalars.bases[4], scalars.bases[5], mv_w, mv_h);
     else RecordImageToUpload(c, mv, g_mgpu.plane[SLOT_MV], transport_slot,
                              scalars.bases[4], scalars.bases[5], mv_w, mv_h);
 }
 
-static void RecordBootstrapOutput(VkCommandBuffer c, const GameRes &game_out,
+static void RecordBootstrapOutputVp(int vp, VkCommandBuffer c, const GameRes &game_out,
                                   bool converted, int transport_slot)
 {
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
     if (!g_mgpu.direct_vulkan_download ||
         g_mgpu.frame[transport_slot].output_valid) return;
     const CrossPlane &p = g_mgpu.plane[SLOT_OUTPUT];
     const UINT bytes = DxgiBytesPerTexel(p.format);
-    VkImage src_image = converted ? g_bridge.tex[SLOT_OUTPUT].image : game_out.image;
+    VkImage src_image = converted ? g_bridge.viewports[vp].tex[SLOT_OUTPUT].image : game_out.image;
     VkImageAspectFlags aspect = converted ? VK_IMAGE_ASPECT_COLOR_BIT : game_out.aspect;
     uint32_t mip = converted ? 0 : game_out.mip;
     uint32_t layer = converted ? 0 : game_out.layer;
-    UINT width = converted ? umin(g_bridge.tex[SLOT_OUTPUT].w, p.width)
+    UINT width = converted ? umin(g_bridge.viewports[vp].tex[SLOT_OUTPUT].w, p.width)
                            : umin(game_out.w, p.width);
-    UINT height = converted ? umin(g_bridge.tex[SLOT_OUTPUT].h, p.height)
+    UINT height = converted ? umin(g_bridge.viewports[vp].tex[SLOT_OUTPUT].h, p.height)
                             : umin(game_out.h, p.height);
     VkImgBarrier(c, src_image, aspect, VK_IMAGE_LAYOUT_GENERAL,
                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -1440,10 +1473,11 @@ static void RecordBootstrapOutput(VkCommandBuffer c, const GameRes &game_out,
 }
 
 // Shared Output -> the game's Output, recorded inline before downstream work.
-static void RecordCopyOutBody(VkCommandBuffer c, VkImage game_out, VkFormat game_fmt,
+static void RecordCopyOutBodyVp(int vp, VkCommandBuffer c, VkImage game_out, VkFormat game_fmt,
                               UINT w, UINT h, int transport_slot)
 {
-    SharedTex &src = g_bridge.tex[SLOT_OUTPUT];
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
+    SharedTex &src = g_bridge.viewports[vp].tex[SLOT_OUTPUT];
     const UINT bytes_per_texel = DxgiBytesPerTexel(g_mgpu.plane[SLOT_OUTPUT].format);
     const bool host_result = g_mgpu.direct_vulkan_download && bytes_per_texel != 0;
     const bool direct = host_result && game_fmt == src.fmtvk;
@@ -1542,11 +1576,13 @@ static const char *BridgeRayReconstructionInput(const NVSDK_NGX_Parameter *p)
 // Called (from the NGX detour in the main .cpp) after the game's own evaluate
 // has been forwarded. Reads the contract, (re)builds if needed, records the
 // input copies into the game's command buffer and arms the pending handoff.
-static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *p,
-                                const FeatureCreateContract &contract,
-                                const GameRes &col, const GameRes &out,
-                                const GameRes &dep, const GameRes &mv);
+// Per-viewport: vp selects the split-screen history (0 for single-viewport).
 static void ArmFamilyProbe(VkCommandBuffer cmd);
+
+static void BridgeVkFrameLockedVp(int vp, VkCommandBuffer cmd, const NVSDK_NGX_Parameter *p,
+                                 const FeatureCreateContract &contract,
+                                 const GameRes &col, const GameRes &out,
+                                 const GameRes &dep, const GameRes &mv);
 
 static void BridgeVkFrame(VkCommandBuffer cmd, const NVSDK_NGX_Handle *feature,
                           const NVSDK_NGX_Parameter *p)
@@ -1576,6 +1612,17 @@ static void BridgeVkFrame(VkCommandBuffer cmd, const NVSDK_NGX_Handle *feature,
         return;
     }
 
+    const int vp = ResolveViewport(feature);
+    if (vp < 0)
+    {
+        static bool said = false;
+        if (!said)
+        { said = true;
+          Log("[bridge] %d viewport(s) already bridged; handle=%p forwarded untouched (raise capture.max_viewports)",
+              ActiveViewportCount(), (void *)feature); }
+        return;
+    }
+
     if (!g_bridge.session_ready)
     {
         if (!D3D12InitSession(g_bridge.game_luid, g_bridge.luid_valid)) return;   // disables on failure
@@ -1585,7 +1632,7 @@ static void BridgeVkFrame(VkCommandBuffer cmd, const NVSDK_NGX_Handle *feature,
     { BridgeDisable("the required in-frame handoff could not be set up"); return; }
 
     FrameLock();
-    BridgeVkFrameLocked(cmd, p, *contract, col, out, dep, mv);
+    BridgeVkFrameLockedVp(vp, cmd, p, *contract, col, out, dep, mv);
     FrameUnlock();
 }
 
@@ -1613,6 +1660,14 @@ static int BridgeSlotsBusy()
     return n;
 }
 
+static int BridgeViewportSlotsBusy(int vp)
+{
+    int n = 0;
+    for (int i = 0; i < ActiveFrameCount(); ++i)
+        if (g_bridge.vkframe[i].in_flight && g_bridge.vkframe[i].viewport == vp) ++n;
+    return n;
+}
+
 static bool AllTransportOutputsValid()
 {
     if (!g_mgpu.active) return true;
@@ -1624,19 +1679,24 @@ static bool AllTransportOutputsValid()
 // The worker's verdict on one frame, applied on the game's thread.
 static void BridgeJudge(Bridge::VkFrame &fr, int slot)
 {
+    const int vp = fr.viewport >= 0 && fr.viewport < MAX_VIEWPORTS ? fr.viewport : 0;
+    BridgeViewport &v = g_bridge.viewports[vp];
     switch (fr.result)
     {
     case 0:
-        g_bridge.consecutive_fails = 0;
+        v.consecutive_fails = 0;
         if (AllTransportOutputsValid() &&
-            InterlockedCompareExchange(&g_neural_only_latched, 1, 0) == 0)
-            Log("[policy] neural-only mode latched after every transport slot received a "
-                "completed private result; game-side DLSS is now suppressed for this process");
+            InterlockedCompareExchange(&v.neural_latched, 1, 0) == 0)
+        {
+            InterlockedExchange(&g_neural_only_latched, 1);
+            Log("[policy] vp%d neural-only mode latched after every transport slot received a "
+                "completed private result; game-side DLSS is now suppressed for this viewport", vp);
+        }
         break;
-    case 2:  Log("[bridge] disabling to protect the game");
+    case 2:  Log("[bridge] vp%d disabling to protect the game", vp);
              BridgeDisable("NGX raised an exception in the D3D12 evaluate"); return;
-    case 1:  BridgeFail("evaluate"); break;             // frame_ready drops; rebuilt next frame
-    case 4:  BridgeFail("d3d12 command list"); break;
+    case 1:  ViewportFail(vp, "evaluate"); break;             // frame_ready drops; rebuilt next frame
+    case 4:  ViewportFail(vp, "d3d12 command list"); break;
     case 32:
         // The transfer/evaluate is still retiring. In latched strict mode the
         // sandwich copies the last completed neural image; it never restores
@@ -1656,16 +1716,16 @@ static void BridgeJudge(Bridge::VkFrame &fr, int slot)
         {
             static int said = 0;
             if (said++ < 5)
-                Log("[bridge] slot %d: the GPU did not reach our copies in command buffer %p within %llu ms "
+                Log("[bridge] vp%d slot %d: the GPU did not reach our copies in command buffer %p within %llu ms "
                     "(%s; %lld unrelated submit(s) seen meanwhile). Its bridged output is dropped.",
-                    slot, (void *)fr.cmd, (unsigned long long)kInputsTimeoutMs,
+                    vp, slot, (void *)fr.cmd, (unsigned long long)kInputsTimeoutMs,
                     fr.submitted ? "its submit was seen" : "no submit carrying it was seen",
                     (long long)g_bridge.unmatched_submits);
-            BridgeFail("input handoff");
+            ViewportFail(vp, "input handoff");
         }
         break;
-    case 16: Log("[bridge] the D3D12 evaluate did not finish within 1 s");
-             BridgeFail("evaluate completion"); break;
+    case 16: Log("[bridge] vp%d the D3D12 evaluate did not finish within 1 s", vp);
+             ViewportFail(vp, "evaluate completion"); break;
     }
 }
 
@@ -1689,57 +1749,60 @@ static void BridgeCollectSlots()
 }
 
 static void RecountSlots();
-static void NoteFrameBridged(UINT64 v);
 
-static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *p,
+static void BridgeVkFrameLockedVp(int vp, VkCommandBuffer cmd, const NVSDK_NGX_Parameter *p,
                                 const FeatureCreateContract &contract,
                                 const GameRes &col, const GameRes &out,
                                 const GameRes &dep, const GameRes &mv)
 {
+    if (vp < 0 || vp >= MAX_VIEWPORTS) return;
+    BridgeViewport &v = g_bridge.viewports[vp];
     BridgeCollectSlots();
     if (g_bridge.disabled) return;
 
-    if (ContractChanged(col, out, dep, mv))
+    if (ViewportContractChanged(vp, col, out, dep, mv))
     {
         // Never release what a recorded sandwich still references: hold the
-        // rebuild (forwarding frames untouched) until every slot has retired.
-        const int busy = BridgeSlotsBusy();
+        // rebuild (forwarding frames untouched) until this viewport's slots
+        // have retired. Other viewports continue flowing.
+        const int busy = BridgeViewportSlotsBusy(vp);
         if (busy > 0)
         {
-            if (g_bridge.rebuild_busy++ == 0)
-                Log("[bridge] resources must be rebuilt but %d bridged frame(s) are still in flight; "
-                    "forwarding frames untouched until they retire", busy);
-            if (g_bridge.rebuild_busy > 600)
+            if (v.rebuild_busy++ == 0)
+                Log("[bridge] vp%d resources must be rebuilt but %d bridged frame(s) are still in flight; "
+                    "forwarding frames untouched until they retire", vp, busy);
+            if (v.rebuild_busy > 600)
                 BridgeDisable("bridged frames never retired (their command buffers were never seen to complete)");
             RecountSlots();
             return;
         }
-        g_bridge.rebuild_busy = 0;
-        if (!RebuildResources(contract, p, col, out, dep, mv)) { RecountSlots(); return; }
+        v.rebuild_busy = 0;
+        if (!RebuildViewportResources(vp, contract, p, col, out, dep, mv)) { RecountSlots(); return; }
     }
-    if (!g_bridge.frame_ready) { RecountSlots(); return; }
+    if (!v.frame_ready) { RecountSlots(); return; }
 
     // A free slot -- or strict mode repeats the last neural image. Never wait
     // here: the sandwich that still owns the slot may be parked on the GPU behind
     // work this very thread has not submitted yet.
     const int slot = g_bridge.vk_slot;
     Bridge::VkFrame &fr = g_bridge.vkframe[slot];
+    const bool vp_latched = g_bridge.viewports[vp].neural_latched != 0;
     if (fr.in_flight)
     {
         if (g_bridge.no_slot_skips++ == 0)
-            Log(g_neural_only_latched
-                ? "[bridge] no free frame slot (%d bridged frames in flight); repeating the last neural image. "
+            Log(vp_latched
+                ? "[bridge] vp%d no free frame slot (%d bridged frames in flight); repeating the last neural image. "
                   "Repeats silently while the GPU stays more than %d frames behind."
-                : "[bridge] no free frame slot (%d bridged frames in flight); forwarding this frame untouched. "
+                : "[bridge] vp%d no free frame slot (%d bridged frames in flight); forwarding this frame untouched. "
                   "Repeats silently while the GPU stays more than %d frames behind.",
-                ActiveFrameCount(), ActiveFrameCount());
-        if (g_neural_only_latched)
+                vp, ActiveFrameCount(), ActiveFrameCount());
+        if (vp_latched)
         {
             ProfileRepeat(g_bridge.timeline + 1, slot);
             // Queue order keeps the shared image stable: the preceding admitted
             // command waits for its D3D12 writer, while a following admitted
             // command cannot release its input event until after this copy.
-            RecordCopyOutBody(cmd, out.image, out.fmt, out.w, out.h, slot);
+            RecordCopyOutBodyVp(vp, cmd, out.image, out.fmt, out.w, out.h, slot);
         }
         RecountSlots();
         return;
@@ -1759,8 +1822,8 @@ static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *
     // sandwich, blit included, before the family was known -- that blit on
     // idTech's compute queue is what froze the game (issue #3).
     VkFormat cvk; DXGI_FORMAT cdx; bool cblit; MapColor(col.fmt, &cvk, &cdx, &cblit);
-    const bool mvblit     = mv.fmt  != g_bridge.tex[SLOT_MV].fmtvk;
-    const bool outblit    = out.fmt != g_bridge.tex[SLOT_OUTPUT].fmtvk;
+    const bool mvblit     = mv.fmt  != g_bridge.viewports[vp].tex[SLOT_MV].fmtvk;
+    const bool outblit    = out.fmt != g_bridge.viewports[vp].tex[SLOT_OUTPUT].fmtvk;
     const bool needs_blit = cblit || mvblit || outblit;
     if (needs_blit && g_bridge.vk_queue_flags == 0)
     {
@@ -1787,7 +1850,7 @@ static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *
     {
         depth_view    = GetSampleableDepthView(fr, dep);
         depth_compute = depth_view != VK_NULL_HANDLE &&
-                        EnsureDepthPipeline() && g_depth_store_view != VK_NULL_HANDLE;
+                        EnsureDepthPipeline() && g_depth_store_view[vp] != VK_NULL_HANDLE;
         static bool said = false;
         if (!said) { said = true;
             if (depth_compute)
@@ -1800,21 +1863,21 @@ static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *
     }
 
     FrameScalars scalars;
-    CaptureFrameScalars(p, &scalars);
+    CaptureFrameScalarsVp(vp, p, &scalars);
 
     // Compatible inputs go directly to this frame's cross-adapter allocation.
     // Shared textures are populated only for the same-adapter D3D12 route or
     // where Vulkan must convert the game's format first.
     if (!g_mgpu.direct_vulkan_upload || cblit)
-        CopyColorLike(cmd, col, SLOT_COLOR, cblit);
+        CopyColorLikeVp(vp, cmd, col, SLOT_COLOR, cblit);
     if (!g_mgpu.direct_vulkan_upload || mvblit)
-        CopyColorLike(cmd, mv, SLOT_MV, mvblit);
+        CopyColorLikeVp(vp, cmd, mv, SLOT_MV, mvblit);
     if (float_depth)
     {
-        if (!g_mgpu.direct_vulkan_upload) CopyDepth(cmd, dep, slot);
+        if (!g_mgpu.direct_vulkan_upload) CopyDepthVp(vp, cmd, dep, slot);
     }
     else if (depth_compute)
-        DispatchDepthConvert(cmd, depth_view, dep.w, dep.h, slot);
+        DispatchDepthConvertVp(vp, cmd, depth_view, dep.w, dep.h, slot);
     else
     {
         // Supplying stale or zero depth is never a valid neural evaluation.
@@ -1822,22 +1885,23 @@ static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *
         RecountSlots();
         return;
     }
-    RecordDirectInputCopies(cmd, slot, col, dep, mv, cblit, !float_depth, mvblit, scalars);
+    RecordDirectInputCopiesVp(vp, cmd, slot, col, dep, mv, cblit, !float_depth, mvblit, scalars);
 
     // During discovery/bootstrap the game output seeds the shared target. Once
     // strict neural-only mode latches, preserve the last completed neural image
     // instead. A missed result then repeats neural output rather than silently
     // displaying the game's original upscaler.
-    if (!g_neural_only_latched)
+    if (g_bridge.viewports[vp].neural_latched == 0)
     {
-        CopyColorLike(cmd, out, SLOT_OUTPUT, outblit);
+        CopyColorLikeVp(vp, cmd, out, SLOT_OUTPUT, outblit);
         // Every direct-download slot starts with a valid game image. Before
         // strict mode latches, a missed first neural result can therefore use
         // this seed; after latching, all slots contain completed neural output.
-        RecordBootstrapOutput(cmd, out, outblit, slot);
+        RecordBootstrapOutputVp(vp, cmd, out, outblit, slot);
     }
 
     fr.transport_slot = slot;
+    fr.viewport = vp;
     fr.cmd       = cmd;
     fr.primary   = VK_NULL_HANDLE;
     fr.submit_queue = VK_NULL_HANDLE;
@@ -1854,7 +1918,7 @@ static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *
     g_disp->CmdWaitEvents(cmd, 1, &fr.ev_output, VK_PIPELINE_STAGE_HOST_BIT,
                           VK_PIPELINE_STAGE_TRANSFER_BIT, 1, &mb,
                           0, nullptr, 0, nullptr);
-    RecordCopyOutBody(cmd, out.image, out.fmt, out.w, out.h, slot);
+    RecordCopyOutBodyVp(vp, cmd, out.image, out.fmt, out.w, out.h, slot);
     g_disp->CmdSetEvent(cmd, fr.ev_done, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
     fr.value     = ++g_bridge.timeline;
@@ -1867,7 +1931,7 @@ static void BridgeVkFrameLocked(VkCommandBuffer cmd, const NVSDK_NGX_Parameter *
     g_bridge.vk_slot = (slot + 1) % ActiveFrameCount();
     RecountSlots();
     WorkQueuePush(slot);
-    NoteFrameBridged(fr.value);
+    NoteFrameBridgedVp(vp, fr.value);
 }
 
 // ---- the queue-submit handoff ---------------------------------------------
@@ -1893,16 +1957,17 @@ static void RecountSlots()
 }
 static bool BridgeWantsSubmitMatch() { return g_match_wanted != 0; }
 
-static void NoteFrameBridged(UINT64 v)
+static void NoteFrameBridgedVp(int vp, UINT64 v)
 {
-    const UINT64 n = ++g_bridge.frames_done;
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
+    const UINT64 n = ++g_bridge.viewports[vp].frames_done;
     // Liveness in the default log; per-frame detail only when configured.
     if (n == 1)
-        Log("[bridge] first frame bridged: in-frame handoff armed (copies -> D3D12 evaluate -> in-place copy-back)");
+        Log("[bridge] vp%d first frame bridged: in-frame handoff armed (copies -> D3D12 evaluate -> in-place copy-back)", vp);
     if (n == 100 || n % 1000 == 0 || (g_cfg.verbose && (n <= 10 || n % 60 == 0)))
-        Log("[bridge] %llu frames bridged (timeline %llu; %llu forwarded untouched for lack of a free "
+        Log("[bridge] vp%d %llu frames bridged (timeline %llu; %llu forwarded untouched for lack of a free "
             "slot; %lld unrelated submits passed while a match was awaited)",
-            (unsigned long long)n, (unsigned long long)v,
+            vp, (unsigned long long)n, (unsigned long long)v,
             (unsigned long long)g_bridge.no_slot_skips, (long long)g_bridge.unmatched_submits);
     if (n == 100 || n % 1000 == 0)
         D3D12ProbeEvalDetour("at heartbeat");
@@ -1910,9 +1975,11 @@ static void NoteFrameBridged(UINT64 v)
 
 // Once neural-only operation latches, determine whether this frame can safely
 // suppress the game-side evaluate and record the private output instead.
-static bool BridgeSkipGameEvaluate(const NVSDK_NGX_Parameter *p)
+// Per-viewport: each split-screen history latches independently.
+static bool BridgeSkipGameEvaluateVp(int vp, const NVSDK_NGX_Parameter *p)
 {
-    const bool strict_latched = g_neural_only_latched != 0;
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
+    const bool strict_latched = g_bridge.viewports[vp].neural_latched != 0;
     if (!g_handoff_ready) return false;
     if (!strict_latched) return false;
     GameRes col, out, dep, mv;
@@ -1920,7 +1987,7 @@ static bool BridgeSkipGameEvaluate(const NVSDK_NGX_Parameter *p)
         !ReadGameRes(p, "Depth", &dep) || !ReadGameRes(p, "MotionVectors", &mv))
         return false;
     FrameLock();
-    const bool contract_ok = g_bridge.rebuild_busy == 0 && !ContractChanged(col, out, dep, mv);
+    const bool contract_ok = g_bridge.viewports[vp].rebuild_busy == 0 && !ViewportContractChanged(vp, col, out, dep, mv);
     const bool ok = contract_ok && (strict_latched ||
                     !g_bridge.vkframe[g_bridge.vk_slot].in_flight);
     FrameUnlock();
@@ -2232,20 +2299,26 @@ static void BridgeOnExecuteCommands(VkCommandBuffer primary, uint32_t count, con
 }
 
 // ---- teardown --------------------------------------------------------------
-static void VkReleaseSharedTex(int slot)
+static void VkReleaseSharedTexVp(int vp, int slot)
 {
-    SharedTex &t = g_bridge.tex[slot];
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
+    SharedTex &t = g_bridge.viewports[vp].tex[slot];
     VkDevice dev = g_bridge.device;
     if (dev && g_disp)
     {
-        if (slot == SLOT_DEPTH && g_depth_store_view && g_disp->DestroyImageView)
-        { g_disp->DestroyImageView(dev, g_depth_store_view, nullptr); g_depth_store_view = VK_NULL_HANDLE; }
+        if (slot == SLOT_DEPTH && g_depth_store_view[vp] && g_disp->DestroyImageView)
+        { g_disp->DestroyImageView(dev, g_depth_store_view[vp], nullptr); g_depth_store_view[vp] = VK_NULL_HANDLE; }
         if (t.image)  g_disp->DestroyImage(dev, t.image, nullptr);
         if (t.memory) g_disp->FreeMemory(dev, t.memory, nullptr);
     }
     t.image = VK_NULL_HANDLE; t.memory = VK_NULL_HANDLE; t.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (t.nt_handle) { CloseHandle(t.nt_handle); t.nt_handle = nullptr; }
     if (t.tex12) { t.tex12->Release(); t.tex12 = nullptr; }
+}
+
+static void VkReleaseSharedTex(int slot)
+{
+    VkReleaseSharedTexVp(0, slot);
 }
 
 // Full teardown. Forward-declared in d3d12_session.inc and reached from
@@ -2309,10 +2382,27 @@ static void D3D12ReleaseResources()
     D3D12DrainGpu();
     VkDevice dev = g_bridge.device;
 
-    if (g_bridge.feature && g_bridge.release_feature)
-    { g_bridge.release_feature(g_bridge.feature); g_bridge.feature = nullptr; }
-
-    for (int i = 0; i < SLOT_COUNT; ++i) VkReleaseSharedTex(i);
+    for (int vp = 0; vp < MAX_VIEWPORTS; ++vp)
+    {
+        BridgeViewport &v = g_bridge.viewports[vp];
+        if (v.feature && g_bridge.release_feature)
+        { g_bridge.release_feature(v.feature); v.feature = nullptr; }
+        if (v.params)
+        {
+            auto destroy = reinterpret_cast<void (*)(NVSDK_NGX_Parameter *)>(
+                GetProcAddress(g_ngx12_module, "NVSDK_NGX_D3D12_DestroyParameters"));
+            if (destroy) { __try { destroy(v.params); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+            v.params = nullptr;
+        }
+        for (int i = 0; i < SLOT_COUNT; ++i) VkReleaseSharedTexVp(vp, i);
+        v.game_handle = nullptr;
+        v.frame_ready = false;
+        v.rebuild_busy = 0;
+        v.frames_done = 0;
+        v.consecutive_fails = 0;
+        InterlockedExchange(&v.neural_latched, 0);
+    }
+    InterlockedExchange(&g_neural_only_latched, 0);
 
     if (dev && g_disp)
     {
@@ -2379,9 +2469,12 @@ static void D3D12ReleaseResources()
     g_mgpu_pending_game = 0; g_mgpu_game_repeats = 0; g_mgpu_output_timeout = false;
 
     g_bridge.session_ready = false;
-    g_bridge.frame_ready   = false;
-    g_bridge.rebuild_busy  = 0;
     g_bridge.probe_cmd = VK_NULL_HANDLE; g_bridge.probe_primary = VK_NULL_HANDLE; g_bridge.probe_matching = false;
+    g_bridge.d3d11_device = nullptr;
+    g_bridge.d3d11_ctx = nullptr;
+    g_bridge.d3d11_slot = 0;
+    for (int i = 0; i < Bridge::kMaxFrames; ++i)
+        g_bridge.d3d11frame[i] = {};
     RecountSlots();
 }
 

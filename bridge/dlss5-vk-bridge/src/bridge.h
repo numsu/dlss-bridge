@@ -1,16 +1,17 @@
-// Vulkan -> D3D12 NGX bridge state.
+// Vulkan/D3D11 -> D3D12 NGX bridge state.
 //
-// The game drives DLSS through NVSDK_NGX_VULKAN_EvaluateFeature. That call is
-// intercepted and forwarded untouched, then this bridge reproduces the same
-// DLSS contract on a second NGX session running on its own D3D12 device -- the
-// call a DLSS 5 Neural Rendering add-on detours and inserts its pass into.
+// The game drives DLSS through NVSDK_NGX_VULKAN_EvaluateFeature (or the D3D11
+// equivalent). That call is intercepted and forwarded untouched, then this
+// bridge reproduces the same DLSS contract on a second NGX session running on
+// its own D3D12 device -- the call a DLSS 5 Neural Rendering add-on detours
+// and inserts its pass into.
 //
-// Per frame the pixels have to cross from the game's Vulkan device to the
-// bridge's D3D12 device and back. That crossing is the whole reason this is
-// harder than the D3D11 original: D3D11 has an implicit immediate-context queue
-// so the copy / signal / evaluate / copy-back run inline; Vulkan can only
-// signal a semaphore at submit granularity, so the handoff is split across the
-// evaluate hook and the following vkQueueSubmit. See vk_interop.inc.
+// Per frame the pixels have to cross from the game's device to the bridge's
+// D3D12 device and back. The Vulkan crossing is the hard one: D3D11 has an
+// implicit immediate-context queue so the copy / signal / evaluate / copy-back
+// run inline; Vulkan can only signal a semaphore at submit granularity, so the
+// handoff is split across the evaluate hook and the following vkQueueSubmit.
+// See vk_interop.inc (Vulkan) and d3d11_interop.inc (D3D11).
 //
 //   evaluate hook  : forward the game's evaluate during bootstrap, then stand
 //                    in for it), then record INTO the game's own command buffer
@@ -27,13 +28,22 @@
 // ALLOW_SIMULTANEOUS_ACCESS) and imported into Vulkan as VkImages backed by
 // imported VkDeviceMemory (VK_KHR_external_memory_win32). Two shared D3D12
 // fences, imported into Vulkan as timeline semaphores (VK_KHR_external_semaphore
-// _win32, D3D12_FENCE handle type), order the two queues.
+// _win32, D3D12_FENCE handle type), order the two queues. The D3D11 path
+// shares the same D3D12 session via NT handles without Vulkan imports.
+//
+// Split-screen: up to MAX_VIEWPORTS concurrent Super Resolution histories are
+// bridged, each keyed by its game NGX handle identity. Every viewport owns its
+// private D3D12 feature, parameter block, shared textures, geometry contract,
+// latch, and telemetry; the D3D12 device, queues, fences, and worker threads
+// stay shared. Temporal order is preserved within a viewport while viewports
+// interleave freely.
 
 #pragma once
 
 enum { SLOT_COLOR = 0, SLOT_OUTPUT, SLOT_DEPTH, SLOT_MV, SLOT_COUNT };
 enum { CROSS_UPLOAD = 0, CROSS_DOWNLOAD, CROSS_COUNT };
 enum { MAX_FRAME_SLOTS = 8 };
+enum { MAX_VIEWPORTS = 4 };
 
 static const char *kSlotKey[SLOT_COUNT]  = { "Color", "Output", "Depth", "MotionVectors" };
 static const char *kSlotName[SLOT_COUNT] = { "Color", "Output", "Depth", "MV" };
@@ -134,7 +144,7 @@ struct MultiGpuState
     ID3D12GraphicsCommandList *neural_download_list[MAX_FRAME_SLOTS];
     ID3D12GraphicsCommandList *pipeline_list[MAX_FRAME_SLOTS];
 
-    ID3D12Resource *neural_tex[SLOT_COUNT];
+    ID3D12Resource *neural_tex[MAX_VIEWPORTS][SLOT_COUNT];
     SIZE_T host_bytes;
     CrossPlane plane[SLOT_COUNT];
     CrossFrameTransport frame[MAX_FRAME_SLOTS];
@@ -148,12 +158,40 @@ struct MultiGpuState
     bool direct_vulkan_download;
 };
 
+// Per-viewport (split-screen) Super Resolution history. One instance exists
+// per concurrent game NGX handle, up to MAX_VIEWPORTS. The D3D12 device,
+// queues, fences, and workers in Bridge/MultiGpuState stay shared.
+struct BridgeViewport
+{
+    const NVSDK_NGX_Handle *game_handle; // game NGX handle identity, null = free
+    NVSDK_NGX_Parameter *params;         // private D3D12 parameter block
+    NVSDK_NGX_Handle    *feature;        // private D3D12 SuperSampling feature
+    SharedTex tex[SLOT_COUNT];           // per-viewport shared textures
+
+    // The contract read from the game's own parameter block.
+    UINT        width, height;          // Color texture size
+    UINT        out_width, out_height;  // Output texture size
+    UINT        render_w, render_h;     // rendered area (smaller when upscaling)
+    UINT        ngx_out_w, ngx_out_h;
+    UINT        feature_flags;
+    UINT        slot_w[SLOT_COUNT];
+    UINT        slot_h[SLOT_COUNT];
+    VkFormat    game_fmt[SLOT_COUNT];   // the game's own source image formats
+    DXGI_FORMAT game_dxgi[SLOT_COUNT];  // the game's own D3D11 formats (d3d11 path)
+
+    bool   frame_ready;       // shared textures and NGX feature match the game
+    bool   need_reset;
+    UINT64 frames_done;
+    int    consecutive_fails;
+    int    rebuild_busy;      // evaluates a rebuild has waited on
+    volatile LONG neural_latched; // per-viewport neural-only latch
+};
+
 struct Bridge
 {
     bool disabled;          // set after a hard failure; never retried
     bool session_ready;     // D3D12 device, queue, fences, NGX session
-    bool frame_ready;       // shared textures and NGX feature match the game
-    int  consecutive_fails;
+    int  consecutive_fails; // shared bring-up failures (device/session level)
 
     // ---- D3D12 side (mirrors the D3D11 original's private session) --------
     ID3D12Device              *dev12;
@@ -162,17 +200,19 @@ struct Bridge
     ID3D12GraphicsCommandList *list;
 
     static const int           kMaxFrames = MAX_FRAME_SLOTS;
+    static const int           kMaxViewports = MAX_VIEWPORTS;
     ID3D12CommandAllocator    *alloc[kMaxFrames];
     UINT64                     alloc_fence[kMaxFrames];
     int                        frame_slot;
 
     HANDLE                     fence_event;
 
-    // fence_in : signalled by the Vulkan queue once the input copies are done,
+    // fence_in : signalled by the game queue once the input copies are done,
     //            waited on by the D3D12 queue before the evaluate.
     // fence_out: signalled by the D3D12 queue after the evaluate, waited on by
-    //            the Vulkan queue before the copy-back.
-    // Both are D3D12 fences (SHARED) aliased into Vulkan as timeline semaphores.
+    //            the game queue before the copy-back.
+    // Both are D3D12 fences (SHARED) aliased into Vulkan as timeline semaphores
+    // on the Vulkan path; the D3D11 path waits them on the host.
     ID3D12Fence               *fence_in;
     ID3D12Fence               *fence_out;
     ID3D12Fence               *fence_gpu;    // D3D12-internal retire fence
@@ -191,23 +231,7 @@ struct Bridge
     PFN_D3D12ReleaseFeature  release_feature;
     PFN_AllocateParameters   alloc_params;
 
-    NVSDK_NGX_Parameter *params;
-    NVSDK_NGX_Handle    *feature;
-
-    SharedTex tex[SLOT_COUNT];
-
-    // The contract read from the game's own parameter block.
-    UINT        width, height;          // Color texture size
-    UINT        out_width, out_height;  // Output texture size
-    UINT        render_w, render_h;     // rendered area (smaller when upscaling)
-    UINT        ngx_out_w, ngx_out_h;
-    UINT        feature_flags;
-    UINT        slot_w[SLOT_COUNT];
-    UINT        slot_h[SLOT_COUNT];
-    VkFormat    game_fmt[SLOT_COUNT];   // the game's own Vulkan image formats
-
-    bool   need_reset;
-    UINT64 frames_done;
+    BridgeViewport viewports[MAX_VIEWPORTS];
 
     // ---- Vulkan side ------------------------------------------------------
     // The game's device LUID, matched against DXGI adapters so the D3D12 device
@@ -254,11 +278,32 @@ struct Bridge
         LONG            result;             // the worker's verdict (see WorkerRunSlot)
         FrameScalars    scalars;
         int             transport_slot;     // immutable cross-adapter allocation
+        int             viewport;           // owning split-screen viewport (0..MAX_VIEWPORTS-1)
         VkImageView     game_depth_view;    // bridge-made DEPTH-only view of the
         VkImage         game_depth_image;   //   game's depth image (see interop)
         uint32_t        game_depth_mip, game_depth_layer;
     } vkframe[kMaxFrames];
     int vk_slot;
+
+    // ---- D3D11 side -------------------------------------------------------
+    // Captured from the first bridged D3D11 evaluate: the game's immediate
+    // context drives inline copy / evaluate / copy-back, so no Vulkan-style
+    // submit-split handoff is needed. Per-frame D3D11 work is synchronous on
+    // the game thread; the shared D3D12 evaluate still runs on the worker.
+    struct ID3D11Device        *d3d11_device;
+    struct ID3D11DeviceContext *d3d11_ctx;
+    struct D3d11Frame
+    {
+        bool            in_flight;
+        int             viewport;
+        UINT64          value;
+        FrameScalars    scalars;
+        int             transport_slot;
+        LONG            result;
+        volatile LONG   worker_done;
+        bool            judged;
+    } d3d11frame[kMaxFrames];
+    int d3d11_slot;
 
     // Which queue family runs the DLSS pass is learned from the submit that
     // carries a command buffer the evaluate hook has seen -- before anything
@@ -272,8 +317,6 @@ struct Bridge
                                             //   pass is submitted on (0 = not known)
     volatile LONG64 unmatched_submits;      // submits seen while bridged work still
                                             //   awaited its own
-    int             rebuild_busy;           // evaluates a rebuild has waited on
-                                            //   in-flight work
     UINT64          no_slot_skips;          // frames forwarded untouched for lack of
                                             //   a free slot
 
