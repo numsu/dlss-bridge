@@ -27,6 +27,16 @@ VARIANTS = {
         0x1E8C63: (bytes.fromhex("3b010000"), bytes.fromhex("b1110000")),
         0x1E8C6D: (bytes.fromhex("3a010000"), bytes.fromhex("b0110000")),
         0x1E8C76: (bytes.fromhex("3c010000"), bytes.fromhex("b2110000")),
+        # The exported D3D12 path has no DXGI frame counter when it is driven
+        # from a Vulkan host.  v0.8.3 consequently records both the creation
+        # and every later evaluation at epoch zero, leaving the model in its
+        # one-submission creation guard forever.  Creation already returns
+        # before this block; once a feature exists, the next bridge call is a
+        # separately submitted command list and is safe to evaluate.
+        0x29C84D: (
+            bytes.fromhex("498b4648483985a00000000f95c0"),
+            bytes.fromhex("b001909090909090909090909090"),
+        ),
     },
 }
 

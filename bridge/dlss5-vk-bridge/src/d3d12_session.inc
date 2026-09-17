@@ -223,7 +223,8 @@ static void BridgeFail(const char *what)
 // device, or the shared NT handles cannot be opened across the two APIs. The
 // game's device LUID comes from VkPhysicalDeviceIDProperties (captured in
 // vk_interop.inc); here it picks the DXGI adapter that matches.
-static IDXGIAdapter1 *PickAdapterByLuid(const uint8_t luid[VK_LUID_SIZE], bool luid_valid)
+static IDXGIAdapter1 *PickAdapterByLuid(const uint8_t luid[VK_LUID_SIZE], bool luid_valid,
+                                       UINT *found_index)
 {
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
     auto create = dxgi ? reinterpret_cast<HRESULT (WINAPI *)(REFIID, void **)>(
@@ -240,16 +241,22 @@ static IDXGIAdapter1 *PickAdapterByLuid(const uint8_t luid[VK_LUID_SIZE], bool l
     {
         DXGI_ADAPTER_DESC1 d = {};
         ad->GetDesc1(&d);
+        Log("[adapter] DXGI adapter %u: %ls vendor=%04X device=%04X LUID=%08X:%08X flags=0x%X",
+            i, d.Description, d.VendorId, d.DeviceId,
+            (unsigned)d.AdapterLuid.HighPart, (unsigned)d.AdapterLuid.LowPart,
+            (unsigned)d.Flags);
         if (luid_valid && memcmp(&d.AdapterLuid, luid, sizeof(LUID)) == 0)
         {
             chosen = ad;   // exact GPU the game's Vulkan device is on
-            Log("[bridge] D3D12 adapter matched by LUID: %ls", d.Description);
+            if (found_index) *found_index = i;
+            Log("[bridge] D3D12 adapter %u matched by LUID: %ls", i, d.Description);
             break;
         }
         if (!luid_valid && chosen == nullptr && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
         {
             chosen = ad;   // no stable identity was available during bootstrap
             chosen->AddRef();
+            if (found_index) *found_index = i;
         }
         ad->Release();
     }
@@ -312,7 +319,7 @@ static IDXGIAdapter1 *PickAdapterByExactLuid(uint32_t high, uint32_t low, UINT *
     return nullptr;
 }
 
-static IDXGIAdapter1 *PickFirstOtherAdapter(const LUID &game_luid, UINT *found_index)
+static IDXGIAdapter1 *PickFirstOtherAdapter(UINT game_index, UINT *found_index)
 {
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
     auto create = dxgi ? reinterpret_cast<HRESULT (WINAPI *)(REFIID, void **)>(
@@ -326,9 +333,14 @@ static IDXGIAdapter1 *PickFirstOtherAdapter(const LUID &game_luid, UINT *found_i
     {
         DXGI_ADAPTER_DESC1 d = {};
         found->GetDesc1(&d);
-        if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-            d.VendorId == 0x10DE &&
-            memcmp(&d.AdapterLuid, &game_luid, sizeof(LUID)) != 0)
+        Log("[adapter] secondary candidate %u: %ls vendor=%04X device=%04X "
+            "LUID=%08X:%08X flags=0x%X%s",
+            i, d.Description, d.VendorId, d.DeviceId,
+            (unsigned)d.AdapterLuid.HighPart, (unsigned)d.AdapterLuid.LowPart,
+            (unsigned)d.Flags, i == game_index ? " (game adapter)" : "");
+        if (i != game_index &&
+            !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            d.VendorId == 0x10DE)
         {
             if (found_index) *found_index = i;
             Log("[adapter] auto-selected secondary DXGI adapter %u: %ls LUID=%08X:%08X", i,
@@ -1428,7 +1440,8 @@ static bool D3D12InitSession(const uint8_t luid[VK_LUID_SIZE], bool luid_valid)
     Log("");
     Log("################ bridge: opening D3D12 session ################");
 
-    IDXGIAdapter1 *game_adapter = PickAdapterByLuid(luid, luid_valid);
+    UINT game_index = UINT_MAX;
+    IDXGIAdapter1 *game_adapter = PickAdapterByLuid(luid, luid_valid, &game_index);
     IDXGIAdapter1 *adapter = game_adapter;
     IDXGIAdapter1 *selected = nullptr;
     DXGI_ADAPTER_DESC1 gd = {};
@@ -1456,21 +1469,29 @@ static bool D3D12InitSession(const uint8_t luid[VK_LUID_SIZE], bool luid_valid)
     {
         // Auto prefers a usable non-game adapter and naturally remains on the
         // game adapter when the host has only one GPU.
-        selected = PickFirstOtherAdapter(gd.AdapterLuid, &selected_index);
+        selected = PickFirstOtherAdapter(game_index, &selected_index);
     }
 
     if (selected)
     {
         DXGI_ADAPTER_DESC1 nd = {};
         selected->GetDesc1(&nd);
-        if (memcmp(&gd.AdapterLuid, &nd.AdapterLuid, sizeof(LUID)) != 0)
+        // NVIDIA's Linux Vulkan stack may expose the same DXGI LUID for two
+        // identical physical GPUs.  DXGI enumeration position is therefore
+        // part of adapter identity here; LUID equality alone cannot prove
+        // that the selected adapter is the game adapter.
+        if (selected_index != game_index)
         {
             adapter = selected;
             g_mgpu.active = true;
             g_mgpu.neural_index = selected_index;
-            Log("[mgpu] enabled: game LUID=%08X:%08X, neural LUID=%08X:%08X",
+            Log("[mgpu] enabled: game adapter=%u LUID=%08X:%08X, neural adapter=%u LUID=%08X:%08X%s",
+                game_index,
                 (unsigned)gd.AdapterLuid.HighPart, (unsigned)gd.AdapterLuid.LowPart,
-                (unsigned)nd.AdapterLuid.HighPart, (unsigned)nd.AdapterLuid.LowPart);
+                selected_index,
+                (unsigned)nd.AdapterLuid.HighPart, (unsigned)nd.AdapterLuid.LowPart,
+                memcmp(&gd.AdapterLuid, &nd.AdapterLuid, sizeof(LUID)) == 0
+                    ? " (duplicate LUIDs)" : "");
         }
         else
         {

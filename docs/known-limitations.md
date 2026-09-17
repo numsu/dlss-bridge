@@ -53,10 +53,12 @@ paths.
   the neural pass.
 - The packaged OptiScaler DLL is pinned and hash-checked. Packaging disables
   its native Vulkan neural pass and redirects the visual-toggle handler to
-  `DlssNrApplyModel`; the private D3D12 model stays active. A new release needs
-  an explicit code review and patch update. Version 0.8.3 changed the D3D12
-  neural path substantially; its CPU-side frame pacing in games that stream
-  assets during movement remains unverified.
+  `DlssNrApplyModel`; the private D3D12 model stays active. It also advances
+  the model past OptiScaler 0.8.3's creation guard when a Vulkan host drives
+  the exported D3D12 path without a DXGI frame counter. A new release needs an
+  explicit code review and patch update. Version 0.8.3 changed the D3D12 neural
+  path substantially; its CPU-side frame pacing in games that stream assets
+  during movement remains unverified.
 - The application/project identity and SDK version come from the game's
   successful Vulkan NGX initialization. These are vendor interfaces without a
   stable public cross-API bridge contract.
