@@ -67,6 +67,27 @@ for invalid_scale in (float("nan"), float("inf")):
     else:
         raise AssertionError(f"controller accepted invalid scale {invalid_scale}")
 
+# Child-process follow must name a bare target exe, and only then.
+followed = module.resolved_runtime(module.merge(
+    cfg, {"launch": {"follow_children": True, "target_executable": "Game.exe"}}))
+assert followed["follow_children"] == 1
+assert followed["target_executable"] == "Game.exe"
+# An unset follow target must be omitted, not emitted as "target_executable=":
+# the DLL's policy parser rejects a line with an empty value and would then
+# terminate the game (its LoadConfig fails on the malformed line).
+assert module.resolved_runtime(cfg)["follow_children"] == 0
+assert "target_executable" not in module.resolved_runtime(cfg)
+for bad_launch in ({"follow_children": True},
+                   {"follow_children": True, "target_executable": ""},
+                   {"follow_children": True, "target_executable": "dir/Game.exe"},
+                   {"follow_children": True, "target_executable": "Game.bin"}):
+    try:
+        module.resolved_runtime(module.merge(cfg, {"launch": bad_launch}))
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError(f"controller accepted invalid launch section {bad_launch}")
+
 with tempfile.TemporaryDirectory() as temporary:
     template = "[DlssNr]\nRunBeforeSR=true\nDeferredDLSS=false\nWorkingScale=1\nPasses=1\nToggleKey=auto\n"
     expected = {
@@ -88,6 +109,47 @@ with tempfile.TemporaryDirectory() as temporary:
         assert "WorkingScale=0.75" in configured
         assert "Passes=2" in configured
         assert "ToggleKey=0x87" in configured
+
+# Bundled GPU-policy profiles resolve, and per-game tuning is unnecessary:
+# defaults already cover every API (auto-detected at runtime) and the full
+# viewport capacity, so only GPU placement is selectable by name.
+assert module.resolved_runtime(cfg)["max_viewports"] == 4
+for bundled in ("same-gpu.toml", "secondary-gpu.toml"):
+    item = module.load_toml(root / "profiles" / bundled)
+    module.validate_profile(item, str(bundled))
+    module.resolved_runtime(module.merge(cfg, item))
+
+# The --follow-children CLI override flows into the runtime policy exactly
+# like a [launch] profile section, so launcher-spawned games need no files.
+follow_args = type("Args", (), {
+    "config": str(root / "profiles" / "default.toml"),
+    "profile": [],
+    "command": ["launcher.exe"],
+    "follow_children": "Game.exe",
+})()
+followed_cli = module.resolve_from_args(follow_args)
+assert followed_cli["follow_children"] == 1
+assert followed_cli["target_executable"] == "Game.exe"
+plain_args = type("Args", (), {
+    "config": str(root / "profiles" / "default.toml"),
+    "profile": [],
+    "command": ["game.exe"],
+    "follow_children": None,
+})()
+assert module.resolve_from_args(plain_args)["follow_children"] == 0
+try:
+    bad_args = type("Args", (), {
+        "config": str(root / "profiles" / "default.toml"),
+        "profile": [],
+        "command": ["game.exe"],
+        "follow_children": "Game.bin",
+    })()
+    module.resolve_from_args(bad_args)
+except SystemExit:
+    pass
+else:
+    raise AssertionError("controller accepted a non-exe --follow-children target")
+
 
 # Runtime acquisition is concise for people and structured only on request.
 original_acquire_model = module.acquire_model
@@ -127,7 +189,9 @@ finally:
 
 components = module.component_inventory()
 assert any(c["id"] == "ngx-vulkan" and c["state"] == "integrated" for c in components)
-assert any(c["id"] == "ngx-d3d12" and c["state"] == "planned" for c in components)
+assert any(c["id"] == "ngx-d3d12" and c["state"] == "integrated" for c in components)
+assert any(c["id"] == "d3d11" and c["state"] == "integrated" for c in components)
+assert any(c["id"] == "injected-d3d12" and c["state"] == "integrated" for c in components)
 for component in (c for c in components if c["state"] == "integrated" and c["kind"] != "platform"):
     assert component["linkage"] == "static"
     assert component["abi"] == 1

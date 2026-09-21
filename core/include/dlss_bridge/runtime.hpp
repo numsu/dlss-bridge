@@ -29,6 +29,8 @@ struct RuntimeConfig {
     int latency_budget_ms;
     int gpu_timestamps;
     int max_viewports;
+    int follow_children;
+    char target_executable[64];
     ExecutionMode execution_mode;
     OutputTransport output_transport;
     NeuralQueueMode neural_queue_mode;

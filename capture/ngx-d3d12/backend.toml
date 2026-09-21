@@ -1,6 +1,13 @@
+# Integrated implementation, hardware validation pending: the D3D12 capture
+# path compiles and passes native checks but has no end-to-end game validation
+# yet. Synchronous same-adapter only; secondary-GPU + D3D12 capture stands
+# aside. See docs/known-limitations.md.
 schema = 1
 kind = "capture"
 id = "ngx-d3d12"
-state = "planned"
+state = "integrated"
 apis = ["d3d12"]
 features = ["super_resolution", "neural_rendering"]
+implementation = "bridge/dlss5-vk-bridge/src/d3d12_interop.inc"
+linkage = "static"
+abi = 1

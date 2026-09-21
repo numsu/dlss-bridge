@@ -18,12 +18,17 @@ NGX:
 - Same-GPU or secondary-GPU neural execution
 - RTX 3000, 4000, and 5000 series cards when runtime capability checks pass
 
-Direct3D 11 capture and multi-viewport split-screen (`capture.max_viewports`
-up to 4) are implemented but untested — see `docs/known-limitations.md`.
-`profiles/bg3-dx11.toml` is experimental; prefer `profiles/bg3.toml`.
+Direct3D 11 and Direct3D 12 capture, multi-viewport split-screen (up to 4,
+on demand, no per-game setup), Frame Generation coexistence, Ray
+Reconstruction on D3D12, and child-process follow (`--follow-children
+TARGET.exe`) for launcher-spawned games are implemented but untested — see
+`docs/known-limitations.md`. There are no per-game profiles: the API is
+auto-detected and only GPU placement is selectable
+(`--profile same-gpu` / `secondary-gpu`).
 
-Native Linux games and Direct3D 12-only capture are planned backends. Frame
-generation is not supported by the current in-frame execution contract.
+Native Linux games and final-frame processing are planned backends.
+Streamline-native titles are covered by the NGX-level hooks with no separate
+backend. Anti-cheat-protected processes are never injected.
 
 ## Install
 
@@ -58,6 +63,14 @@ dlss-bridge steam configure APPID --profile same-gpu
 
 Restore the previous setting with `dlss-bridge steam remove APPID`.
 
+Heroic configures the same way and additionally ensures Proton exposes the
+NVIDIA GPU (`PROTON_ENABLE_NVAPI=1`, `PROTON_HIDE_NVIDIA_GPU=0`) so DX11/DX12
+titles show their DLSS option:
+
+```bash
+dlss-bridge heroic configure GAME --profile same-gpu
+```
+
 Both installers download and checksum-verify the pinned NVIDIA neural runtime;
 installation fails if it is unavailable or invalid. The runtime is not bundled
 in this project’s release artifacts. Rerun the Linux installer or run a newer
@@ -88,9 +101,11 @@ dlss-bridge run --profile secondary-gpu -- %command%
 
 ## Runtime behavior
 
-The runtime intercepts the game's Vulkan NGX temporal-upscaling call, recreates
-its frame contract in a private D3D12/NGX session, executes neural rendering,
-and reinserts the result before downstream rendering.
+The runtime intercepts the game's NGX temporal-upscaling call (Vulkan, D3D11,
+or D3D12), recreates its frame contract in a private D3D12/NGX session,
+executes neural rendering, and reinserts the result before downstream
+rendering. Frame Generation features pass through natively; Ray
+Reconstruction inputs are transported on the D3D12 path.
 
 After the first private neural frame completes, neural-only operation is
 latched:
@@ -100,6 +115,11 @@ latched:
 - a frame that cannot enter the bridge reports NGX failure;
 - a permanent bridge failure remains visible instead of silently resuming the
   game's original DLSS path.
+
+If the game never enables DLSS, the bridge stays idle — there is no contract
+to mirror — and after ~512 presents (Vulkan) or submissions (D3D12) with no
+NGX feature created it logs one `DLSS appears disabled in-game` hint. The
+notice fires only once frames are actually flowing, never during startup.
 
 ## Configuration
 
@@ -136,10 +156,11 @@ creation, and transport probes determine whether a route is usable.
 
 The implementation provides:
 
-- Vulkan NGX capture through suspended-process injection, a Vulkan layer, or a ReShade add-on
+- Vulkan, D3D11, and D3D12 NGX capture through suspended-process injection, a Vulkan layer, or a ReShade add-on
+- Child-process follow for launcher-spawned games
 - Same-GPU D3D12 NGX execution
 - Secondary-GPU execution through directional host-memory staging
-- In-frame Vulkan reinsertion
+- In-frame reinsertion on all three capture APIs
 - A versioned C ABI for capture, executor, transport, and host backends
 - Shared configuration, scheduling, adapter identity, and telemetry policy
 - Linux/Proton and native Windows launch wrappers
@@ -171,6 +192,9 @@ Run the core checks:
 g++ -std=c++17 -Wall -Wextra -Werror -Icore/include \
   core/src/runtime.cpp core/src/components.cpp tests/unit/runtime_test.cpp -o /tmp/dlss-runtime-test
 /tmp/dlss-runtime-test
+g++ -std=c++17 -Wall -Wextra -Werror -Ibridge/dlss5-vk-bridge/src \
+  tests/unit/dlss_off_gate_test.cpp -o /tmp/dlss-off-gate-test
+/tmp/dlss-off-gate-test
 PYTHONDONTWRITEBYTECODE=1 python3 tests/unit/controller_test.py
 gcc -std=c11 -Wall -Wextra -Werror -Iinclude \
   tests/unit/abi_c_test.c -o /tmp/dlss-abi-test

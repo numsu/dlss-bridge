@@ -26,6 +26,8 @@ static void ApplyFrameScalarsVp(int vp, const FrameScalars *s);
 static void NoteFrameBridgedVp(int vp, UINT64 v);
 static void D3D12RunEvaluateCoreVp(UINT64 v, LONG *result, int transport_slot, int vp);
 static void VkReleaseSharedTexVp(int vp, int slot);
+static void D3d12ReleaseAllGameAliases();
+static void D3d12ReleaseViewportRR(int vp);
 
 static DeviceDispatch               *g_disp;        // game device dispatch
 
@@ -265,7 +267,7 @@ static bool VkImportCrossBuffer(int direction)
     const bool upload = direction == CROSS_UPLOAD;
     bool &active = upload ? g_mgpu.direct_vulkan_upload : g_mgpu.direct_vulkan_download;
     active = false;
-    if (!g_mgpu.active || !g_disp->GetMemoryHostPointerPropertiesEXT)
+    if (!g_mgpu.active || !g_disp || !g_disp->GetMemoryHostPointerPropertiesEXT)
     {
         Log("[vk] direct cross-buffer %s unavailable; retaining the D3D12 game-adapter copy",
             upload ? "input" : "output");
@@ -992,12 +994,14 @@ static bool RebuildViewportResources(int vp, const FeatureCreateContract &contra
     return true;
 }
 
-static bool ViewportContractChanged(int vp, const GameRes &col, const GameRes &out,
+static bool ViewportContractChanged(int vp, const FeatureCreateContract &contract,
+                            const GameRes &col, const GameRes &out,
                             const GameRes &dep, const GameRes &mv)
 {
     if (vp < 0 || vp >= MAX_VIEWPORTS) return true;
     const BridgeViewport &v = g_bridge.viewports[vp];
-    return !v.frame_ready
+    return CreateContractDrifted(v.create_contract, contract)
+        || !v.frame_ready
         || v.slot_w[SLOT_COLOR]  != col.w || v.slot_h[SLOT_COLOR]  != col.h
         || v.slot_w[SLOT_OUTPUT] != out.w || v.slot_h[SLOT_OUTPUT] != out.h
         || v.slot_w[SLOT_DEPTH]  != dep.w || v.slot_h[SLOT_DEPTH]  != dep.h
@@ -1048,6 +1052,29 @@ static void CaptureFrameScalarsVp(int vp, const NVSDK_NGX_Parameter *g, FrameSca
     g_bridge.viewports[vp].need_reset = false;
 
     s->has_frame_dt = GetFloatOr(g, "FrameTimeDeltaInMsec", 0.0f, &s->frame_dt);
+
+    // Ray Reconstruction view matrices, mirrored back under whichever spelling
+    // the game used. Matrices are 4x4 row-major floats; only the D3D12 path
+    // binds them today, but capture is API-agnostic so every path carries them.
+    static const char *const kW2VKeys[] = { "DLSSD.WorldToViewMatrix", "WorldToViewMatrix", nullptr };
+    static const char *const kV2CKeys[] = { "DLSSD.ViewToClipMatrix", "ViewToClipMatrix", nullptr };
+    s->has_w2v = s->has_v2c = false;
+    s->w2v_key = s->v2c_key = nullptr;
+    if (g)
+    {
+        for (const char *const *k = kW2VKeys; *k; ++k)
+        {
+            void *m = nullptr;
+            if (g->Get(*k, &m) == NGX_SUCCESS && m)
+            { memcpy(s->w2v, m, sizeof(s->w2v)); s->has_w2v = true; s->w2v_key = *k; break; }
+        }
+        for (const char *const *k = kV2CKeys; *k; ++k)
+        {
+            void *m = nullptr;
+            if (g->Get(*k, &m) == NGX_SUCCESS && m)
+            { memcpy(s->v2c, m, sizeof(s->v2c)); s->has_v2c = true; s->v2c_key = *k; break; }
+        }
+    }
 }
 static void ApplyFrameScalarsVp(int vp, const FrameScalars *s)
 {
@@ -1097,6 +1124,8 @@ static void ApplyFrameScalarsVp(int vp, const FrameScalars *s)
     q->Set("MV.Scale.Y",     s->mv_scale_y);
     q->Set("Pre.Exposure",   s->pre_exposure);
     q->Set("Exposure.Scale", s->exposure_scale);
+    if (s->has_w2v && s->w2v_key) q->Set(s->w2v_key, (void *)s->w2v);
+    if (s->has_v2c && s->v2c_key) q->Set(s->v2c_key, (void *)s->v2c);
     for (int i = 0; i < 8; ++i) q->Set(kSubrectBaseKeys[i], s->bases[i]);
     q->Set("Reset", s->reset);
     if (s->has_frame_dt) q->Set("FrameTimeDeltaInMsec", s->frame_dt);
@@ -1559,6 +1588,9 @@ static const char *const kRayReconstructionKeys[] = {
     "NormalRoughness",           "GBuffer.Normals",          "GBuffer.Roughness",
     "DiffuseAlbedo",             "SpecularAlbedo",           "SpecularHitDistance",
     "WorldToViewMatrix",         "ViewToClipMatrix",
+    "GBuffer.DiffuseAlbedo",     "GBuffer.SpecularAlbedo",   "GBuffer.SpecularMvec",
+    "RayTracingHitDistance",     "MotionVectorsReflection",
+    "DLSS.Input.DiffuseAlbedo",  "DLSS.Input.SpecularAlbedo",
 };
 
 static const char *BridgeRayReconstructionInput(const NVSDK_NGX_Parameter *p)
@@ -1606,7 +1638,7 @@ static void BridgeVkFrame(VkCommandBuffer cmd, const NVSDK_NGX_Handle *feature,
     }
 
     const FeatureCreateContract *contract = FindFeatureContract(feature);
-    if (!contract)
+    if (!contract || !contract->valid)
     {
         BridgeDisable("the DLSS feature has no complete captured creation contract");
         return;
@@ -1760,7 +1792,7 @@ static void BridgeVkFrameLockedVp(int vp, VkCommandBuffer cmd, const NVSDK_NGX_P
     BridgeCollectSlots();
     if (g_bridge.disabled) return;
 
-    if (ViewportContractChanged(vp, col, out, dep, mv))
+    if (ViewportContractChanged(vp, contract, col, out, dep, mv))
     {
         // Never release what a recorded sandwich still references: hold the
         // rebuild (forwarding frames untouched) until this viewport's slots
@@ -1987,7 +2019,11 @@ static bool BridgeSkipGameEvaluateVp(int vp, const NVSDK_NGX_Parameter *p)
         !ReadGameRes(p, "Depth", &dep) || !ReadGameRes(p, "MotionVectors", &mv))
         return false;
     FrameLock();
-    const bool contract_ok = g_bridge.viewports[vp].rebuild_busy == 0 && !ViewportContractChanged(vp, col, out, dep, mv);
+    // A missing/invalid stored contract means the viewport can never be
+    // considered unchanged: skipping would suppress the game's evaluate.
+    const FeatureCreateContract *contract = FindFeatureContract(g_bridge.viewports[vp].game_handle);
+    const bool contract_ok = g_bridge.viewports[vp].rebuild_busy == 0 && contract &&
+        !ViewportContractChanged(vp, *contract, col, out, dep, mv);
     const bool ok = contract_ok && (strict_latched ||
                     !g_bridge.vkframe[g_bridge.vk_slot].in_flight);
     FrameUnlock();
@@ -2299,21 +2335,31 @@ static void BridgeOnExecuteCommands(VkCommandBuffer primary, uint32_t count, con
 }
 
 // ---- teardown --------------------------------------------------------------
-static void VkReleaseSharedTexVp(int vp, int slot)
+// Release one shared-texture generation's handles (NT handle, D3D12 resource,
+// and the Vulkan-imported alias). Does not touch the per-viewport depth store
+// view, which the caller manages. Used both by the live-slot path and by the
+// D3D12 deferred-release pool (which retires generations the game's in-flight
+// lists may still reference).
+static void VkReleaseSharedTexHandles(SharedTex *t)
 {
-    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
-    SharedTex &t = g_bridge.viewports[vp].tex[slot];
     VkDevice dev = g_bridge.device;
     if (dev && g_disp)
     {
-        if (slot == SLOT_DEPTH && g_depth_store_view[vp] && g_disp->DestroyImageView)
-        { g_disp->DestroyImageView(dev, g_depth_store_view[vp], nullptr); g_depth_store_view[vp] = VK_NULL_HANDLE; }
-        if (t.image)  g_disp->DestroyImage(dev, t.image, nullptr);
-        if (t.memory) g_disp->FreeMemory(dev, t.memory, nullptr);
+        if (t->image)  g_disp->DestroyImage(dev, t->image, nullptr);
+        if (t->memory) g_disp->FreeMemory(dev, t->memory, nullptr);
     }
-    t.image = VK_NULL_HANDLE; t.memory = VK_NULL_HANDLE; t.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (t.nt_handle) { CloseHandle(t.nt_handle); t.nt_handle = nullptr; }
-    if (t.tex12) { t.tex12->Release(); t.tex12 = nullptr; }
+    t->image = VK_NULL_HANDLE; t->memory = VK_NULL_HANDLE; t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (t->nt_handle) { CloseHandle(t->nt_handle); t->nt_handle = nullptr; }
+    if (t->tex12) { t->tex12->Release(); t->tex12 = nullptr; }
+}
+
+static void VkReleaseSharedTexVp(int vp, int slot)
+{
+    if (vp < 0 || vp >= MAX_VIEWPORTS) vp = 0;
+    VkDevice dev = g_bridge.device;
+    if (dev && g_disp && slot == SLOT_DEPTH && g_depth_store_view[vp] && g_disp->DestroyImageView)
+    { g_disp->DestroyImageView(dev, g_depth_store_view[vp], nullptr); g_depth_store_view[vp] = VK_NULL_HANDLE; }
+    VkReleaseSharedTexHandles(&g_bridge.viewports[vp].tex[slot]);
 }
 
 static void VkReleaseSharedTex(int slot)
@@ -2380,6 +2426,7 @@ static void D3D12ReleaseResources()
 
     D3D12StopPipelineSubmitter();
     D3D12DrainGpu();
+    D3d12FlushRetiredAll(); // at teardown the game is exiting; free deferred generations
     VkDevice dev = g_bridge.device;
 
     for (int vp = 0; vp < MAX_VIEWPORTS; ++vp)
@@ -2395,11 +2442,15 @@ static void D3D12ReleaseResources()
             v.params = nullptr;
         }
         for (int i = 0; i < SLOT_COUNT; ++i) VkReleaseSharedTexVp(vp, i);
+        D3d12ReleaseViewportRR(vp);
         v.game_handle = nullptr;
+        v.game_feature = 0;
         v.frame_ready = false;
         v.rebuild_busy = 0;
         v.frames_done = 0;
         v.consecutive_fails = 0;
+        v.rr_active = false;
+        for (int i = 0; i < RR_SLOT_COUNT; ++i) v.rr_key[i] = nullptr;
         InterlockedExchange(&v.neural_latched, 0);
     }
     InterlockedExchange(&g_neural_only_latched, 0);
@@ -2461,6 +2512,7 @@ static void D3D12ReleaseResources()
         if (g_mgpu.neural_copy_alloc[slot]) { g_mgpu.neural_copy_alloc[slot]->Release(); g_mgpu.neural_copy_alloc[slot] = nullptr; }
     }
     if (g_mgpu.game_event) { CloseHandle(g_mgpu.game_event); g_mgpu.game_event = nullptr; }
+    D3d12ReleaseAllGameAliases();
     g_mgpu.active = false; g_mgpu.game_value = 0;
     g_mgpu_pending_neural = 0; g_mgpu_dropped_outputs = 0;
     g_mgpu_pending_timing_slot = -1; g_mgpu_pending_submitted_at = 0;

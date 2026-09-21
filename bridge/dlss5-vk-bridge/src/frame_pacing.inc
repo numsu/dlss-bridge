@@ -22,6 +22,11 @@ static void NotePresentPace(VkQueue queue, const VkPresentInfoKHR *info,
                             VkResult result, const LARGE_INTEGER &started,
                             const LARGE_INTEGER &finished)
 {
+    // Total across queues: one queue's count would under-report when the game
+    // presents on several. Gated here so the idle notice only fires once
+    // frames are actually flowing (never during process start/loader stalls).
+    MaybeLogDlssOff((unsigned long long)InterlockedIncrement64(&g_total_presents),
+                    "presents");
     LARGE_INTEGER frequency = {};
     if (!started.QuadPart || !finished.QuadPart ||
         !QueryPerformanceFrequency(&frequency) || !frequency.QuadPart) return;

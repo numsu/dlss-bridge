@@ -24,7 +24,16 @@ if _controller_dir not in sys.path:
 from runtime_setup import acquire_model, import_model, model_path, state_root, validate_model
 from session import close_session, prepare_session
 from steam_config import (bridge_command, configure as configure_steam,
-                          remove as remove_steam, select_localconfig, steam_running)
+                           installed_games, library_folders,
+                           remove as remove_steam, select_localconfig,
+                           steam_roots, steam_running)
+from heroic_config import (check_game as check_heroic_game,
+                           configure as configure_heroic,
+                           heroic_running, heroic_wrapper,
+                           list_games as list_heroic_games,
+                           list_games_with_titles as list_heroic_games_with_titles,
+                           remove as remove_heroic,
+                           select_games_config)
 
 ROOT = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
         else Path(__file__).resolve().parent.parent)
@@ -85,6 +94,7 @@ PROFILE_KEYS = {
     "bridge": {"verbose"},
     "match": {"executable", "graphics_api"},
     "capture": {"adapter", "max_viewports"},
+    "launch": {"follow_children", "target_executable"},
 }
 
 
@@ -105,12 +115,12 @@ def validate_profile(data: dict[str, Any], source: str = "profile") -> None:
     if kind != "neural_rendering":
         raise SystemExit(f"{source}: unsupported feature.kind: {kind}")
     adapter = data.get("capture", {}).get("adapter", "ngx_vulkan")
-    if adapter not in ("ngx_vulkan", "d3d11"):
+    if adapter not in ("ngx_vulkan", "d3d11", "ngx_d3d12"):
         raise SystemExit(f"{source}: capture.adapter is not integrated: {adapter}")
     graphics_api = data.get("match", {}).get("graphics_api", "vulkan")
-    if graphics_api not in ("vulkan", "d3d11"):
+    if graphics_api not in ("vulkan", "d3d11", "d3d12"):
         raise SystemExit(f"{source}: unsupported match.graphics_api: {graphics_api}")
-    expected_api = "d3d11" if adapter == "d3d11" else "vulkan"
+    expected_api = {"d3d11": "d3d11", "ngx_d3d12": "d3d12"}.get(adapter, "vulkan")
     if "match" in data and "graphics_api" in data.get("match", {}) and graphics_api != expected_api:
         raise SystemExit(
             f"{source}: match.graphics_api {graphics_api!r} does not match "
@@ -123,6 +133,15 @@ def validate_profile(data: dict[str, Any], source: str = "profile") -> None:
             raise SystemExit(f"{source}: capture.max_viewports must be an integer 1..4")
         if not 1 <= viewports <= 4:
             raise SystemExit(f"{source}: capture.max_viewports must be between 1 and 4")
+    launch = data.get("launch", {})
+    follow = bool(launch.get("follow_children", False))
+    target = str(launch.get("target_executable", ""))
+    if follow:
+        if not target or "/" in target or "\\" in target or not target.lower().endswith(".exe"):
+            raise SystemExit(
+                f"{source}: launch.target_executable must be a bare .exe filename "
+                f"when launch.follow_children is set"
+            )
 
 
 def resolved_runtime(data: dict[str, Any]) -> dict[str, str | int]:
@@ -162,10 +181,19 @@ def resolved_runtime(data: dict[str, Any]) -> dict[str, str | int]:
         raise SystemExit(f"invalid transport.neural_queue: {neural_queue_mode}")
     if not 1 <= budget <= 125:
         raise SystemExit("transport.latency_budget_ms must be between 1 and 125")
-    viewports = int(data.get("capture", {}).get("max_viewports", 1))
+    viewports = int(data.get("capture", {}).get("max_viewports", 4))
     if not 1 <= viewports <= 4:
         raise SystemExit("capture.max_viewports must be between 1 and 4")
-    return {
+    launch = data.get("launch", {})
+    follow = bool(launch.get("follow_children", False))
+    target = str(launch.get("target_executable", ""))
+    if follow and (not target or "/" in target or "\\" in target
+                   or not target.lower().endswith(".exe")):
+        raise SystemExit(
+            "launch.target_executable must be a bare .exe filename "
+            "when launch.follow_children is set"
+        )
+    runtime = {
         "verbose": bool_int(bridge.get("verbose", False)),
         "execution_mode": mode,
         "compute_adapter": selector,
@@ -179,7 +207,13 @@ def resolved_runtime(data: dict[str, Any]) -> dict[str, str | int]:
         "neural_passes": passes,
         "gpu_timestamps": bool_int(telemetry.get("gpu_timestamps", True)),
         "max_viewports": viewports,
+        "follow_children": bool_int(follow),
     }
+    # The DLL parser rejects empty values (its sscanf requires two fields),
+    # so an unset target is omitted rather than emitted as "target_executable=".
+    if target:
+        runtime["target_executable"] = target
+    return runtime
 
 
 def runtime_text(settings: dict[str, str | int]) -> str:
@@ -300,6 +334,10 @@ def resolve_from_args(args: argparse.Namespace) -> dict[str, str | int]:
         item = load_toml(path)
         validate_profile(item, str(path))
         data = merge(data, item)
+    follow = getattr(args, "follow_children", None)
+    if follow:
+        data = merge(data, {"launch": {"follow_children": True,
+                                       "target_executable": follow}})
     return resolved_runtime(data)
 
 
@@ -349,8 +387,11 @@ def cmd_steam_configure(args: argparse.Namespace) -> int:
         raise SystemExit("Steam configuration requires a bundled profile name")
     if args.profile != "default":
         profile_path(args.profile)
+    follow = getattr(args, "follow_children", None)
+    if follow and ("/" in follow or "\\" in follow or not follow.lower().endswith(".exe")):
+        raise SystemExit("steam configure --follow-children needs a bare .exe filename")
     config = steam_config_path(args)
-    option = bridge_command(ROOT, args.profile)
+    option = bridge_command(ROOT, args.profile, follow)
     result = configure_steam(config, args.appid, option, state_root())
     verb = "Already configured" if result == "unchanged" else "Configured"
     print(f"{verb} Steam AppID {args.appid}: {option}")
@@ -362,6 +403,73 @@ def cmd_steam_remove(args: argparse.Namespace) -> int:
     config = steam_config_path(args)
     remove_steam(config, args.appid, state_root())
     print(f"Restored the previous launch options for Steam AppID {args.appid}.")
+    return 0
+
+
+def cmd_steam_list(args: argparse.Namespace) -> int:
+    roots = ([Path(args.steam_root)] if args.steam_root else steam_roots(None))
+    libraries: list[Path] = []
+    for root in roots:
+        for library in library_folders(root):
+            if library not in libraries:
+                libraries.append(library)
+    if not libraries:
+        searched = ", ".join(str(root) for root in roots) or "(no candidate roots)"
+        raise SystemExit(
+            f"no Steam libraries found (HOME={Path.home()}; searched roots: "
+            f"{searched}). If running inside the headless-sunshine-steam "
+            "container, re-run as the gamer user (`docker exec --user gamer "
+            "...`; plain `docker exec` defaults to root with HOME=/root) "
+            "or pass --steam-root."
+        )
+    print("ID\tNAME")
+    for appid, name in installed_games(libraries):
+        print(f"{appid}\t{name}")
+    return 0
+
+
+def heroic_config_path(args: argparse.Namespace) -> Path:
+    root = Path(args.heroic_root) if args.heroic_root else None
+    return select_games_config(root)
+
+
+def require_heroic_stopped() -> None:
+    if heroic_running():
+        raise SystemExit("Heroic is running. Exit Heroic completely, then run this command again.")
+
+
+def cmd_heroic_configure(args: argparse.Namespace) -> int:
+    require_heroic_stopped()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.profile):
+        raise SystemExit("Heroic configuration requires a bundled profile name")
+    if args.profile != "default":
+        profile_path(args.profile)
+    game = check_heroic_game(args.game)
+    follow = getattr(args, "follow_children", None)
+    if follow and ("/" in follow or "\\" in follow or not follow.lower().endswith(".exe")):
+        raise SystemExit("heroic configure --follow-children needs a bare .exe filename")
+    games = heroic_config_path(args)
+    exe, wrapper_args = heroic_wrapper(ROOT, args.profile, follow)
+    result = configure_heroic(games, game, exe, wrapper_args, state_root())
+    verb = "Already configured" if result == "unchanged" else "Configured"
+    print(f"{verb} Heroic game {game}: {exe} {wrapper_args}")
+    return 0
+
+
+def cmd_heroic_list(args: argparse.Namespace) -> int:
+    print("ID\tNAME")
+    for game, title in list_heroic_games_with_titles(heroic_config_path(args)):
+        print(f"{game}\t{title}")
+    return 0
+
+
+def cmd_heroic_remove(args: argparse.Namespace) -> int:
+    require_heroic_stopped()
+    game = check_heroic_game(args.game)
+    games = heroic_config_path(args)
+    exe, _ = heroic_wrapper(ROOT, "default", None)
+    remove_heroic(games, game, exe, state_root())
+    print(f"Restored the previous wrappers for Heroic game {game}.")
     return 0
 
 
@@ -417,6 +525,8 @@ def parser() -> argparse.ArgumentParser:
     )
     steam_configure.add_argument("appid", type=steam_appid)
     steam_configure.add_argument("--profile", default="default")
+    steam_configure.add_argument("--follow-children", metavar="TARGET_EXE", default=None,
+                                 help="bridge a launcher-spawned child executable")
     steam_configure.add_argument("--steam-root")
     steam_configure.add_argument("--user")
     steam_configure.set_defaults(func=cmd_steam_configure)
@@ -427,10 +537,40 @@ def parser() -> argparse.ArgumentParser:
     steam_remove.add_argument("--steam-root")
     steam_remove.add_argument("--user")
     steam_remove.set_defaults(func=cmd_steam_remove)
+    steam_list = steam_commands.add_parser(
+        "list", help="list installed Steam games with AppIDs"
+    )
+    steam_list.add_argument("--steam-root")
+    steam_list.set_defaults(func=cmd_steam_list)
+
+    heroic = commands.add_parser("heroic", help="manage Heroic Games Launcher wrappers")
+    heroic_commands = heroic.add_subparsers(dest="heroic_command", required=True)
+    heroic_configure = heroic_commands.add_parser(
+        "configure", help="attach DLSS Bridge to a Heroic game"
+    )
+    heroic_configure.add_argument("game", help="Heroic app name (GamesConfig/<AppName>.json basename)")
+    heroic_configure.add_argument("--profile", default="default")
+    heroic_configure.add_argument("--follow-children", metavar="TARGET_EXE", default=None,
+                                  help="bridge a launcher-spawned child executable")
+    heroic_configure.add_argument("--heroic-root")
+    heroic_configure.set_defaults(func=cmd_heroic_configure)
+    heroic_remove = heroic_commands.add_parser(
+        "remove", help="restore a game's previous Heroic wrappers"
+    )
+    heroic_remove.add_argument("game", help="Heroic app name (GamesConfig/<AppName>.json basename)")
+    heroic_remove.add_argument("--heroic-root")
+    heroic_remove.set_defaults(func=cmd_heroic_remove)
+    heroic_list = heroic_commands.add_parser(
+        "list", help="list Heroic games with per-game settings files"
+    )
+    heroic_list.add_argument("--heroic-root")
+    heroic_list.set_defaults(func=cmd_heroic_list)
 
     launch = commands.add_parser("launch", aliases=["run"])
     launch.add_argument("--config", default=str(ROOT / "profiles" / "default.toml"))
     launch.add_argument("--profile", action="append", default=[])
+    launch.add_argument("--follow-children", metavar="TARGET_EXE", default=None,
+                        help="bridge a launcher-spawned child executable (bare .exe filename)")
     launch.add_argument("--dry-run", action="store_true")
     launch.add_argument("command", nargs=argparse.REMAINDER)
     launch.set_defaults(func=cmd_launch)

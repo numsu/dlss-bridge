@@ -1,6 +1,0 @@
-schema = 1
-kind = "capture"
-id = "streamline-d3d12"
-state = "planned"
-apis = ["d3d12"]
-features = ["super_resolution", "neural_rendering", "ray_reconstruction"]

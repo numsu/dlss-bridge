@@ -139,6 +139,73 @@ def _quoted(value: str) -> str:
     return f'"{escaped}"'
 
 
+def _string_entry(node: ObjectNode, key: str) -> str | None:
+    entry = node.entries.get(key.casefold())
+    if not entry or not isinstance(entry[1], Token):
+        return None
+    return entry[1].value
+
+
+def library_folders(root: Path) -> list[Path]:
+    """Steam library folders: the root itself plus libraryfolders.vdf entries.
+
+    Handles both schema generations (index-to-path strings and index objects
+    with a path member); non-directory values fall out through the is_dir
+    filter below.
+    """
+    try:
+        folders = _child(_parse_root((root / "steamapps" / "libraryfolders.vdf").read_text()),
+                         "libraryfolders")
+    except (OSError, ValueError, KeyError):
+        return []
+    found: list[Path] = [root]
+    for _, value in folders.entries.values():
+        if isinstance(value, ObjectNode):
+            candidate = _string_entry(value, "path")
+        elif isinstance(value, Token):
+            candidate = value.value
+        else:
+            continue
+        if candidate:
+            found.append(Path(candidate))
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for folder in found:
+        try:
+            resolved = folder.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved.is_dir() and resolved not in seen:
+            seen.add(resolved)
+            unique.append(resolved)
+    return unique
+
+
+def installed_games(libraries: list[Path]) -> list[tuple[str, str]]:
+    """(appid, name) pairs from each library's appmanifest files, sorted by name."""
+    games: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for library in libraries:
+        try:
+            manifests = sorted((library / "steamapps").glob("appmanifest_*.acf"))
+        except OSError:
+            continue
+        for manifest in manifests:
+            try:
+                state = _child(_parse_root(manifest.read_text()), "appstate")
+            except (OSError, ValueError, KeyError):
+                continue
+            appid = _string_entry(state, "appid")
+            name = _string_entry(state, "name")
+            if not appid or not appid.isdecimal() or not name:
+                continue
+            if appid not in seen:
+                seen.add(appid)
+                games.append((appid, name))
+    games.sort(key=lambda item: item[1].casefold())
+    return games
+
+
 def _line_bounds(text: str, start: int, end: int) -> tuple[int, int]:
     line_start = text.rfind("\n", 0, start) + 1
     line_end = text.find("\n", end)
@@ -275,21 +342,41 @@ def select_localconfig(explicit_root: Path | None = None, user: str | None = Non
     return paths[0]
 
 
-def bridge_command(root: Path, profile: str) -> str:
+def bridge_executable_path(root: Path) -> Path:
+    """Locate the installed dlss-bridge executable (no shell quoting)."""
     if getattr(sys, "frozen", False):
-        executable = Path(sys.executable)
-    else:
-        executable = root.parent.parent / "bin" / "dlss-bridge"
-        if not executable.is_file():
-            located = shutil.which("dlss-bridge")
-            if not located:
-                raise SystemExit("could not locate the installed dlss-bridge command")
-            executable = Path(located)
-    rendered = str(executable)
+        return Path(sys.executable)
+    executable = root.parent.parent / "bin" / "dlss-bridge"
+    if executable.is_file():
+        return executable
+    located = shutil.which("dlss-bridge")
+    if not located:
+        raise SystemExit("could not locate the installed dlss-bridge command")
+    return Path(located)
+
+
+def bridge_executable(root: Path) -> str:
+    """Render the dlss-bridge command path for a shell-style command string.
+
+    Steam (and anything else that shell-splits) needs the path quoted when it
+    holds spaces. Heroic does not: it takes the executable as a literal token
+    and splits only the argument list, so it must use
+    `bridge_executable_path` instead.
+    """
+    rendered = str(bridge_executable_path(root))
     if any(char.isspace() for char in rendered):
         rendered = f'"{rendered}"'
+    return rendered
+
+
+def bridge_command(root: Path, profile: str, follow: str | None = None) -> str:
+    rendered = bridge_executable(root)
     profile_option = "" if profile == "default" else f" --profile {profile}"
-    return f"{rendered} run{profile_option} -- %command%"
+    follow_option = ""
+    if follow:
+        target = follow if not any(char.isspace() for char in follow) else f'"{follow}"'
+        follow_option = f" --follow-children {target}"
+    return f"{rendered} run{profile_option}{follow_option} -- %command%"
 
 
 def _records_path(state: Path) -> Path:

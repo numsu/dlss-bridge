@@ -44,6 +44,9 @@ enum { SLOT_COLOR = 0, SLOT_OUTPUT, SLOT_DEPTH, SLOT_MV, SLOT_COUNT };
 enum { CROSS_UPLOAD = 0, CROSS_DOWNLOAD, CROSS_COUNT };
 enum { MAX_FRAME_SLOTS = 8 };
 enum { MAX_VIEWPORTS = 4 };
+// Ray Reconstruction denoiser-guidance slots, indexed by RRSlot below. Storage
+// is separate from SLOT_* so SR loops never touch RR textures.
+enum { RR_DIFFUSE = 0, RR_SPECULAR, RR_NORMAL, RR_ROUGHNESS, RR_SPEC_MV, RR_HITDIST, RR_SLOT_COUNT };
 
 static const char *kSlotKey[SLOT_COUNT]  = { "Color", "Output", "Depth", "MotionVectors" };
 static const char *kSlotName[SLOT_COUNT] = { "Color", "Output", "Depth", "MV" };
@@ -65,7 +68,9 @@ struct SharedTex
 // The per-frame NGX scalars the game supplies with its evaluate, captured when
 // the frame is recorded so that the D3D12 evaluate that consumes them -- run
 // later, on the worker, possibly with the next frame already recorded --
-// applies that frame's own jitter and not the newest one.
+// applies that frame's own jitter and not the newest one. View/world matrices
+// ride along the same way for Ray Reconstruction frames (4x4 row-major floats;
+// keys mirrored from whichever spelling the game used).
 struct FrameScalars
 {
     float    jitter_x, jitter_y, sharpness;
@@ -75,6 +80,10 @@ struct FrameScalars
     unsigned reset;
     float    frame_dt;
     bool     has_frame_dt;
+    float    w2v[16], v2c[16];
+    bool     has_w2v, has_v2c;
+    const char *w2v_key;
+    const char *v2c_key;
 };
 
 struct CrossPlane
@@ -161,12 +170,38 @@ struct MultiGpuState
 // Per-viewport (split-screen) Super Resolution history. One instance exists
 // per concurrent game NGX handle, up to MAX_VIEWPORTS. The D3D12 device,
 // queues, fences, and workers in Bridge/MultiGpuState stay shared.
+// Exact creation contract mirrored from the game's NGX feature create.
+// Optional fields (subrects, RR modes) are applied only when captured;
+// mandatory fields gate validity at capture time.
+struct FeatureCreateContract {
+    const NVSDK_NGX_Handle *handle;
+    int feature;
+    unsigned int width, height, out_width, out_height;
+    unsigned int quality, flags, output_subrects;
+    bool has_output_subrects;
+    // Ray Reconstruction creation modes (DLSS.Denoise.Mode and siblings):
+    // opportunistic like subrects, never invented.
+    unsigned int denoise_mode, roughness_mode, use_hw_depth;
+    bool has_denoise_mode, has_roughness_mode, has_use_hw_depth;
+    bool valid;
+};
+
 struct BridgeViewport
 {
     const NVSDK_NGX_Handle *game_handle; // game NGX handle identity, null = free
+    int game_feature;                    // game NGX feature id (1 SR, 13 RR)
     NVSDK_NGX_Parameter *params;         // private D3D12 parameter block
-    NVSDK_NGX_Handle    *feature;        // private D3D12 SuperSampling feature
+    NVSDK_NGX_Handle    *feature;        // private D3D12 feature (SR or RR)
+    FeatureCreateContract create_contract; // stored creation keys for params rebuilds
     SharedTex tex[SLOT_COUNT];           // per-viewport shared textures
+    // Ray Reconstruction denoiser-guidance textures. Populated only when the
+    // game's evaluates carry RR inputs; the matched NGX key per slot is kept
+    // so the private bind mirrors the game's own spelling back.
+    SharedTex rr_tex[RR_SLOT_COUNT];
+    const char *rr_key[RR_SLOT_COUNT];
+    UINT rr_slot_w[RR_SLOT_COUNT], rr_slot_h[RR_SLOT_COUNT];
+    DXGI_FORMAT rr_game_dxgi[RR_SLOT_COUNT];
+    bool rr_active;
 
     // The contract read from the game's own parameter block.
     UINT        width, height;          // Color texture size
@@ -186,6 +221,12 @@ struct BridgeViewport
     int    rebuild_busy;      // evaluates a rebuild has waited on
     volatile LONG neural_latched; // per-viewport neural-only latch
 };
+
+// Thread-local reentrancy guard, set around every private D3D12 create/
+// evaluate (including the worker-thread cores) and checked by the D3D12
+// detours in dlss5-vk-bridge.cpp so a same-API call forwarded into a patched
+// module by the session-local OptiScaler forwards without bridging.
+static __declspec(thread) int g_d3d12_in_bridge;
 
 struct Bridge
 {

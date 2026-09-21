@@ -64,12 +64,18 @@ bool ParseAdapterSelector(const char *text, AdapterSelector *out)
 RuntimeConfig::RuntimeConfig()
     : verbose(0),
       ring_slots(3), neural_pipeline_frames(2),
-      latency_budget_ms(16), gpu_timestamps(1), max_viewports(1),
+      // Viewports allocate lazily per observed NGX handle, so the default is
+      // the static capacity: single-feature games behave exactly as before,
+      // split-screen needs no per-game configuration. Lower it only to bound
+      // resource use against pathological multi-feature processes.
+      latency_budget_ms(16), gpu_timestamps(1), max_viewports(4),
+      follow_children(0),
       execution_mode(ExecutionMode::Auto),
       output_transport(OutputTransport::Native), neural_queue_mode(NeuralQueueMode::Split),
       compute_adapter{}
 {
     ParseAdapterSelector("auto", &compute_adapter);
+    target_executable[0] = 0;
 }
 
 bool RuntimeConfig::Apply(const char *key, const char *value)
@@ -102,6 +108,15 @@ bool RuntimeConfig::Apply(const char *key, const char *value)
         if (!ParseInt(value, &n)) return false;
         if (n < 1 || n > 4) return false;
         max_viewports = n;
+    }
+    else if (EqualNoCase(key, "follow_children")) {
+        if (!ParseInt(value, &n) || (n != 0 && n != 1)) return false;
+        follow_children = n;
+    }
+    else if (EqualNoCase(key, "target_executable")) {
+        // Empty means unset (follow disabled); the follow gate also requires
+        // follow_children, so an empty name can never arm child injection.
+        CopyText(target_executable, sizeof(target_executable), value ? value : "");
     }
     else if (EqualNoCase(key, "execution_mode")) {
         if (EqualNoCase(value, "auto")) execution_mode = ExecutionMode::Auto;

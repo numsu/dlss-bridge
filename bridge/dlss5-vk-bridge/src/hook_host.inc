@@ -799,6 +799,8 @@ static bool IsApplicationModule(HMODULE module, const wchar_t *path)
     return IsApplicationPath(path);
 }
 
+static unsigned PatchD3d12Iat(HMODULE module, const wchar_t *module_name); // d3d12.dll tracking (below)
+
 static void PatchLoadedApplicationModule(HMODULE module)
 {
     wchar_t path[MAX_PATH] = {};
@@ -814,6 +816,7 @@ static void PatchLoadedApplicationModule(HMODULE module)
     EnterCriticalSection(&g_iat_cs);
     RegisterApplicationModule(module, path);
     PatchLoaderIat(module, path);
+    PatchD3d12Iat(module, path);
     if (EnsureRealLoader()) PatchVulkanIat(module, path);
     LeaveCriticalSection(&g_iat_cs);
 }
@@ -843,6 +846,9 @@ static void *VulkanReplacement(const char *name)
     return nullptr;
 }
 
+static HMODULE D3d12Module(); // d3d12.dll device-creation tracking (below)
+static HRESULT WINAPI D3d12CreateDeviceAndTrack(IUnknown *, unsigned int, const IID &, void **);
+
 static FARPROC WINAPI GetProcAddressAndPatch(HMODULE module, LPCSTR name)
 {
     using Fn = FARPROC (WINAPI *)(HMODULE, LPCSTR);
@@ -850,9 +856,20 @@ static FARPROC WINAPI GetProcAddressAndPatch(HMODULE module, LPCSTR name)
     auto real = kernel ? reinterpret_cast<Fn>(GetProcAddress(kernel, "GetProcAddress")) : nullptr;
     FARPROC resolved = real ? real(module, name) : nullptr;
     if (reinterpret_cast<uintptr_t>(name) <= 0xffff) return resolved;
-    if (!EnsureRealLoader() || module != g_real_vulkan) return resolved;
-    void *replacement = resolved ? VulkanReplacement(name) : nullptr;
-    return replacement ? reinterpret_cast<FARPROC>(replacement) : resolved;
+    if (resolved)
+    {
+        if (EnsureRealLoader() && module == g_real_vulkan)
+        {
+            void *replacement = VulkanReplacement(name);
+            if (replacement) return reinterpret_cast<FARPROC>(replacement);
+        }
+        // GetProcAddress resolution of D3D12CreateDevice (engines that skip
+        // the static import): track the game device the same way.
+        if (D3d12Module() && module == D3d12Module() &&
+            _stricmp(name, "D3D12CreateDevice") == 0)
+            return reinterpret_cast<FARPROC>(D3d12CreateDeviceAndTrack);
+    }
+    return resolved;
 }
 
 // Most engines load their renderer DLL through LoadLibrary. Intercepting that
@@ -924,6 +941,11 @@ static unsigned PatchLoaderIat(HMODULE module, const wchar_t *module_name)
         { "LoadLibraryW",   (void *)LoadLibraryAndPatchW },
         { "LoadLibraryExA", (void *)LoadLibraryExAndPatchA },
         { "LoadLibraryExW", (void *)LoadLibraryExAndPatchW },
+        // Child-process follow (child_follow.inc): the replacements forward
+        // untouched unless [launch] follow_children names the child, so
+        // non-follow launches observe no behavior change.
+        { "CreateProcessW", (void *)CreateProcessAndFollowW },
+        { "CreateProcessA", (void *)CreateProcessAndFollowA },
     };
     unsigned patched = 0;
     auto *imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(base + dir.VirtualAddress);
@@ -1035,6 +1057,94 @@ static unsigned PatchVulkanIat(HMODULE module, const wchar_t *module_name)
     return patched;
 }
 
+// ---- d3d12.dll device-creation tracking ------------------------------------
+// D3D12's generation retirement needs the game's command queues to prove
+// completion (d3d12_interop.inc), and the only place a queue is reachable is
+// at creation: the device-creation hook below reports every game device, and
+// per-object vtable slot patches on its CreateCommandQueue and on each queue's
+// ExecuteCommandLists then observe every submission. The game's D3D12 device
+// is reported through D3D12CreateDevice, redirected for application modules
+// exactly like the vulkan-1.dll imports (static IAT, or GetProcAddress
+// resolution above). The private session's own device never reaches the
+// detour (the bridge module's imports are not patched) and is additionally
+// excluded by g_d3d12_in_bridge.
+struct ID3D12Device;
+static void D3d12NoteGameDeviceCreated(ID3D12Device *device); // d3d12_interop.inc
+typedef HRESULT (WINAPI *PFN_D3D12CreateDevice)(IUnknown *, unsigned int, const IID &, void **);
+static PFN_D3D12CreateDevice g_real_d3d12_create_device;
+
+static HMODULE D3d12Module()
+{
+    static HMODULE mod = GetModuleHandleW(L"d3d12.dll");
+    return mod;
+}
+
+static HRESULT WINAPI D3d12CreateDeviceAndTrack(IUnknown *adapter, unsigned int level,
+                                                const IID &riid, void **out)
+{
+    if (!g_real_d3d12_create_device)
+    {
+        HMODULE mod = D3d12Module();
+        g_real_d3d12_create_device = mod
+            ? reinterpret_cast<PFN_D3D12CreateDevice>(GetProcAddress(mod, "D3D12CreateDevice"))
+            : nullptr;
+        if (!g_real_d3d12_create_device) return E_FAIL;
+    }
+    const HRESULT hr = g_real_d3d12_create_device(adapter, level, riid, out);
+    if (SUCCEEDED(hr) && out && *out && !g_d3d12_in_bridge)
+        D3d12NoteGameDeviceCreated(reinterpret_cast<ID3D12Device *>(*out));
+    return hr;
+}
+
+static unsigned PatchD3d12Iat(HMODULE module, const wchar_t *module_name)
+{
+    if (module == nullptr || module == g_self || !IsApplicationModule(module, module_name)) return 0;
+    auto *base = reinterpret_cast<unsigned char *>(module);
+    auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    const auto &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (dir.VirtualAddress == 0) return 0;
+
+    IatHook hooks[] = { { "D3D12CreateDevice", (void *)D3d12CreateDeviceAndTrack } };
+    unsigned patched = 0;
+    auto *imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(base + dir.VirtualAddress);
+    for (; imp->Name; ++imp)
+    {
+        const char *dll = reinterpret_cast<const char *>(base + imp->Name);
+        if (_stricmp(dll, "d3d12.dll") != 0) continue;
+        if (imp->OriginalFirstThunk == 0) break;
+        auto *names = reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->OriginalFirstThunk);
+        auto *slots = reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++slots)
+        {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+            auto *byname = reinterpret_cast<IMAGE_IMPORT_BY_NAME *>(base + names->u1.AddressOfData);
+            const char *name = reinterpret_cast<const char *>(byname->Name);
+            for (const auto &h : hooks)
+                if (strcmp(name, h.name) == 0)
+                {
+                    void **slot = reinterpret_cast<void **>(&slots->u1.Function);
+                    if (*slot == h.replacement) break;
+                    DWORD old = 0;
+                    if (VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old))
+                    {
+                        *slot = h.replacement;
+                        VirtualProtect(slot, sizeof(void *), old, &old);
+                        ++patched;
+                    }
+                    break;
+                }
+        }
+        break;
+    }
+    if (patched)
+        Log("[iat-host] redirected %u d3d12.dll import(s) in %ls", patched,
+            module_name ? module_name : L"a loaded module");
+    return patched;
+}
+
 static unsigned InstallVulkanHooks()
 {
     LoaderPatchScope recursion_guard;
@@ -1053,6 +1163,7 @@ static unsigned InstallVulkanHooks()
         do
         {
             PatchLoaderIat(entry.hModule, entry.szExePath);
+            patched += PatchD3d12Iat(entry.hModule, entry.szExePath);
             if (have_vulkan) patched += PatchVulkanIat(entry.hModule, entry.szExePath);
         }
         while (Module32NextW(snapshot, &entry));

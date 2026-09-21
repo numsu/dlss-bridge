@@ -82,25 +82,6 @@ static bool ReadD3d11Res(const NVSDK_NGX_Parameter *p, const char *key, D3d11Gam
 #endif
 }
 
-// D3D11 game formats are already DXGI, so the alias is identity for the known
-// neural-compatible set. Unknown formats fall back to RGBA16F conversion via
-// the D3D11 device's format-support query; frames that cannot be converted
-// are forwarded untouched rather than guessed.
-static bool MapD3d11Color(DXGI_FORMAT game, DXGI_FORMAT *neural, bool *need_convert)
-{
-    static const DXGI_FORMAT kDirect[] = {
-        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UNORM,
-        DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM,
-        DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
-        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32_FLOAT,
-    };
-    for (DXGI_FORMAT f : kDirect)
-        if (f == game) { *neural = game; *need_convert = false; return true; }
-    *neural = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    *need_convert = true;
-    return true;
-}
-
 // Per-viewport D3D11 aliases of the D3D12 shared textures. Opened lazily on
 // first use via ID3D11Device::OpenSharedResource; released with the viewport.
 static ID3D11Resource *g_d3d11_alias[MAX_VIEWPORTS][SLOT_COUNT] = {};
@@ -180,13 +161,15 @@ static bool D3d11EnsureAlias(int vp, int slot)
 }
 #endif
 
-static bool D3d11ViewportContractChanged(int vp, const D3d11GameRes &col,
+static bool D3d11ViewportContractChanged(int vp, const FeatureCreateContract &contract,
+                                         const D3d11GameRes &col,
                                          const D3d11GameRes &out, const D3d11GameRes &dep,
                                          const D3d11GameRes &mv)
 {
     if (vp < 0 || vp >= MAX_VIEWPORTS) return true;
     const BridgeViewport &v = g_bridge.viewports[vp];
-    return !v.frame_ready
+    return CreateContractDrifted(v.create_contract, contract)
+        || !v.frame_ready
         || v.slot_w[SLOT_COLOR] != col.w || v.slot_h[SLOT_COLOR] != col.h
         || v.slot_w[SLOT_OUTPUT] != out.w || v.slot_h[SLOT_OUTPUT] != out.h
         || v.slot_w[SLOT_DEPTH] != dep.w || v.slot_h[SLOT_DEPTH] != dep.h
@@ -212,18 +195,25 @@ static bool D3d11RebuildViewport(int vp, const FeatureCreateContract &contract,
         Log("[policy] vp%d resource contract changed; rewarming before neural-only relatches", vp);
 
     struct Plan { int slot; UINT w, h; DXGI_FORMAT dxgi; bool uav; } plan[SLOT_COUNT];
-    DXGI_FORMAT cdx; bool cconv; MapD3d11Color(col.fmt, &cdx, &cconv);
-    DXGI_FORMAT odx; bool oconv; MapD3d11Color(out.fmt, &odx, &oconv);
-    if (g_cfg.output_transport == dlss_bridge::OutputTransport::R11G11B10Float)
-    { odx = DXGI_FORMAT_R11G11B10_FLOAT; oconv = (out.fmt != odx); }
-    DXGI_FORMAT mdx; bool mconv; MapD3d11Color(mv.fmt, &mdx, &mconv);
+    DXGI_FORMAT cdx; bool cconv; MapDxgiIdentityColor(col.fmt, &cdx, &cconv);
+    DXGI_FORMAT odx; bool oconv; MapDxgiIdentityColor(out.fmt, &odx, &oconv);
+    DXGI_FORMAT mdx; bool mconv; MapDxgiIdentityColor(mv.fmt, &mdx, &mconv);
     plan[SLOT_COLOR] = { SLOT_COLOR, col.w, col.h, cdx, false };
     plan[SLOT_OUTPUT] = { SLOT_OUTPUT, out.w, out.h, odx, true };
     plan[SLOT_DEPTH] = { SLOT_DEPTH, dep.w, dep.h, DXGI_FORMAT_R32_FLOAT, true };
     plan[SLOT_MV] = { SLOT_MV, mv.w, mv.h, mdx, false };
     if (cconv || oconv || mconv)
-        Log("[d3d11] vp%d format conversion required (color %d, output %d, mv %d); "
-            "conversion runs on the D3D11 immediate context", vp, (int)col.fmt, (int)out.fmt, (int)mv.fmt);
+    {
+        // CopyResource between incompatible formats is invalid; the immediate
+        // context performs no conversion. Forward untouched instead.
+        static LONG said = 0;
+        if (InterlockedExchange(&said, 1) == 0)
+            Log("[d3d11] vp%d color/output/mv formats need conversion (game %d/%d/%d); "
+                "frames are forwarded untouched until a conversion pass exists",
+                vp, (int)col.fmt, (int)out.fmt, (int)mv.fmt);
+        ViewportFail(vp, "incompatible formats");
+        return false;
+    }
 
     for (const Plan &pl : plan)
     {
@@ -277,7 +267,7 @@ static void BridgeD3D11Frame(ID3D11DeviceContext *ctx, const NVSDK_NGX_Handle *f
     if (BridgeRayReconstructionInput(p)) return; // denoiser guidance present; leave untouched
 
     const FeatureCreateContract *contract = FindFeatureContract(feature);
-    if (!contract)
+    if (!contract || !contract->valid)
     {
         BridgeDisable("the D3D11 DLSS feature has no complete captured creation contract");
         return;
@@ -289,7 +279,7 @@ static void BridgeD3D11Frame(ID3D11DeviceContext *ctx, const NVSDK_NGX_Handle *f
         return;
 
     FrameLock();
-    if (D3d11ViewportContractChanged(vp, col, out, dep, mv) &&
+    if (D3d11ViewportContractChanged(vp, *contract, col, out, dep, mv) &&
         !D3d11RebuildViewport(vp, *contract, col, out, dep, mv))
     { FrameUnlock(); return; }
     BridgeViewport &v = g_bridge.viewports[vp];
@@ -315,10 +305,12 @@ static void BridgeD3D11Frame(ID3D11DeviceContext *ctx, const NVSDK_NGX_Handle *f
 
     // Neural evaluate on the shared D3D12 queue (ordered with Vulkan frames
     // when both APIs are live in one process, e.g. mixed-API engines).
+    // Synchronous frames host-wait, so the slot is always free; rotation is
+    // what lets every ring slot complete and the viewport latch.
     ApplyFrameScalarsVp(vp, &scalars);
     g_bridge.fence_in->Signal(++g_bridge.timeline);
     LONG result = 0;
-    D3D12RunEvaluateCoreVp(g_bridge.timeline, &result, 0, vp);
+    D3D12RunEvaluateCoreVp(g_bridge.timeline, &result, NextSyncTransportSlot(), vp);
     if (result == 0 && g_bridge.fence_out->GetCompletedValue() < g_bridge.timeline)
     {
         g_bridge.fence_out->SetEventOnCompletion(g_bridge.timeline, g_bridge.fence_event);
@@ -357,5 +349,8 @@ static bool BridgeD3D11SkipGameEvaluate(int vp, const NVSDK_NGX_Parameter *p)
     if (!ReadD3d11Res(p, "Color", &col) || !ReadD3d11Res(p, "Output", &out) ||
         !ReadD3d11Res(p, "Depth", &dep) || !ReadD3d11Res(p, "MotionVectors", &mv))
         return false;
-    return !D3d11ViewportContractChanged(vp, col, out, dep, mv);
+    // A missing/invalid stored contract means the viewport can never be
+    // considered unchanged: skipping would suppress the game's evaluate.
+    const FeatureCreateContract *contract = FindFeatureContract(g_bridge.viewports[vp].game_handle);
+    return contract && !D3d11ViewportContractChanged(vp, *contract, col, out, dep, mv);
 }

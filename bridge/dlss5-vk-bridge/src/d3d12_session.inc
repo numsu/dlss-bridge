@@ -39,10 +39,11 @@ static NVSDK_NGX_Result SafeAllocParams(PFN_AllocateParameters fn, NVSDK_NGX_Par
 }
 
 static NVSDK_NGX_Result SafeCreateFeature(PFN_D3D12CreateFeature fn, ID3D12GraphicsCommandList *list,
-                                          NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out, DWORD *code)
+                                          int feature_id, NVSDK_NGX_Parameter *p,
+                                          NVSDK_NGX_Handle **out, DWORD *code)
 {
     *code = 0;
-    __try { return fn(list, 1 /*SuperSampling*/, p, out); }
+    __try { return fn(list, feature_id, p, out); }
     __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
 }
 
@@ -200,6 +201,10 @@ static int D3D12QueryNgxCaps()
 
 static void D3D12ReleaseResources();
 
+// Adopted game device for D3D12 capture (defined in d3d12_interop.inc, which
+// captures it from the first intercepted command list).
+static ID3D12Device *D3D12GameDevice();
+
 static void BridgeDisable(const char *why)
 {
     if (g_bridge.disabled) return;
@@ -234,6 +239,31 @@ static void BridgeFail(const char *what)
         Log("[bridge] disabled after repeated failures (%s); evaluation now fails closed.", what);
         BridgeDisable(what);
     }
+}
+
+// True when the game's captured creation contract has drifted from the one the
+// viewport's private feature was built from. Geometry-only comparison is not
+// enough: a game that releases and recreates its feature at the same handle
+// address can change quality, creation flags, or the feature kind (SR vs RR)
+// while the textures keep their shape, and the bridge must not keep
+// suppressing the new game feature with the old private one. Optional fields
+// compare their presence first; values only matter when the field is present.
+static bool CreateContractDrifted(const FeatureCreateContract &stored,
+                                  const FeatureCreateContract &cur)
+{
+    if (!stored.valid || !cur.valid) return true;
+    return stored.feature != cur.feature
+        || stored.width != cur.width || stored.height != cur.height
+        || stored.out_width != cur.out_width || stored.out_height != cur.out_height
+        || stored.quality != cur.quality || stored.flags != cur.flags
+        || stored.has_output_subrects != cur.has_output_subrects
+        || (cur.has_output_subrects && stored.output_subrects != cur.output_subrects)
+        || stored.has_denoise_mode != cur.has_denoise_mode
+        || (cur.has_denoise_mode && stored.denoise_mode != cur.denoise_mode)
+        || stored.has_roughness_mode != cur.has_roughness_mode
+        || (cur.has_roughness_mode && stored.roughness_mode != cur.roughness_mode)
+        || stored.has_use_hw_depth != cur.has_use_hw_depth
+        || (cur.has_use_hw_depth && stored.use_hw_depth != cur.use_hw_depth);
 }
 
 // ---- adapter selection by LUID --------------------------------------------
@@ -979,6 +1009,33 @@ static void D3D12DrainGpu()
     NeuralTimingFlush();
 }
 
+// The same-adapter D3D12 path retires (rather than releases) shared textures
+// on rebuild; the pool lives in d3d12_interop.inc. It must be flushed when the
+// session tears down.
+static void D3d12FlushRetiredAll();
+
+// Game formats on D3D11/D3D12 capture are already DXGI, so the neural alias
+// is identity for the known compatible set: RGBA render/output encodings
+// plus the standard R16G16_FLOAT / R32G32_FLOAT motion-vector encodings.
+// Anything else reports conversion-required, and callers forward untouched:
+// CopyResource between incompatible formats is invalid, and this path has no
+// conversion pass (unlike the Vulkan graphics-queue blits).
+static bool MapDxgiIdentityColor(DXGI_FORMAT game, DXGI_FORMAT *neural, bool *need_convert)
+{
+    static const DXGI_FORMAT kDirect[] = {
+        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UNORM,
+        DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
+    };
+    for (DXGI_FORMAT f : kDirect)
+        if (f == game) { *neural = game; *need_convert = false; return true; }
+    *neural = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    *need_convert = true;
+    return true;
+}
+
 static void Barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *res,
                     D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
 {
@@ -997,12 +1054,12 @@ static void Barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *res,
 // ALLOW_SIMULTANEOUS_ACCESS (so the two APIs need no cross-API state
 // transitions) and an NT shared handle is exported for Vulkan to import. Depth
 // and the Output always carry a UAV; Output because DLSS writes it through one.
-// Textures are per-viewport so split-screen histories never alias.
-static bool D3D12MakeSharedTextureVp(int vp, int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
+// Textures are per-viewport so split-screen histories never alias. The Ref
+// core below also backs Ray Reconstruction slots, which live in a parallel
+// per-viewport array with their own labels.
+static bool D3D12MakeSharedTextureRef(SharedTex &t, int vp, const char *label,
+                                      UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
 {
-    if (vp < 0 || vp >= MAX_VIEWPORTS) return false;
-    SharedTex &t = g_bridge.viewports[vp].tex[slot];
-
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
@@ -1023,20 +1080,27 @@ static bool D3D12MakeSharedTextureVp(int vp, int slot, UINT w, UINT h, DXGI_FORM
     HRESULT hr = interop->CreateCommittedResource(
         &hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
         __uuidof(ID3D12Resource), reinterpret_cast<void **>(&t.tex12));
-    if (FAILED(hr)) { Log("[bridge] %s: CreateCommittedResource failed 0x%08X", kSlotName[slot], hr); return false; }
+    if (FAILED(hr)) { Log("[bridge] %s: CreateCommittedResource failed 0x%08X", label, hr); return false; }
 
     hr = interop->CreateSharedHandle(t.tex12, nullptr, GENERIC_ALL, nullptr, &t.nt_handle);
-    if (FAILED(hr)) { Log("[bridge] %s: CreateSharedHandle failed 0x%08X", kSlotName[slot], hr); return false; }
+    if (FAILED(hr)) { Log("[bridge] %s: CreateSharedHandle failed 0x%08X", label, hr); return false; }
 
     {
         wchar_t n[64];
-        _snwprintf_s(n, _TRUNCATE, L"dlss5-vk-bridge %hs", kSlotName[slot]);
+        _snwprintf_s(n, _TRUNCATE, L"dlss5-vk-bridge %hs", label);
         t.tex12->SetName(n);
     }
     t.w = w; t.h = h; t.fmt12 = fmt;
     Log("[bridge] vp%d %-6s %ux%u fmt=%u  D3D12 shared texture created (handle=%p)",
-        vp, kSlotName[slot], w, h, fmt, t.nt_handle);
+        vp, label, w, h, fmt, t.nt_handle);
     return true;
+}
+
+static bool D3D12MakeSharedTextureVp(int vp, int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
+{
+    if (vp < 0 || vp >= MAX_VIEWPORTS) return false;
+    return D3D12MakeSharedTextureRef(g_bridge.viewports[vp].tex[slot], vp,
+                                     kSlotName[slot], w, h, fmt, uav);
 }
 
 static bool D3D12CreateSharedFence(ID3D12Fence **out, HANDLE *handle)
@@ -1467,6 +1531,11 @@ static bool D3D12InitSession(const uint8_t luid[VK_LUID_SIZE], bool luid_valid)
     Log("");
     Log("################ bridge: opening D3D12 session ################");
 
+    // Declared up front: fail-path gotos below jump forward past this point,
+    // and C++ forbids jumping over initializations.
+    bool d3d12_capture = false;
+    ID3D12Device *adopted = nullptr;
+
     UINT game_index = UINT_MAX;
     IDXGIAdapter1 *game_adapter = PickAdapterByLuid(luid, luid_valid, &game_index);
     IDXGIAdapter1 *adapter = game_adapter;
@@ -1548,6 +1617,25 @@ static bool D3D12InitSession(const uint8_t luid[VK_LUID_SIZE], bool luid_valid)
         g_components.host->id, g_components.capture->id,
         g_components.executor->id, g_components.transport->id);
 
+    // D3D12 capture on the game adapter runs the private neural session on
+    // the game's own device and records into the game's open command lists:
+    // cross-device copies evaluated from the CPU can never observe inputs
+    // that the game has recorded but not yet submitted. The adopted reference
+    // is balanced by teardown; every other session object below is created on
+    // that device exactly as for a private one. (Secondary-GPU D3D12 capture
+    // keeps the separate neural device; its frames stand aside, see the
+    // frame path.)
+    d3d12_capture = g_components.capture && g_components.capture->id &&
+        strcmp(g_components.capture->id, "ngx-d3d12") == 0;
+    adopted = (!g_mgpu.active && d3d12_capture) ? D3D12GameDevice() : nullptr;
+    if (adopted)
+    {
+        adopted->AddRef();
+        g_bridge.dev12 = adopted;
+        Log("[bridge] D3D12 capture on the game adapter: neural session shares game device %p; "
+            "evaluate work records into the game's command lists", (void *)adopted);
+    }
+
     {
         HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
         auto create_device = d3d12 ? reinterpret_cast<HRESULT (WINAPI *)(
@@ -1555,18 +1643,32 @@ static bool D3D12InitSession(const uint8_t luid[VK_LUID_SIZE], bool luid_valid)
                 GetProcAddress(d3d12, "D3D12CreateDevice")) : nullptr;
         if (create_device == nullptr) { Log("[bridge] no D3D12CreateDevice"); goto fail; }
 
-        HRESULT hr = S_OK;
+        // The D3D12CreateDevice tracker (injected host) must never treat the
+        // session's own devices as game devices: the in-bridge guard stays set
+        // for the duration of each create (the lambda owns the counter, so a
+        // failure goto cannot leak it).
+        auto session_create = [&](IUnknown *ad, REFIID riid, void **out) -> HRESULT
+        {
+            g_d3d12_in_bridge++;
+            const HRESULT r = create_device(ad, D3D_FEATURE_LEVEL_11_0, riid, out);
+            g_d3d12_in_bridge--;
+            return r;
+        };
         if (g_mgpu.active)
         {
-            hr = create_device(game_adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device3),
-                               reinterpret_cast<void **>(&g_mgpu.game_dev));
+            const HRESULT hr = session_create(game_adapter, __uuidof(ID3D12Device3),
+                                              reinterpret_cast<void **>(&g_mgpu.game_dev));
             if (FAILED(hr) || !g_mgpu.game_dev)
             { Log("[mgpu] game-side D3D12Device3 creation failed 0x%08X", hr); goto fail; }
         }
-        hr = create_device(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
-                           reinterpret_cast<void **>(&g_bridge.dev12));
-        if (FAILED(hr) || g_bridge.dev12 == nullptr)
-        { Log("[bridge] D3D12CreateDevice failed 0x%08X", hr); goto fail; }
+        if (!adopted)
+        {
+            const HRESULT hr = session_create(adapter, __uuidof(ID3D12Device),
+                                              reinterpret_cast<void **>(&g_bridge.dev12));
+            if (FAILED(hr) || g_bridge.dev12 == nullptr)
+            { Log("[bridge] D3D12CreateDevice failed 0x%08X", hr); goto fail; }
+        }
+        HRESULT hr = S_OK;
 
         adapter->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void **>(&g_bridge.adapter3));
 
@@ -1753,7 +1855,19 @@ static void D3D12LogCreateFailureDetail()
 static bool D3D12CreateDlssFeatureVp(const FeatureCreateContract &contract, int vp)
 {
     if (vp < 0 || vp >= MAX_VIEWPORTS) return false;
+    // Private features mirror the game feature kind: SuperSampling (1) or
+    // RayReconstruction (13). Anything else (FrameGeneration is tracked
+    // passthrough and never reaches here) is refused, not guessed.
+    if (contract.feature != NVSDK_NGX_FEATURE_SUPER_SAMPLING &&
+        contract.feature != NVSDK_NGX_FEATURE_RAY_RECONSTRUCTION)
+    {
+        Log("[bridge] vp%d unsupported game feature id %d; only SuperSampling and "
+            "RayReconstruction are bridged", vp, contract.feature);
+        return false;
+    }
     BridgeViewport &state = g_bridge.viewports[vp];
+    state.game_feature = contract.feature;
+    state.create_contract = contract;
     if (state.feature && g_bridge.release_feature)
     { g_bridge.release_feature(state.feature); state.feature = nullptr; }
     if (!state.params)
@@ -1772,14 +1886,20 @@ static bool D3D12CreateDlssFeatureVp(const FeatureCreateContract &contract, int 
     state.params->Set("DLSS.Feature.Create.Flags", contract.flags);
     if (contract.has_output_subrects)
         state.params->Set("DLSS.Enable.Output.Subrects", contract.output_subrects);
+    if (contract.has_denoise_mode)
+        state.params->Set("DLSS.Denoise.Mode", contract.denoise_mode);
+    if (contract.has_roughness_mode)
+        state.params->Set("DLSS.Roughness.Mode", contract.roughness_mode);
+    if (contract.has_use_hw_depth)
+        state.params->Set("DLSS.Use.HW.Depth", contract.use_hw_depth);
     state.feature_flags = contract.flags;
 
     // These masks describe the single-node private D3D12 device rather than a
     // game policy, so they are determined by the executor.
     state.params->Set("CreationNodeMask", 1u);
     state.params->Set("VisibilityNodeMask", 1u);
-    Log("[bridge] vp%d exact create contract: %ux%u -> %ux%u quality=%u flags=0x%X%s",
-        vp, contract.width, contract.height, contract.out_width, contract.out_height,
+    Log("[bridge] vp%d exact create contract (feature %d): %ux%u -> %ux%u quality=%u flags=0x%X%s",
+        vp, contract.feature, contract.width, contract.height, contract.out_width, contract.out_height,
         contract.quality, contract.flags,
         contract.has_output_subrects ? " with output-subrect policy" : "");
 
@@ -1787,8 +1907,14 @@ static bool D3D12CreateDlssFeatureVp(const FeatureCreateContract &contract, int 
     if (!D3D12BeginCommands()) { Log("[bridge] vp%d could not start a command list for create", vp); return false; }
 
     DWORD code = 0;
-    NVSDK_NGX_Result rf = SafeCreateFeature(g_bridge.create_feature, g_bridge.list,
-                                            state.params, &state.feature, &code);
+    NVSDK_NGX_Result rf = NGX_FAIL;
+    // Private-session guard: if this create's downstream calls forward into a
+    // patched NGX module, the re-entered detour must forward raw instead of
+    // re-bridging (or re-capturing a "game" contract from our own params).
+    ++g_d3d12_in_bridge;
+    rf = SafeCreateFeature(g_bridge.create_feature, g_bridge.list,
+                           contract.feature, state.params, &state.feature, &code);
+    --g_d3d12_in_bridge;
     const UINT64 fence_value = D3D12EndCommands();
 
     if (g_bridge.fence_gpu->GetCompletedValue() < fence_value)
@@ -1810,6 +1936,48 @@ static bool D3D12CreateDlssFeatureVp(const FeatureCreateContract &contract, int 
         vp, state.render_w, state.render_h, state.ngx_out_w, state.ngx_out_h,
         (void *)state.feature);
     state.need_reset = true;
+    return true;
+}
+
+// Destroy and reallocate a viewport's private parameter block, reapplying its
+// stored creation contract and SR bindings. Stale per-evaluate bindings
+// (notably removed Ray Reconstruction inputs) cannot survive: the next bind
+// starts from a clean block, so a released texture is never evaluated.
+static bool D3D12RecreatePrivateParams(int vp)
+{
+    if (vp < 0 || vp >= MAX_VIEWPORTS) return false;
+    BridgeViewport &state = g_bridge.viewports[vp];
+    const FeatureCreateContract &contract = state.create_contract;
+    if (!contract.valid || !g_bridge.alloc_params || !g_ngx12_module) return false;
+    if (state.params)
+    {
+        auto destroy = reinterpret_cast<void (*)(NVSDK_NGX_Parameter *)>(
+            GetProcAddress(g_ngx12_module, "NVSDK_NGX_D3D12_DestroyParameters"));
+        if (destroy) { __try { destroy(state.params); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        state.params = nullptr;
+    }
+    DWORD acode = 0;
+    NVSDK_NGX_Result arp = SafeAllocParams(g_bridge.alloc_params, &state.params, &acode);
+    if (acode || arp != NGX_SUCCESS || !state.params)
+    { Log("[bridge] vp%d AllocateParameters failed 0x%08X", vp, arp); return false; }
+    state.params->Set("Width",     contract.width);
+    state.params->Set("Height",    contract.height);
+    state.params->Set("OutWidth",  contract.out_width);
+    state.params->Set("OutHeight", contract.out_height);
+    state.params->Set("PerfQualityValue", contract.quality);
+    state.params->Set("DLSS.Feature.Create.Flags", contract.flags);
+    if (contract.has_output_subrects)
+        state.params->Set("DLSS.Enable.Output.Subrects", contract.output_subrects);
+    if (contract.has_denoise_mode)
+        state.params->Set("DLSS.Denoise.Mode", contract.denoise_mode);
+    if (contract.has_roughness_mode)
+        state.params->Set("DLSS.Roughness.Mode", contract.roughness_mode);
+    if (contract.has_use_hw_depth)
+        state.params->Set("DLSS.Use.HW.Depth", contract.use_hw_depth);
+    state.params->Set("CreationNodeMask", 1u);
+    state.params->Set("VisibilityNodeMask", 1u);
+    for (int i = 0; i < SLOT_COUNT; ++i)
+        state.params->Set(kSlotKey[i], NeuralTexVp(vp, i));
     return true;
 }
 
@@ -2118,8 +2286,12 @@ static void D3D12RunEvaluatePipelinedVp(UINT64 timeline, LONG *result, int trans
     const bool toggle_pulse = BeginNeuralTogglePulse();
     LARGE_INTEGER optiscaler_started = {};
     QueryPerformanceCounter(&optiscaler_started);
+    // Private-session guard: a same-API call forwarded by OptiScaler into a
+    // patched module must not be treated as a new game evaluation.
+    ++g_d3d12_in_bridge;
     evaluated = SafeEvaluate(g_bridge.eval_feature, list,
                              g_bridge.viewports[vp].feature, g_bridge.viewports[vp].params, &code);
+    --g_d3d12_in_bridge;
     ReportSlowCpuStage("OptiScaler/NGX EvaluateFeature", optiscaler_started);
     EndNeuralTogglePulse(toggle_pulse);
     list->EndEvent();
@@ -2161,6 +2333,21 @@ static void D3D12RunEvaluatePipelinedVp(UINT64 timeline, LONG *result, int trans
             NgxResultName(evaluated));
         *result = 1;
     }
+}
+
+// Transport slot rotation for the synchronous D3D11/D3D12 frame paths. Those
+// paths host-wait every frame, so any slot is free on entry; rotating through
+// the ring lets every slot complete once, which is what AllTransportOutputs-
+// Valid (and therefore neural-only latching) requires. Vulkan manages its own
+// slots through the submit-matched ring instead.
+static volatile LONG g_sync_transport_rr = 0;
+
+static int NextSyncTransportSlot()
+{
+    const LONG next = InterlockedIncrement(&g_sync_transport_rr);
+    const int count = ActiveFrameCount();
+    if (count <= 0) return 0;
+    return (int)((next % count + count) % count);
 }
 
 static void D3D12RunEvaluateCoreVp(UINT64 v, LONG *result, int transport_slot, int vp)
@@ -2318,7 +2505,11 @@ static void D3D12RunEvaluateCoreVp(UINT64 v, LONG *result, int transport_slot, i
     const bool toggle_pulse = BeginNeuralTogglePulse();
     LARGE_INTEGER optiscaler_started = {};
     QueryPerformanceCounter(&optiscaler_started);
+    // Private-session guard: a same-API call forwarded by OptiScaler into a
+    // patched module must not be treated as a new game evaluation.
+    ++g_d3d12_in_bridge;
     re = SafeEvaluate(g_bridge.eval_feature, g_bridge.list, g_bridge.viewports[vp].feature, g_bridge.viewports[vp].params, &code);
+    --g_d3d12_in_bridge;
     ReportSlowCpuStage("OptiScaler/NGX EvaluateFeature", optiscaler_started);
     EndNeuralTogglePulse(toggle_pulse);
     g_bridge.list->EndEvent();

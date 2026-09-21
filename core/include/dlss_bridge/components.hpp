@@ -14,6 +14,7 @@ enum ComponentCapability : uint32_t {
     TemporalInputs     = 1u << 4,
     D3D11Frames        = 1u << 5,
     MultiViewport      = 1u << 6,
+    D3D12Frames        = 1u << 7,
 };
 
 struct ComponentDescriptor {

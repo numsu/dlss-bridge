@@ -7,9 +7,12 @@ register a system-wide Vulkan layer.
 ## Compatibility
 
 The validated release path is 64-bit Windows Vulkan games that expose NVIDIA
-NGX Super Resolution. Direct3D 11 capture and multi-viewport
-(`capture.max_viewports` up to 4) are implemented but untested — no
-hardware-validated game run exists yet.
+NGX Super Resolution. Direct3D 11 and Direct3D 12 capture, multi-viewport
+(`capture.max_viewports` up to 4), Frame Generation coexistence, Ray
+Reconstruction on D3D12, and child-process follow are implemented but
+untested — no hardware-validated game run exists yet. D3D11/D3D12 capture
+additionally requires float depth in v1 (no conversion pass); secondary-GPU
+execution rides the shared host-staging ring on all three APIs.
 
 | Host | Game runtime | Attachment method |
 | --- | --- | --- |
@@ -22,14 +25,25 @@ on the game's NVIDIA GPU or another NVIDIA GPU. RTX 3000, 4000, and 5000 series
 cards are selected through runtime capability checks rather than a generation
 allowlist.
 
-Native Linux games, Direct3D 12-only games, launchers that move rendering into an
-unrelated child process, Streamline capture, frame generation, and system-wide
-automatic injection are not supported in this release. Baldur's Gate 3 is
-supported through `bg3.exe` (Vulkan, `profiles/bg3.toml`) and `bg3_dx11.exe`
-(Direct3D 11, `profiles/bg3-dx11.toml`); bypass the Larian launcher with
-`--skip-launcher` so the bridge injects the game executable directly. Avoid
-injection in protected multiplayer games unless the game and its anti-cheat
-system explicitly permit it.
+Native Linux games and system-wide automatic injection are not supported in
+this release. Streamline-native titles work through the NGX-level hooks with
+no extra setup (Cyberpunk 2077's sl.* chain is intercepted transparently).
+No per-game configuration exists: the graphics API is auto-detected from the
+game's own NGX calls at runtime, and viewports allocate on demand up to the
+static capacity of four, so single-feature and split-screen titles alike run
+on defaults. The only bundled profiles are GPU-placement policies
+(`same-gpu`, `secondary-gpu`).
+
+Titles exercised or queued during development (all untested unless noted):
+Vulkan — No Man's Sky (works), DOOM Eternal, Wolfenstein Youngblood, Red
+Dead Redemption 2 (follow), Baldur's Gate 3 (`--skip-launcher` so the bridge
+sees `bg3.exe`/`bg3_dx11.exe` directly); Direct3D 11 — God of War (DLSS 2);
+Direct3D 12 — Alan Wake 2, Metro Exodus Enhanced, Cyberpunk 2077, The
+Witcher 3 (DX12 mode), GTA V Enhanced (follow). Avoid injection in protected
+multiplayer games unless the game and its anti-cheat system explicitly permit
+it — BattlEye-protected Online modes are never injected; GTA V Enhanced and
+RDR2 story modes require the anti-cheat disabled (`-nobattleye`) plus
+`--follow-children`.
 
 ## Requirements
 
@@ -108,7 +122,18 @@ Steam AppID:
 dlss-bridge steam configure APPID --profile same-gpu
 ```
 
-Omit `--profile` to use the default automatic GPU policy. The command locates
+Omit `--profile` to use the default automatic GPU policy. For a
+launcher-spawned game, name the real game executable as well:
+
+```bash
+dlss-bridge steam configure APPID --follow-children GTA5_Enhanced.exe
+```
+
+Find numeric AppIDs with `dlss-bridge steam list` (installed games across
+all libraries, sorted by name; `--steam-root PATH` for unusual installs).
+Output is a uniform `ID<TAB>NAME` table with an `ID  NAME` header.
+
+The command locates
 the current Steam user, creates a one-time backup of `localconfig.vdf`, and
 remembers the previous launch option. If more than one Steam account is present,
 select one with `--user STEAMID`. Unusual installations can be selected with
@@ -123,6 +148,46 @@ dlss-bridge steam remove APPID
 
 Removal refuses to overwrite the setting if another program or the user changed
 it after DLSS Bridge configured it.
+
+## Configure Heroic from the command line
+
+Exit Heroic completely before changing anything: it keeps settings in memory
+and would silently drop external edits. Configure a game by its Heroic app
+name (the `GamesConfig/<AppName>.json` basename — the first column of
+`dlss-bridge heroic list`, which prints a uniform `ID<TAB>NAME` table with an
+`ID  NAME` header, titles resolved from Heroic's library caches and sorted
+by name):
+
+```bash
+dlss-bridge heroic configure GAME --profile same-gpu
+```
+
+This prepends a `{exe, args}` wrapper entry (`dlss-bridge run ... --`) to the
+game's `wrapperOptions`, which Heroic places ahead of the game command —
+the equivalent of Steam's `%command%` prefix. It also ensures
+`enviromentOptions` (Heroic's spelling) contains `PROTON_ENABLE_NVAPI=1` and
+`PROTON_HIDE_NVIDIA_GPU=0` so DX11/DX12 NGX titles detect the NVIDIA GPU and
+expose their DLSS option instead of hiding it behind an AMD-spoofed path.
+Only our own wrapper entry and those two env keys are ever added, moved
+first, or removed; every other wrapper, env entry, and setting in Heroic's
+shared per-game file is preserved byte-for-byte. A missing settings file is
+created holding just our entries, which Heroic merges over its defaults.
+
+```bash
+dlss-bridge heroic list
+dlss-bridge heroic configure GAME --follow-children GTA5_Enhanced.exe
+dlss-bridge heroic remove GAME
+```
+
+`--heroic-root PATH` selects the configuration when several exist (custom
+`$XDG_CONFIG_HOME`, Flatpak). Removal drops only our wrapper entry and
+restores the two managed env keys to their prior values (deleting keys we
+added); a settings file we created is deleted only when nothing else has
+been added to it.
+
+Inside the headless-sunshine-steam container, run these commands as the gamer
+user (`docker exec --user gamer ...`); plain `docker exec` runs as root with
+`HOME=/root` and finds neither Heroic nor Steam data.
 
 ## Enable a Steam game
 
@@ -146,6 +211,32 @@ For each launch, the controller:
 
 No step writes to the game directory or Wine prefix. Omit the command prefix to
 launch without DLSS Bridge; no disable flag is needed.
+
+## Launcher-spawned games (child-process follow)
+
+Some games start through a launcher that spawns the real game as a child
+process (Rockstar Games Launcher, Warframe launcher). Prefixing the launcher
+command alone would inject the launcher, not the game. Name the real game
+executable explicitly instead of writing a profile file for it:
+
+```text
+dlss-bridge run --follow-children GTA5_Enhanced.exe -- %command%
+```
+
+The injected launcher redirects its own `CreateProcessW/A` imports: every
+child it spawns is force-created suspended, injected with the session hook,
+initialized, and resumed. The name given in the flag only selects which
+process is the game's renderer; intermediate launchers in a
+Launcher -> Helper -> Game chain are carried along automatically because
+each injected process re-arms the same follow rule, and the hook is inert in
+a process that never creates NGX features. Failed follows run exactly as the
+launcher requested. The session log records each followed child and
+injection result. The session launcher
+retains the session directory until every followed child has exited (it polls
+the process list by executable name after the launcher itself exits), so
+cleanup never deletes DLLs, configuration, or the model from under a running
+game; a child that never appears releases the session after a bounded grace
+window.
 
 ## Toggle neural rendering while playing
 
@@ -256,3 +347,8 @@ Useful errors:
   runtime components.
 - **hook injection failed**: check that the target is a 64-bit Windows program
   and that anti-cheat or endpoint security is not blocking process injection.
+- **bridge is idle, DLSS appears disabled**: the session log contains
+  `DLSS appears disabled in-game, so the bridge is idle` after ~512 presents
+  (Vulkan) or submissions (D3D12) with no NGX feature created. Enable DLSS
+  in the game's graphics settings and the bridge activates without
+  reinstalling anything.

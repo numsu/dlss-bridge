@@ -1,6 +1,0 @@
-schema = 1
-kind = "transport"
-id = "d3d12-cross-adapter"
-state = "planned"
-apis = ["d3d12"]
-multi_gpu = true

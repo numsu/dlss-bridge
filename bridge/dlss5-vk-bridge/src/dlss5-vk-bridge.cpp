@@ -47,6 +47,7 @@ typedef NVSDK_NGX_Result (*PFN_D3D12EvaluateFeature)(
 typedef NVSDK_NGX_Result (*PFN_D3D12ReleaseFeature)(NVSDK_NGX_Handle *);
 
 #include "bridge.h"
+#include "dlss_off_gate.h"
 #include "dlss_bridge/runtime.hpp"
 #include "dlss_bridge/components.hpp"
 
@@ -92,14 +93,6 @@ struct NgxInitIdentity {
 };
 static NgxInitIdentity g_ngx_identity{};
 
-struct FeatureCreateContract {
-    const NVSDK_NGX_Handle *handle;
-    int feature;
-    unsigned int width, height, out_width, out_height;
-    unsigned int quality, flags, output_subrects;
-    bool has_output_subrects;
-    bool valid;
-};
 static FeatureCreateContract g_feature_contracts[32]{};
 
 static bool ReadCreateUInt(const NVSDK_NGX_Parameter *p, const char *key, unsigned int *value)
@@ -107,10 +100,13 @@ static bool ReadCreateUInt(const NVSDK_NGX_Parameter *p, const char *key, unsign
     return p && p->Get(key, value) == NGX_SUCCESS;
 }
 
+static void ClearFgHandle(const NVSDK_NGX_Handle *handle);
+
 static void CaptureFeatureContract(int feature, const NVSDK_NGX_Parameter *p,
                                    const NVSDK_NGX_Handle *handle)
 {
     if (!handle) return;
+    ClearFgHandle(handle);
     FeatureCreateContract contract{};
     contract.handle = handle;
     contract.feature = feature;
@@ -123,6 +119,16 @@ static void CaptureFeatureContract(int feature, const NVSDK_NGX_Parameter *p,
         ReadCreateUInt(p, "DLSS.Feature.Create.Flags", &contract.flags);
     contract.has_output_subrects =
         ReadCreateUInt(p, "DLSS.Enable.Output.Subrects", &contract.output_subrects);
+    // Ray Reconstruction creation modes: opportunistic like subrects. These
+    // spellings come from the DLSS 3.5 integration guides (the vendored SDK
+    // snapshot does not define them); absent keys simply stay disabled and no
+    // value is ever invented.
+    contract.has_denoise_mode =
+        ReadCreateUInt(p, "DLSS.Denoise.Mode", &contract.denoise_mode);
+    contract.has_roughness_mode =
+        ReadCreateUInt(p, "DLSS.Roughness.Mode", &contract.roughness_mode);
+    contract.has_use_hw_depth =
+        ReadCreateUInt(p, "DLSS.Use.HW.Depth", &contract.use_hw_depth);
     FeatureCreateContract *slot = nullptr;
     for (FeatureCreateContract &item : g_feature_contracts)
         if (item.handle == handle) { slot = &item; break; }
@@ -148,6 +154,83 @@ static const FeatureCreateContract *FindFeatureContract(const NVSDK_NGX_Handle *
     for (const FeatureCreateContract &contract : g_feature_contracts)
         if (contract.handle == handle) return contract.valid ? &contract : nullptr;
     return nullptr;
+}
+
+// Frame Generation coexistence: FG features are never bridged (their
+// presentation-time interpolation contract is outside the in-frame executor),
+// but they are no longer refused either. Tracked handles forward untouched so
+// FG titles keep native frame generation while Super Resolution frames bridge.
+// Creates are serialized on g_hook_cs, so plain slot scans are sufficient.
+static const NVSDK_NGX_Handle *g_fg_handles[32]{};
+
+static void NoteFgCreate(const NVSDK_NGX_Handle *handle)
+{
+    if (!handle) return;
+    for (const NVSDK_NGX_Handle *slot : g_fg_handles)
+        if (slot == handle) return;
+    for (const NVSDK_NGX_Handle *&slot : g_fg_handles)
+        if (!slot)
+        {
+            slot = handle;
+            Log("[contract] NGX Frame Generation handle=%p tracked passthrough (never bridged; "
+                "Super Resolution frames continue to bridge)", (void *)handle);
+            return;
+        }
+    // Fixed table, unbounded game behavior: evict the oldest entry rather
+    // than forwarding untracked (an untracked FG handle would fall through
+    // to contract lookup and disable the bridge).
+    Log("[contract] FG handle table full; evicting oldest for handle=%p", (void *)handle);
+    for (int i = 0; i + 1 < 32; ++i) g_fg_handles[i] = g_fg_handles[i + 1];
+    g_fg_handles[31] = handle;
+}
+
+// A released or recycled address must never keep an FG classification: an SR
+// handle allocated at a former FG address would otherwise bypass bridging
+// forever. SR contracts self-heal through geometry comparison; FG has no
+// such check, so its registry is maintained explicitly.
+static void ClearFgHandle(const NVSDK_NGX_Handle *handle)
+{
+    if (!handle) return;
+    for (const NVSDK_NGX_Handle *&slot : g_fg_handles)
+        if (slot == handle) { slot = nullptr; return; }
+}
+
+static bool IsFgHandle(const NVSDK_NGX_Handle *handle)
+{
+    if (!handle) return false;
+    for (const NVSDK_NGX_Handle *slot : g_fg_handles)
+        if (slot == handle) return true;
+    return false;
+}
+
+// Idle-notice state: the bridge is inert while the game never creates an NGX
+// feature (DLSS off in the game's settings). Every successful game create on
+// any API bumps g_game_create_count; Vulkan presents and D3D12 accepted
+// submissions prove frames are flowing. Once activity passes the gate with
+// zero creates, a single log line tells the user to enable DLSS.
+static volatile LONG g_game_create_count = 0;
+static volatile LONG g_dlss_off_logged = 0;
+static volatile LONGLONG g_total_presents = 0;
+
+static void NoteGameCreateObserved()
+{
+    InterlockedIncrement(&g_game_create_count);
+}
+
+static void MaybeLogDlssOff(unsigned long long activity, const char *activity_name)
+{
+    // Plain read first: after the one-shot fires this stays a single volatile
+    // load on the present/submission hot path instead of locked operations.
+    if (g_dlss_off_logged) return;
+    if (!DlssOffShouldLog(activity,
+                           InterlockedCompareExchange(&g_game_create_count, 0, 0),
+                           InterlockedCompareExchange(&g_dlss_off_logged, 0, 0)))
+        return;
+    if (InterlockedCompareExchange(&g_dlss_off_logged, 1, 0) != 0) return;
+    Log("[bridge] %llu %s observed with no NGX feature created; DLSS appears "
+        "disabled in-game, so the bridge is idle. Enable DLSS in the game's "
+        "graphics settings to activate neural rendering.",
+        activity, activity_name);
 }
 
 static void CaptureNgxApplicationIdentity(unsigned long long application_id, int sdk_version)
@@ -363,17 +446,10 @@ static bool LoadConfig()
 
 // ---------------------------------------------------------------------------
 // Frame Generation has a different presentation-time contract from the
-// temporal upscaling operation implemented here. Refuse its feature creation
-// explicitly so an attached process never enters a partially supported mode.
+// temporal upscaling operation implemented here, so FG features are never
+// bridged. They are forwarded untouched and tracked (see g_fg_handles) so FG
+// titles keep native frame generation while Super Resolution frames bridge.
 // ---------------------------------------------------------------------------
-static bool NoteVkFeatureCreate(int feature)
-{
-    if (feature != NVSDK_NGX_FEATURE_FRAME_GENERATION) return false;
-    static LONG warned = 0;
-    if (InterlockedExchange(&warned, 1) == 0)
-        Warn("NGX Frame Generation is unsupported by this temporal bridge; refusing the feature create");
-    return true;
-}
 
 // Implemented by vk_interop.inc after the host-specific Vulkan wrappers. A
 // submitted game frame waits on the bridge's output event on the GPU. Keep
@@ -392,7 +468,9 @@ static void BridgeWaitBeforePresent(VkQueue queue);
 #include "d3d12_session.inc"
 #include "frame_pacing.inc"
 #include "d3d11_host.inc"
+#include "d3d12_host.inc"
 #if defined(DLSS5VK_HOOK_HOST)
+#include "child_follow.inc"
 #include "hook_host.inc"
 #elif defined(DLSS5VK_ADDON_HOST)
 #include "addon_host.inc"
@@ -401,6 +479,7 @@ static void BridgeWaitBeforePresent(VkQueue queue);
 #endif
 #include "vk_interop.inc"
 #include "d3d11_interop.inc"
+#include "d3d12_interop.inc"
 
 // ---------------------------------------------------------------------------
 // NGX Vulkan evaluate hook
@@ -439,6 +518,26 @@ static Hook      g_d3d11_create_hooks[kMaxHooks]; // NVSDK_NGX_D3D11_CreateFeatu
 static int       g_d3d11_create_count;
 static int       g_lift_d3d11_eval_depth;
 static int       g_lift_d3d11_create_depth;
+static Hook      g_d3d12_eval_hooks[kMaxHooks];   // NVSDK_NGX_D3D12_EvaluateFeature
+static int       g_d3d12_eval_count;
+static Hook      g_d3d12_create_hooks[kMaxHooks]; // NVSDK_NGX_D3D12_CreateFeature
+static int       g_d3d12_create_count;
+static Hook      g_d3d12_init_ext_hooks[kMaxHooks];     // NVSDK_NGX_D3D12_Init_Ext
+static int       g_d3d12_init_ext_count;
+static Hook      g_d3d12_init_project_hooks[kMaxHooks]; // NVSDK_NGX_D3D12_Init_ProjectID
+static int       g_d3d12_init_project_count;
+static int       g_lift_d3d12_eval_depth;
+static int       g_lift_d3d12_create_depth;
+static int       g_lift_d3d12_init_depth;
+// ReleaseFeature detours only clear handle classifications and forward; the
+// exports are optional (absent on older NGX builds) and simply unhooked then.
+static Hook      g_vk_release_hooks[kMaxHooks];    // NVSDK_NGX_VULKAN_ReleaseFeature
+static int       g_vk_release_count;
+static Hook      g_d3d11_release_hooks[kMaxHooks]; // NVSDK_NGX_D3D11_ReleaseFeature
+static int       g_d3d11_release_count;
+static Hook      g_d3d12_release_hooks[kMaxHooks]; // NVSDK_NGX_D3D12_ReleaseFeature
+static int       g_d3d12_release_count;
+static int       g_lift_release_depth;
 static __declspec(thread) int g_ngx_nest;
 
 static void WriteCode(void *dst, const void *src, size_t n)
@@ -623,6 +722,10 @@ static void AuditHooksAtFault()
     bad += AuditHookArray("create1",  g_create1_hooks, g_create1_count, g_lift_create_depth > 0);
     bad += AuditHookArray("d3d11-evaluate", g_d3d11_eval_hooks, g_d3d11_eval_count, g_lift_d3d11_eval_depth > 0);
     bad += AuditHookArray("d3d11-create", g_d3d11_create_hooks, g_d3d11_create_count, g_lift_d3d11_create_depth > 0);
+    bad += AuditHookArray("d3d12-evaluate", g_d3d12_eval_hooks, g_d3d12_eval_count, g_lift_d3d12_eval_depth > 0);
+    bad += AuditHookArray("d3d12-create", g_d3d12_create_hooks, g_d3d12_create_count, g_lift_d3d12_create_depth > 0);
+    bad += AuditHookArray("d3d12-init", g_d3d12_init_ext_hooks, g_d3d12_init_ext_count, g_lift_d3d12_init_depth > 0);
+    bad += AuditHookArray("d3d12-init-project", g_d3d12_init_project_hooks, g_d3d12_init_project_count, g_lift_d3d12_init_depth > 0);
     if (bad == 0)
         Log("[hook]   audit: every hooked entry point is loaded and in the expected "
             "state; the fault is not a patch-integrity problem");
@@ -696,6 +799,16 @@ static NVSDK_NGX_Result BridgedVkEvaluate(int idx, VkCommandBuffer cmd, const NV
         FrameLock();
         D3D12ReleaseResources();
         FrameUnlock();
+    }
+
+    // Frame Generation features are never bridged: forward untouched without
+    // touching viewport, contract, or frame state. This check precedes the
+    // fail-closed gate below on purpose: native FG keeps running even after
+    // the SR path has failed.
+    if (IsFgHandle(feat))
+    {
+        --g_ngx_nest;
+        return ForwardVkEvaluateVia(idx, cmd, feat, p, cb);
     }
 
     // An attached bridge that has failed remains fail-closed for the process.
@@ -838,21 +951,27 @@ static NVSDK_NGX_Result ForwardVkCreateVia(Hook *h, bool one, VkDevice dev, VkCo
 static NVSDK_NGX_Result BridgedVkCreate(int idx, VkCommandBuffer cmd, int feature,
                                         NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
-    if (NoteVkFeatureCreate(feature))
-    { if (out) *out = nullptr; return NGX_FAIL_FEATURE_NOT_SUPPORTED; }
     NVSDK_NGX_Result result = ForwardVkCreateVia(
         &g_create_hooks[idx], false, VK_NULL_HANDLE, cmd, feature, p, out);
-    if (result == NGX_SUCCESS && out) CaptureFeatureContract(feature, p, *out);
+    if (result == NGX_SUCCESS && out)
+    {
+        NoteGameCreateObserved();
+        if (feature == NVSDK_NGX_FEATURE_FRAME_GENERATION) NoteFgCreate(*out);
+        else CaptureFeatureContract(feature, p, *out);
+    }
     return result;
 }
 static NVSDK_NGX_Result BridgedVkCreate1(int idx, VkDevice dev, VkCommandBuffer cmd, int feature,
                                          NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
-    if (NoteVkFeatureCreate(feature))
-    { if (out) *out = nullptr; return NGX_FAIL_FEATURE_NOT_SUPPORTED; }
     NVSDK_NGX_Result result = ForwardVkCreateVia(
         &g_create1_hooks[idx], true, dev, cmd, feature, p, out);
-    if (result == NGX_SUCCESS && out) CaptureFeatureContract(feature, p, *out);
+    if (result == NGX_SUCCESS && out)
+    {
+        NoteGameCreateObserved();
+        if (feature == NVSDK_NGX_FEATURE_FRAME_GENERATION) NoteFgCreate(*out);
+        else CaptureFeatureContract(feature, p, *out);
+    }
     return result;
 }
 
@@ -1088,6 +1207,11 @@ static NVSDK_NGX_Result BridgedD3d11Evaluate(int idx, ID3D11DeviceContext *ctx,
         D3D12ReleaseResources();
         FrameUnlock();
     }
+    if (IsFgHandle(feat))
+    {
+        --g_ngx_nest;
+        return ForwardD3d11EvaluateVia(idx, ctx, feat, p);
+    }
     if (outer && g_bridge.disabled) { --g_ngx_nest; return NGX_FAIL; }
     const int vp = feat ? ResolveViewport(feat) : -1;
     const bool skip_game = outer && vp >= 0 && BridgeD3D11SkipGameEvaluate(vp, p);
@@ -1162,8 +1286,6 @@ static NVSDK_NGX_Result ForwardD3d11CreateVia(Hook *h, ID3D11DeviceContext *ctx,
 static NVSDK_NGX_Result BridgedD3d11Create(int idx, ID3D11DeviceContext *ctx, int feature,
     NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
-    if (NoteVkFeatureCreate(feature))
-    { if (out) *out = nullptr; return NGX_FAIL_FEATURE_NOT_SUPPORTED; }
     // Ensure the runtime composition covers D3D11 before the first create.
     if (!g_components.capture || strcmp(g_components.capture->id, "d3d11") != 0)
     {
@@ -1176,7 +1298,12 @@ static NVSDK_NGX_Result BridgedD3d11Create(int idx, ID3D11DeviceContext *ctx, in
     }
     NVSDK_NGX_Result result = ForwardD3d11CreateVia(
         &g_d3d11_create_hooks[idx], ctx, feature, p, out);
-    if (result == NGX_SUCCESS && out) CaptureFeatureContract(feature, p, *out);
+    if (result == NGX_SUCCESS && out)
+    {
+        NoteGameCreateObserved();
+        if (feature == NVSDK_NGX_FEATURE_FRAME_GENERATION) NoteFgCreate(*out);
+        else CaptureFeatureContract(feature, p, *out);
+    }
     return result;
 }
 
@@ -1192,6 +1319,448 @@ static void *const g_d3d11_create_detours[kMaxHooks] = {
     (void *)Detour_D3D11_Create_0, (void *)Detour_D3D11_Create_1, (void *)Detour_D3D11_Create_2,  (void *)Detour_D3D11_Create_3,
     (void *)Detour_D3D11_Create_4, (void *)Detour_D3D11_Create_5, (void *)Detour_D3D11_Create_6,  (void *)Detour_D3D11_Create_7,
     (void *)Detour_D3D11_Create_8, (void *)Detour_D3D11_Create_9, (void *)Detour_D3D11_Create_10, (void *)Detour_D3D11_Create_11,
+};
+
+// ---------------------------------------------------------------------------
+// NGX D3D12 hooks: DX12 titles with native Super Resolution.
+//
+// Same 14-byte absolute-jump patching and lift-all-while-forwarding contract
+// as Vulkan/D3D11. Two differences are D3D12-specific: (1) the session-local
+// OptiScaler module is never hooked (see TryHookModule), so the private
+// neural session's own NGX calls travel through unhooked code; (2) a
+// thread-local in-bridge guard makes any re-entered detour -- e.g. a game
+// interposer forwarding through the private module -- forward without
+// bridging instead of recursing. The D3D12 evaluate runs synchronously on the
+// game thread (see d3d12_interop.inc), so no worker is involved.
+// ---------------------------------------------------------------------------
+static void LiftD3d12EvalHooks()
+{
+    if (++g_lift_d3d12_eval_depth != 1) return;
+    for (int i = 0; i < g_d3d12_eval_count; ++i) HookRestore(&g_d3d12_eval_hooks[i]);
+}
+static void UnliftD3d12EvalHooks()
+{
+    if (--g_lift_d3d12_eval_depth != 0) return;
+    for (int i = 0; i < g_d3d12_eval_count; ++i) HookReinstall(&g_d3d12_eval_hooks[i]);
+}
+static void LiftD3d12CreateHooks()
+{
+    if (++g_lift_d3d12_create_depth != 1) return;
+    for (int i = 0; i < g_d3d12_create_count; ++i) HookRestore(&g_d3d12_create_hooks[i]);
+}
+static void UnliftD3d12CreateHooks()
+{
+    if (--g_lift_d3d12_create_depth != 0) return;
+    for (int i = 0; i < g_d3d12_create_count; ++i) HookReinstall(&g_d3d12_create_hooks[i]);
+}
+static void LiftD3d12InitHooks()
+{
+    if (++g_lift_d3d12_init_depth != 1) return;
+    for (int i = 0; i < g_d3d12_init_ext_count; ++i) HookRestore(&g_d3d12_init_ext_hooks[i]);
+    for (int i = 0; i < g_d3d12_init_project_count; ++i) HookRestore(&g_d3d12_init_project_hooks[i]);
+}
+static void UnliftD3d12InitHooks()
+{
+    if (--g_lift_d3d12_init_depth != 0) return;
+    for (int i = 0; i < g_d3d12_init_ext_count; ++i) HookReinstall(&g_d3d12_init_ext_hooks[i]);
+    for (int i = 0; i < g_d3d12_init_project_count; ++i) HookReinstall(&g_d3d12_init_project_hooks[i]);
+}
+
+static NVSDK_NGX_Result SafeCallD3d12Evaluate(PFN_D3D12EvaluateFeature fn,
+    ID3D12GraphicsCommandList *list, const NVSDK_NGX_Handle *feat,
+    const NVSDK_NGX_Parameter *p, FaultInfo *fi)
+{
+    memset(fi, 0, sizeof(*fi));
+    __try { return fn(list, feat, p, nullptr); }
+    __except (FaultCapture(fi, GetExceptionInformation()))
+    {
+        if (fi->code == kStatusStackOverflow) _resetstkoflw();
+        return NGX_FAIL;
+    }
+}
+
+static NVSDK_NGX_Result ForwardD3d12EvaluateVia(int idx, ID3D12GraphicsCommandList *list,
+    const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Parameter *p)
+{
+    Hook &h = g_d3d12_eval_hooks[idx];
+    if (reinterpret_cast<uintptr_t>(h.target) < 0x10000) return NGX_FAIL;
+    EnterCriticalSection(&g_hook_cs);
+    LiftD3d12EvalHooks();
+    FaultInfo fi;
+    NVSDK_NGX_Result r = SafeCallD3d12Evaluate(
+        reinterpret_cast<PFN_D3D12EvaluateFeature>(h.target), list, feat, p, &fi);
+    if (fi.code) AuditHooksAtFault();
+    UnliftD3d12EvalHooks();
+    LeaveCriticalSection(&g_hook_cs);
+    if (fi.code)
+    {
+        Log("[hook] forwarded NGX D3D12 evaluate raised 0x%08X", fi.code);
+        LogFaultSite(&fi);
+        BridgeDisable("the game's NGX D3D12 evaluate faulted while forwarding");
+    }
+    return r;
+}
+
+static NVSDK_NGX_Result BridgedD3d12Evaluate(int idx, ID3D12GraphicsCommandList *list,
+    const NVSDK_NGX_Handle *feat, const NVSDK_NGX_Parameter *p,
+    PFN_NVSDK_NGX_ProgressCallback cb)
+{
+    (void)cb;
+    // Re-entered from the private neural session (same API names on both
+    // sides): forward without bridging instead of recursing.
+    if (g_d3d12_in_bridge) return ForwardD3d12EvaluateVia(idx, list, feat, p);
+    ++g_ngx_nest;
+    const bool outer = (g_ngx_nest == 1);
+    if (outer && g_release_deferred)
+    {
+        InterlockedExchange(&g_release_deferred, 0);
+        FrameLock();
+        D3D12ReleaseResources();
+        FrameUnlock();
+    }
+    if (IsFgHandle(feat))
+    {
+        --g_ngx_nest;
+        return ForwardD3d12EvaluateVia(idx, list, feat, p);
+    }
+    if (outer && g_bridge.disabled) { --g_ngx_nest; return NGX_FAIL; }
+    const int vp = feat ? ResolveViewport(feat) : -1;
+    const bool skip_game = outer && vp >= 0 && BridgeD3D12SkipGameEvaluate(vp, p);
+    NVSDK_NGX_Result r = NGX_FAIL;
+    if (!skip_game)
+    {
+        r = ForwardD3d12EvaluateVia(idx, list, feat, p);
+        if (outer && !g_bridge.disabled && r == NGX_SUCCESS)
+        {
+            FaultInfo fi;
+            memset(&fi, 0, sizeof(fi));
+            __try { BridgeD3D12Frame(list, feat, p); }
+            __except (FaultCapture(&fi, GetExceptionInformation()))
+            { BridgeFrameUnlockAll();
+              Log("[bridge] d3d12 frame path faulted 0x%08X; disabling", fi.code);
+              BridgeDisable("the d3d12 bridge frame path raised"); }
+        }
+    }
+    else
+    {
+        // Latched: the private neural result is authoritative, but only if it
+        // actually writes the output. Run it first; on any failure the
+        // game's own evaluate still has to run, or downstream rendering would
+        // consume an unwritten/stale Output.
+        static bool said = false;
+        if (!said) { said = true;
+            Log("[policy] vp%d (d3d12) skipping game-side evaluate; private neural result authoritative", vp); }
+        bool wrote = false;
+        FaultInfo fi;
+        memset(&fi, 0, sizeof(fi));
+        __try { wrote = BridgeD3D12Frame(list, feat, p); }
+        __except (FaultCapture(&fi, GetExceptionInformation()))
+        { BridgeFrameUnlockAll();
+          Log("[bridge] d3d12 frame path faulted 0x%08X; disabling", fi.code);
+          BridgeDisable("the d3d12 bridge frame path raised"); }
+        if (wrote)
+        {
+            r = NGX_SUCCESS;
+        }
+        else
+        {
+            static bool said_fb = false;
+            if (!said_fb) { said_fb = true;
+                Log("[d3d12] vp%d private evaluate produced no output; "
+                    "falling back to the game-side evaluate", vp); }
+            r = ForwardD3d12EvaluateVia(idx, list, feat, p);
+        }
+    }
+    --g_ngx_nest;
+    return r;
+}
+
+#define D3D12_EVAL_DETOUR(N) \
+    static NVSDK_NGX_Result Detour_D3D12_Eval_##N(ID3D12GraphicsCommandList *l, const NVSDK_NGX_Handle *f, \
+        const NVSDK_NGX_Parameter *p, PFN_NVSDK_NGX_ProgressCallback cb) \
+    { return BridgedD3d12Evaluate(N, l, f, p, cb); }
+D3D12_EVAL_DETOUR(0) D3D12_EVAL_DETOUR(1) D3D12_EVAL_DETOUR(2)  D3D12_EVAL_DETOUR(3)
+D3D12_EVAL_DETOUR(4) D3D12_EVAL_DETOUR(5) D3D12_EVAL_DETOUR(6)  D3D12_EVAL_DETOUR(7)
+D3D12_EVAL_DETOUR(8) D3D12_EVAL_DETOUR(9) D3D12_EVAL_DETOUR(10) D3D12_EVAL_DETOUR(11)
+
+static void *const g_d3d12_eval_detours[kMaxHooks] = {
+    (void *)Detour_D3D12_Eval_0, (void *)Detour_D3D12_Eval_1, (void *)Detour_D3D12_Eval_2,  (void *)Detour_D3D12_Eval_3,
+    (void *)Detour_D3D12_Eval_4, (void *)Detour_D3D12_Eval_5, (void *)Detour_D3D12_Eval_6,  (void *)Detour_D3D12_Eval_7,
+    (void *)Detour_D3D12_Eval_8, (void *)Detour_D3D12_Eval_9, (void *)Detour_D3D12_Eval_10, (void *)Detour_D3D12_Eval_11,
+};
+
+static NVSDK_NGX_Result SafeCallD3d12Create(PFN_D3D12CreateFeature fn,
+    ID3D12GraphicsCommandList *list, int feature, NVSDK_NGX_Parameter *p,
+    NVSDK_NGX_Handle **out, FaultInfo *fi)
+{
+    memset(fi, 0, sizeof(*fi));
+    __try { return fn(list, feature, p, out); }
+    __except (FaultCapture(fi, GetExceptionInformation()))
+    {
+        if (fi->code == kStatusStackOverflow) _resetstkoflw();
+        return NGX_FAIL;
+    }
+}
+
+static NVSDK_NGX_Result ForwardD3d12CreateVia(Hook *h, ID3D12GraphicsCommandList *list,
+    int feature, NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
+{
+    if (reinterpret_cast<uintptr_t>(h->target) < 0x10000) return NGX_FAIL;
+    EnterCriticalSection(&g_hook_cs);
+    LiftD3d12EvalHooks();
+    LiftD3d12CreateHooks();
+    FaultInfo fi;
+    NVSDK_NGX_Result r = SafeCallD3d12Create(
+        reinterpret_cast<PFN_D3D12CreateFeature>(h->target), list, feature, p, out, &fi);
+    if (fi.code) AuditHooksAtFault();
+    UnliftD3d12CreateHooks();
+    UnliftD3d12EvalHooks();
+    LeaveCriticalSection(&g_hook_cs);
+    if (fi.code) BridgeDisable("the game's NGX D3D12 feature creation faulted");
+    return r;
+}
+
+static NVSDK_NGX_Result BridgedD3d12Create(int idx, ID3D12GraphicsCommandList *list, int feature,
+    NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
+{
+    // Re-entered from the private neural session (same API names on both
+    // sides): forward raw -- no component switch, no contract capture, no FG
+    // note -- or our own creation parameters would arm a game viewport.
+    if (g_d3d12_in_bridge) return ForwardD3d12CreateVia(&g_d3d12_create_hooks[idx], list, feature, p, out);
+    // Ensure the runtime composition covers D3D12 before the first create.
+    if (!g_components.capture || strcmp(g_components.capture->id, "ngx-d3d12") != 0)
+    {
+        dlss_bridge::RuntimeComposition dual{};
+        if (dual.Configure(D3D12HostId()) && dual.SelectTransport(false))
+        {
+            g_components = dual;
+            Log("[components] D3D12 capture activated (host injected-d3d12)");
+        }
+    }
+    NVSDK_NGX_Result result = ForwardD3d12CreateVia(
+        &g_d3d12_create_hooks[idx], list, feature, p, out);
+    if (result == NGX_SUCCESS && out)
+    {
+        NoteGameCreateObserved();
+        if (feature == NVSDK_NGX_FEATURE_FRAME_GENERATION) NoteFgCreate(*out);
+        else CaptureFeatureContract(feature, p, *out);
+    }
+    return result;
+}
+
+#define D3D12_CREATE_DETOUR(N) \
+    static NVSDK_NGX_Result Detour_D3D12_Create_##N(ID3D12GraphicsCommandList *l, int ft, \
+        NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **o) \
+    { return BridgedD3d12Create(N, l, ft, p, o); }
+D3D12_CREATE_DETOUR(0) D3D12_CREATE_DETOUR(1) D3D12_CREATE_DETOUR(2)  D3D12_CREATE_DETOUR(3)
+D3D12_CREATE_DETOUR(4) D3D12_CREATE_DETOUR(5) D3D12_CREATE_DETOUR(6)  D3D12_CREATE_DETOUR(7)
+D3D12_CREATE_DETOUR(8) D3D12_CREATE_DETOUR(9) D3D12_CREATE_DETOUR(10) D3D12_CREATE_DETOUR(11)
+
+static void *const g_d3d12_create_detours[kMaxHooks] = {
+    (void *)Detour_D3D12_Create_0, (void *)Detour_D3D12_Create_1, (void *)Detour_D3D12_Create_2,  (void *)Detour_D3D12_Create_3,
+    (void *)Detour_D3D12_Create_4, (void *)Detour_D3D12_Create_5, (void *)Detour_D3D12_Create_6,  (void *)Detour_D3D12_Create_7,
+    (void *)Detour_D3D12_Create_8, (void *)Detour_D3D12_Create_9, (void *)Detour_D3D12_Create_10, (void *)Detour_D3D12_Create_11,
+};
+
+// Game-side NGX initialization: forward, then capture the application/project
+// identity the private D3D12 session reuses at bring-up. No device adoption --
+// the evaluate entry point already hands the bridge the game command list.
+static NVSDK_NGX_Result ForwardD3d12InitExt(int idx, unsigned long long app_id,
+    const wchar_t *data_path, ID3D12Device *device, int version, const void *feature_info)
+{
+    Hook &h = g_d3d12_init_ext_hooks[idx];
+    (void)device;
+    EnterCriticalSection(&g_hook_cs);
+    LiftD3d12InitHooks();
+    const NVSDK_NGX_Result result = reinterpret_cast<PFN_NGX_D3D12_Init_Ext>(h.target)(
+        app_id, data_path, device, version, feature_info);
+    if (result == NGX_SUCCESS) CaptureNgxApplicationIdentity(app_id, version);
+    UnliftD3d12InitHooks();
+    LeaveCriticalSection(&g_hook_cs);
+    return result;
+}
+
+#define D3D12_INIT_EXT_DETOUR(N) \
+    static NVSDK_NGX_Result Detour_D3D12_InitExt_##N(unsigned long long a, const wchar_t *p, \
+        ID3D12Device *d, int v, const void *f) \
+    { return ForwardD3d12InitExt(N, a, p, d, v, f); }
+D3D12_INIT_EXT_DETOUR(0) D3D12_INIT_EXT_DETOUR(1) D3D12_INIT_EXT_DETOUR(2)  D3D12_INIT_EXT_DETOUR(3)
+D3D12_INIT_EXT_DETOUR(4) D3D12_INIT_EXT_DETOUR(5) D3D12_INIT_EXT_DETOUR(6)  D3D12_INIT_EXT_DETOUR(7)
+D3D12_INIT_EXT_DETOUR(8) D3D12_INIT_EXT_DETOUR(9) D3D12_INIT_EXT_DETOUR(10) D3D12_INIT_EXT_DETOUR(11)
+
+static void *const g_d3d12_init_ext_detours[kMaxHooks] = {
+    (void *)Detour_D3D12_InitExt_0, (void *)Detour_D3D12_InitExt_1, (void *)Detour_D3D12_InitExt_2,
+    (void *)Detour_D3D12_InitExt_3, (void *)Detour_D3D12_InitExt_4, (void *)Detour_D3D12_InitExt_5,
+    (void *)Detour_D3D12_InitExt_6, (void *)Detour_D3D12_InitExt_7, (void *)Detour_D3D12_InitExt_8,
+    (void *)Detour_D3D12_InitExt_9, (void *)Detour_D3D12_InitExt_10, (void *)Detour_D3D12_InitExt_11,
+};
+
+static NVSDK_NGX_Result ForwardD3d12InitProject(int idx, const char *project_id,
+    int engine_type, const char *engine_version, const wchar_t *data_path,
+    ID3D12Device *device, int version, const void *feature_info)
+{
+    Hook &h = g_d3d12_init_project_hooks[idx];
+    (void)device;
+    EnterCriticalSection(&g_hook_cs);
+    LiftD3d12InitHooks();
+    const NVSDK_NGX_Result result = reinterpret_cast<PFN_NGX_D3D12_Init_ProjectID>(h.target)(
+        project_id, engine_type, engine_version, data_path, device, version, feature_info);
+    if (result == NGX_SUCCESS)
+        CaptureNgxProjectIdentity(project_id, engine_type, engine_version, version);
+    UnliftD3d12InitHooks();
+    LeaveCriticalSection(&g_hook_cs);
+    return result;
+}
+
+#define D3D12_INIT_PROJECT_DETOUR(N) \
+    static NVSDK_NGX_Result Detour_D3D12_InitProject_##N( \
+        const char *p, int e, const char *ev, const wchar_t *d, ID3D12Device *dev, \
+        int v, const void *f) \
+    { return ForwardD3d12InitProject(N, p, e, ev, d, dev, v, f); }
+D3D12_INIT_PROJECT_DETOUR(0) D3D12_INIT_PROJECT_DETOUR(1) D3D12_INIT_PROJECT_DETOUR(2) D3D12_INIT_PROJECT_DETOUR(3)
+D3D12_INIT_PROJECT_DETOUR(4) D3D12_INIT_PROJECT_DETOUR(5) D3D12_INIT_PROJECT_DETOUR(6) D3D12_INIT_PROJECT_DETOUR(7)
+D3D12_INIT_PROJECT_DETOUR(8) D3D12_INIT_PROJECT_DETOUR(9) D3D12_INIT_PROJECT_DETOUR(10) D3D12_INIT_PROJECT_DETOUR(11)
+
+static void *const g_d3d12_init_project_detours[kMaxHooks] = {
+    (void *)Detour_D3D12_InitProject_0, (void *)Detour_D3D12_InitProject_1,
+    (void *)Detour_D3D12_InitProject_2, (void *)Detour_D3D12_InitProject_3,
+    (void *)Detour_D3D12_InitProject_4, (void *)Detour_D3D12_InitProject_5,
+    (void *)Detour_D3D12_InitProject_6, (void *)Detour_D3D12_InitProject_7,
+    (void *)Detour_D3D12_InitProject_8, (void *)Detour_D3D12_InitProject_9,
+    (void *)Detour_D3D12_InitProject_10, (void *)Detour_D3D12_InitProject_11,
+};
+
+// ---------------------------------------------------------------------------
+// ReleaseFeature detours: forward, then drop the handle's FG classification
+// and invalidate the viewport that was bridged under it (a recreated feature
+// at the same address rebuilds from the fresh creation contract; the stale
+// private feature's history and any neural-only latch do not survive). All
+// three APIs share one signature, one lift set, and one classification table.
+// ---------------------------------------------------------------------------
+typedef NVSDK_NGX_Result (*PFN_NGXReleaseFeature)(NVSDK_NGX_Handle *);
+
+static NVSDK_NGX_Result SafeCallRelease(PFN_NGXReleaseFeature fn, NVSDK_NGX_Handle *h,
+    FaultInfo *fi)
+{
+    memset(fi, 0, sizeof(*fi));
+    __try { return fn(h); }
+    __except (FaultCapture(fi, GetExceptionInformation()))
+    {
+        if (fi->code == kStatusStackOverflow) _resetstkoflw();
+        return NGX_FAIL;
+    }
+}
+
+static void LiftReleaseHooks()
+{
+    if (++g_lift_release_depth != 1) return;
+    for (int i = 0; i < g_vk_release_count; ++i) HookRestore(&g_vk_release_hooks[i]);
+    for (int i = 0; i < g_d3d11_release_count; ++i) HookRestore(&g_d3d11_release_hooks[i]);
+    for (int i = 0; i < g_d3d12_release_count; ++i) HookRestore(&g_d3d12_release_hooks[i]);
+}
+static void UnliftReleaseHooks()
+{
+    if (--g_lift_release_depth != 0) return;
+    for (int i = 0; i < g_vk_release_count; ++i) HookReinstall(&g_vk_release_hooks[i]);
+    for (int i = 0; i < g_d3d11_release_count; ++i) HookReinstall(&g_d3d11_release_hooks[i]);
+    for (int i = 0; i < g_d3d12_release_count; ++i) HookReinstall(&g_d3d12_release_hooks[i]);
+}
+
+// A released game handle must not keep its bridge state: a game that
+// recreates its feature at the same address would otherwise be evaluated
+// against the previous feature's private history, and a still-set neural-only
+// latch would suppress the new game feature. Drop the latch and force a clean
+// rebuild on the next frame -- the rebuild then releases and recreates the
+// private feature behind its normal queue-completion waits (D3D12DrainGpu for
+// the bridge-queue paths, the game-queue fence for the D3D12 path), so the
+// stale feature's temporal state never survives the recreate. Shared textures
+// stay: a rebuild recreates them only when the geometry actually changed.
+static void InvalidateBridgedFeature(const NVSDK_NGX_Handle *h)
+{
+    if (!h) return;
+    int vp = -1;
+    for (int i = 0; i < MAX_VIEWPORTS; ++i)
+        if (g_bridge.viewports[i].game_handle == h) { vp = i; break; }
+    if (vp < 0) return;
+    FrameLock();
+    BridgeViewport &v = g_bridge.viewports[vp];
+    if (InterlockedExchange(&v.neural_latched, 0) != 0)
+        Log("[policy] vp%d game feature released; neural-only relatches on the recreated feature", vp);
+    v.frame_ready = false;
+    v.rr_active = false;
+    for (int s = 0; s < RR_SLOT_COUNT; ++s) v.rr_key[s] = nullptr;
+    FrameUnlock();
+}
+
+static NVSDK_NGX_Result BridgedReleaseCommon(Hook *hooks, int count, int idx,
+    NVSDK_NGX_Handle *h, const char *what)
+{
+    NVSDK_NGX_Result r = NGX_FAIL;
+    if (idx >= 0 && idx < count && reinterpret_cast<uintptr_t>(hooks[idx].target) >= 0x10000)
+    {
+        EnterCriticalSection(&g_hook_cs);
+        LiftReleaseHooks();
+        FaultInfo fi;
+        r = SafeCallRelease(reinterpret_cast<PFN_NGXReleaseFeature>(hooks[idx].target), h, &fi);
+        if (fi.code) AuditHooksAtFault();
+        UnliftReleaseHooks();
+        LeaveCriticalSection(&g_hook_cs);
+        if (fi.code)
+        {
+            Log("[hook] forwarded NGX %s release raised 0x%08X", what, fi.code);
+            LogFaultSite(&fi);
+        }
+    }
+    ClearFgHandle(h);
+    InvalidateBridgedFeature(h);
+    return r;
+}
+
+static NVSDK_NGX_Result BridgedVkRelease(int idx, NVSDK_NGX_Handle *h)
+{ return BridgedReleaseCommon(g_vk_release_hooks, g_vk_release_count, idx, h, "VULKAN"); }
+static NVSDK_NGX_Result BridgedD3d11Release(int idx, NVSDK_NGX_Handle *h)
+{ return BridgedReleaseCommon(g_d3d11_release_hooks, g_d3d11_release_count, idx, h, "D3D11"); }
+static NVSDK_NGX_Result BridgedD3d12Release(int idx, NVSDK_NGX_Handle *h)
+{ return BridgedReleaseCommon(g_d3d12_release_hooks, g_d3d12_release_count, idx, h, "D3D12"); }
+
+#define RELEASE_DETOUR(TAG, FN, N) \
+    static NVSDK_NGX_Result Detour_##TAG##_Release_##N(NVSDK_NGX_Handle *h) { return FN(N, h); }
+RELEASE_DETOUR(Vk, BridgedVkRelease, 0) RELEASE_DETOUR(Vk, BridgedVkRelease, 1)
+RELEASE_DETOUR(Vk, BridgedVkRelease, 2) RELEASE_DETOUR(Vk, BridgedVkRelease, 3)
+RELEASE_DETOUR(Vk, BridgedVkRelease, 4) RELEASE_DETOUR(Vk, BridgedVkRelease, 5)
+RELEASE_DETOUR(Vk, BridgedVkRelease, 6) RELEASE_DETOUR(Vk, BridgedVkRelease, 7)
+RELEASE_DETOUR(Vk, BridgedVkRelease, 8) RELEASE_DETOUR(Vk, BridgedVkRelease, 9)
+RELEASE_DETOUR(Vk, BridgedVkRelease, 10) RELEASE_DETOUR(Vk, BridgedVkRelease, 11)
+RELEASE_DETOUR(D3D11, BridgedD3d11Release, 0) RELEASE_DETOUR(D3D11, BridgedD3d11Release, 1)
+RELEASE_DETOUR(D3D11, BridgedD3d11Release, 2) RELEASE_DETOUR(D3D11, BridgedD3d11Release, 3)
+RELEASE_DETOUR(D3D11, BridgedD3d11Release, 4) RELEASE_DETOUR(D3D11, BridgedD3d11Release, 5)
+RELEASE_DETOUR(D3D11, BridgedD3d11Release, 6) RELEASE_DETOUR(D3D11, BridgedD3d11Release, 7)
+RELEASE_DETOUR(D3D11, BridgedD3d11Release, 8) RELEASE_DETOUR(D3D11, BridgedD3d11Release, 9)
+RELEASE_DETOUR(D3D11, BridgedD3d11Release, 10) RELEASE_DETOUR(D3D11, BridgedD3d11Release, 11)
+RELEASE_DETOUR(D3D12, BridgedD3d12Release, 0) RELEASE_DETOUR(D3D12, BridgedD3d12Release, 1)
+RELEASE_DETOUR(D3D12, BridgedD3d12Release, 2) RELEASE_DETOUR(D3D12, BridgedD3d12Release, 3)
+RELEASE_DETOUR(D3D12, BridgedD3d12Release, 4) RELEASE_DETOUR(D3D12, BridgedD3d12Release, 5)
+RELEASE_DETOUR(D3D12, BridgedD3d12Release, 6) RELEASE_DETOUR(D3D12, BridgedD3d12Release, 7)
+RELEASE_DETOUR(D3D12, BridgedD3d12Release, 8) RELEASE_DETOUR(D3D12, BridgedD3d12Release, 9)
+RELEASE_DETOUR(D3D12, BridgedD3d12Release, 10) RELEASE_DETOUR(D3D12, BridgedD3d12Release, 11)
+
+static void *const g_vk_release_detours[kMaxHooks] = {
+    (void *)Detour_Vk_Release_0, (void *)Detour_Vk_Release_1, (void *)Detour_Vk_Release_2,
+    (void *)Detour_Vk_Release_3, (void *)Detour_Vk_Release_4, (void *)Detour_Vk_Release_5,
+    (void *)Detour_Vk_Release_6, (void *)Detour_Vk_Release_7, (void *)Detour_Vk_Release_8,
+    (void *)Detour_Vk_Release_9, (void *)Detour_Vk_Release_10, (void *)Detour_Vk_Release_11,
+};
+static void *const g_d3d11_release_detours[kMaxHooks] = {
+    (void *)Detour_D3D11_Release_0, (void *)Detour_D3D11_Release_1, (void *)Detour_D3D11_Release_2,
+    (void *)Detour_D3D11_Release_3, (void *)Detour_D3D11_Release_4, (void *)Detour_D3D11_Release_5,
+    (void *)Detour_D3D11_Release_6, (void *)Detour_D3D11_Release_7, (void *)Detour_D3D11_Release_8,
+    (void *)Detour_D3D11_Release_9, (void *)Detour_D3D11_Release_10, (void *)Detour_D3D11_Release_11,
+};
+static void *const g_d3d12_release_detours[kMaxHooks] = {
+    (void *)Detour_D3D12_Release_0, (void *)Detour_D3D12_Release_1, (void *)Detour_D3D12_Release_2,
+    (void *)Detour_D3D12_Release_3, (void *)Detour_D3D12_Release_4, (void *)Detour_D3D12_Release_5,
+    (void *)Detour_D3D12_Release_6, (void *)Detour_D3D12_Release_7, (void *)Detour_D3D12_Release_8,
+    (void *)Detour_D3D12_Release_9, (void *)Detour_D3D12_Release_10, (void *)Detour_D3D12_Release_11,
 };
 
 // ---------------------------------------------------------------------------
@@ -1227,6 +1796,14 @@ static bool EntryIsOwnDetourJump(const void *entry)
     for (int i = 0; i < kMaxHooks; ++i)
         if (dst == g_d3d11_eval_detours[i] || dst == g_d3d11_create_detours[i])
             return true;
+    for (int i = 0; i < kMaxHooks; ++i)
+        if (dst == g_d3d12_eval_detours[i] || dst == g_d3d12_create_detours[i] ||
+            dst == g_d3d12_init_ext_detours[i] || dst == g_d3d12_init_project_detours[i])
+            return true;
+    for (int i = 0; i < kMaxHooks; ++i)
+        if (dst == g_vk_release_detours[i] || dst == g_d3d11_release_detours[i] ||
+            dst == g_d3d12_release_detours[i])
+            return true;
     return false;
 }
 
@@ -1236,7 +1813,7 @@ static void InstallOne(Hook *hooks, int *count, void *const detours[], void *tar
     for (int i = 0; i < *count; ++i) if (hooks[i].target == target) return;   // already hooked
     if (EntryIsOwnDetourJump(target))
     {
-        Warn("[hook] %ls: NVSDK_NGX_VULKAN_%s entry already carries this bridge's own jump "
+        Warn("[hook] %ls: NVSDK_NGX_%s entry already carries this bridge's own jump "
              "from an unloaded previous load; its original bytes are unrecoverable -- not "
              "hooking it.", ModuleName(m), what);
         return;                                                  // never install over it
@@ -1246,7 +1823,7 @@ static void InstallOne(Hook *hooks, int *count, void *const detours[], void *tar
     h.target = target;
     h.detour = detours[*count];
     HookInstall(&h);
-    Log("[hook] patched NVSDK_NGX_VULKAN_%s @ %p in %ls", what, target, ModuleName(m));
+    Log("[hook] patched NVSDK_NGX_%s @ %p in %ls", what, target, ModuleName(m));
     ++*count;
 }
 
@@ -1254,6 +1831,11 @@ static void TryHookModule(HMODULE m)
 {
     if (g_bridge.disabled) return;                               // never re-patch after giving up
     if (m == g_self || m == GetModuleHandleW(nullptr)) return;   // never the host exe (integrity checks)
+    // Never patch the session-local OptiScaler module: the private neural
+    // session's own D3D12 NGX calls travel through it, and patching them
+    // would route the bridge into itself. Vulkan/D3D11 exports never resolve
+    // there, so this exclusion only ever bites for D3D12.
+    if (g_optiscaler_module && m == g_optiscaler_module) return;
 
     auto eval   = GetProcAddress(m, "NVSDK_NGX_VULKAN_EvaluateFeature");
     auto create = GetProcAddress(m, "NVSDK_NGX_VULKAN_CreateFeature");
@@ -1263,36 +1845,96 @@ static void TryHookModule(HMODULE m)
     auto init_project = GetProcAddress(m, "NVSDK_NGX_VULKAN_Init_ProjectID");
     auto d3d11_eval = GetProcAddress(m, "NVSDK_NGX_D3D11_EvaluateFeature");
     auto d3d11_create = GetProcAddress(m, "NVSDK_NGX_D3D11_CreateFeature");
+    auto d3d12_eval = GetProcAddress(m, "NVSDK_NGX_D3D12_EvaluateFeature");
+    auto d3d12_create = GetProcAddress(m, "NVSDK_NGX_D3D12_CreateFeature");
+    auto d3d12_init_ext = GetProcAddress(m, "NVSDK_NGX_D3D12_Init_Ext");
+    auto d3d12_init_project = GetProcAddress(m, "NVSDK_NGX_D3D12_Init_ProjectID");
+    // ReleaseFeature exports are optional (absent on older NGX builds); each
+    // API is hooked independently when present.
+    auto vk_release = GetProcAddress(m, "NVSDK_NGX_VULKAN_ReleaseFeature");
+    auto d3d11_release = GetProcAddress(m, "NVSDK_NGX_D3D11_ReleaseFeature");
+    auto d3d12_release = GetProcAddress(m, "NVSDK_NGX_D3D12_ReleaseFeature");
     if ((eval == nullptr || create == nullptr) && init_ext == nullptr &&
         init_ext2 == nullptr && init_project == nullptr &&
-        d3d11_eval == nullptr && d3d11_create == nullptr) return;
+        d3d11_eval == nullptr && d3d11_create == nullptr &&
+        d3d12_eval == nullptr && d3d12_create == nullptr &&
+        d3d12_init_ext == nullptr && d3d12_init_project == nullptr) return;
 
     EnterCriticalSection(&g_hook_cs);
     if (eval && create)
     {
-        InstallOne(g_eval_hooks,   &g_eval_count,   g_eval_detours,   (void *)eval,   "EvaluateFeature", m);
-        InstallOne(g_create_hooks, &g_create_count, g_create_detours, (void *)create, "CreateFeature",   m);
+        InstallOne(g_eval_hooks,   &g_eval_count,   g_eval_detours,   (void *)eval,   "VULKAN_EvaluateFeature", m);
+        InstallOne(g_create_hooks, &g_create_count, g_create_detours, (void *)create, "VULKAN_CreateFeature",   m);
     }
     if (create1)
-        InstallOne(g_create1_hooks, &g_create1_count, g_create1_detours, (void *)create1, "CreateFeature1", m);
+        InstallOne(g_create1_hooks, &g_create1_count, g_create1_detours, (void *)create1, "VULKAN_CreateFeature1", m);
     if (init_ext)
-        InstallOne(g_init_ext_hooks, &g_init_ext_count, g_init_ext_detours, (void *)init_ext, "Init_Ext", m);
+        InstallOne(g_init_ext_hooks, &g_init_ext_count, g_init_ext_detours, (void *)init_ext, "VULKAN_Init_Ext", m);
     if (init_ext2)
-        InstallOne(g_init_ext2_hooks, &g_init_ext2_count, g_init_ext2_detours, (void *)init_ext2, "Init_Ext2", m);
+        InstallOne(g_init_ext2_hooks, &g_init_ext2_count, g_init_ext2_detours, (void *)init_ext2, "VULKAN_Init_Ext2", m);
     if (init_project)
         InstallOne(g_init_project_hooks, &g_init_project_count, g_init_project_detours,
-                   (void *)init_project, "Init_ProjectID", m);
+                   (void *)init_project, "VULKAN_Init_ProjectID", m);
     if (d3d11_eval)
         InstallOne(g_d3d11_eval_hooks, &g_d3d11_eval_count, g_d3d11_eval_detours,
                    (void *)d3d11_eval, "D3D11_EvaluateFeature", m);
     if (d3d11_create)
         InstallOne(g_d3d11_create_hooks, &g_d3d11_create_count, g_d3d11_create_detours,
                    (void *)d3d11_create, "D3D11_CreateFeature", m);
+    if (d3d12_eval && d3d12_create)
+    {
+        InstallOne(g_d3d12_eval_hooks, &g_d3d12_eval_count, g_d3d12_eval_detours,
+                   (void *)d3d12_eval, "D3D12_EvaluateFeature", m);
+        InstallOne(g_d3d12_create_hooks, &g_d3d12_create_count, g_d3d12_create_detours,
+                   (void *)d3d12_create, "D3D12_CreateFeature", m);
+    }
+    if (d3d12_init_ext)
+        InstallOne(g_d3d12_init_ext_hooks, &g_d3d12_init_ext_count, g_d3d12_init_ext_detours,
+                   (void *)d3d12_init_ext, "D3D12_Init_Ext", m);
+    if (d3d12_init_project)
+        InstallOne(g_d3d12_init_project_hooks, &g_d3d12_init_project_count, g_d3d12_init_project_detours,
+                   (void *)d3d12_init_project, "D3D12_Init_ProjectID", m);
+    if (vk_release)
+        InstallOne(g_vk_release_hooks, &g_vk_release_count, g_vk_release_detours,
+                   (void *)vk_release, "VULKAN_ReleaseFeature", m);
+    if (d3d11_release)
+        InstallOne(g_d3d11_release_hooks, &g_d3d11_release_count, g_d3d11_release_detours,
+                   (void *)d3d11_release, "D3D11_ReleaseFeature", m);
+    if (d3d12_release)
+        InstallOne(g_d3d12_release_hooks, &g_d3d12_release_count, g_d3d12_release_detours,
+                   (void *)d3d12_release, "D3D12_ReleaseFeature", m);
     LeaveCriticalSection(&g_hook_cs);
+}
+
+// Streamline coexistence: sl.* plugins (sl.dlss, sl.dlss_g, sl.reflex,
+// sl.pace, sl.interposer) drive the same in-process NVSDK_NGX_* exports the
+// bridge already patches, so Streamline-forwarded calls are intercepted with
+// no separate backend. FG evaluates arriving on sl.dlss_g's present thread
+// hit the same IsFgHandle passthrough, serialized on g_hook_cs like
+// everything else. This probe only records which sl plugins are resident so
+// logs attribute chains correctly; it never loads anything.
+static volatile LONG g_streamline_seen = 0;
+
+static void NoteStreamlinePresence()
+{
+    static const wchar_t *const kSlModules[] = {
+        L"sl.interposer.dll", L"sl.dlss.dll", L"sl.dlss_d.dll",
+        L"sl.dlss_g.dll", L"sl.reflex.dll", L"sl.pace.dll",
+    };
+    LONG mask = 0;
+    for (int i = 0; i < (int)_countof(kSlModules); ++i)
+        if (GetModuleHandleW(kSlModules[i])) mask |= (1L << i);
+    const LONG previous = InterlockedOr(&g_streamline_seen, mask);
+    const LONG fresh = mask & ~previous;
+    for (int i = 0; fresh && i < (int)_countof(kSlModules); ++i)
+        if (fresh & (1L << i))
+            Log("[hook] Streamline plugin resident: %ls (NGX-level interception covers "
+                "its forwarded calls; no separate backend)", kSlModules[i]);
 }
 
 static void ScanModules()
 {
+    NoteStreamlinePresence();
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
     auto enum_modules = reinterpret_cast<BOOL (WINAPI *)(HANDLE, HMODULE *, DWORD, LPDWORD)>(
         GetProcAddress(k32, "K32EnumProcessModules"));
@@ -1376,9 +2018,13 @@ static BOOL CALLBACK InitializeRuntimeOnce(PINIT_ONCE, PVOID, PVOID *)
     }
     if (!LoadLocalOptiScaler()) return FALSE;
 #if defined(DLSS5VK_HOOK_HOST)
-    Log("dlss5-vk-bridge " DLSS5VK_VERSION_STRING " initialized -- injected Vulkan+D3D11 host "
-        "(capture ngx-vulkan + d3d11, %d viewport(s)).", ActiveViewportCount());
+    Log("dlss5-vk-bridge " DLSS5VK_VERSION_STRING " initialized -- injected Vulkan+D3D11+D3D12 host "
+        "(capture ngx-vulkan + d3d11 + ngx-d3d12, %d viewport(s)).", ActiveViewportCount());
     InstallVulkanHooks();
+    if (ChildFollowEnabled())
+        Log("[follow] child-process follow armed for target %hs; every spawned child "
+            "(intermediates included) is force-suspended, injected, and resumed",
+            g_cfg.target_executable);
     CreateThread(nullptr, 0, VulkanHookWatch, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, NgxWatch, nullptr, 0, nullptr);
 #elif defined(DLSS5VK_ADDON_HOST)

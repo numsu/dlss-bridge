@@ -1,0 +1,12 @@
+# Integrated implementation, hardware validation pending: suspended-process
+# injection for D3D12 builds and links but has no end-to-end game validation
+# yet. See docs/known-limitations.md.
+schema = 1
+kind = "host"
+id = "injected-d3d12"
+state = "integrated"
+platforms = ["windows", "proton"]
+apis = ["d3d12"]
+implementation = "bridge/dlss5-vk-bridge/src/d3d12_host.inc"
+linkage = "static"
+abi = 1

@@ -7,10 +7,12 @@ namespace dlss_bridge {
 static const ComponentDescriptor kComponents[] = {
     { ComponentKind::Host,      "injected-vulkan",            VulkanFrames, 0 },
     { ComponentKind::Host,      "injected-d3d11",             D3D11Frames, 0 },
+    { ComponentKind::Host,      "injected-d3d12",             D3D12Frames, 0 },
     { ComponentKind::Host,      "vulkan-windows",             VulkanFrames, 0 },
     { ComponentKind::Host,      "reshade-addon",              VulkanFrames, 0 },
     { ComponentKind::Capture,   "ngx-vulkan",                 (TemporalInputs | MultiViewport), VulkanFrames },
     { ComponentKind::Capture,   "d3d11",                      (TemporalInputs | MultiViewport), D3D11Frames },
+    { ComponentKind::Capture,   "ngx-d3d12",                  (TemporalInputs | MultiViewport), D3D12Frames },
     { ComponentKind::Executor,  "ngx-d3d12",                  (D3D12Execution | MultiViewport), TemporalInputs },
     { ComponentKind::Transport, "same-adapter-external-image", (SameAdapter | MultiViewport), TemporalInputs | D3D12Execution },
     { ComponentKind::Transport, "directional-host-staging",    (CrossAdapter | MultiViewport), TemporalInputs | D3D12Execution },
@@ -45,8 +47,10 @@ bool RuntimeComposition::Configure(const char *host_id)
     *this = {};
     host = FindIntegratedComponent(ComponentKind::Host, host_id);
     if (!RequirementsMet(host, 0)) return false;
-    const bool d3d11 = host->provides & D3D11Frames;
-    capture = FindIntegratedComponent(ComponentKind::Capture, d3d11 ? "d3d11" : "ngx-vulkan");
+    const char *capture_id = "ngx-vulkan";
+    if (host->provides & D3D11Frames) capture_id = "d3d11";
+    else if (host->provides & D3D12Frames) capture_id = "ngx-d3d12";
+    capture = FindIntegratedComponent(ComponentKind::Capture, capture_id);
     if (!capture) return false;
     executor = FindIntegratedComponent(ComponentKind::Executor, "ngx-d3d12");
     if (!RequirementsMet(capture, host->provides)) return false;

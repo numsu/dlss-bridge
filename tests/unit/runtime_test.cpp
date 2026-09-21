@@ -46,6 +46,14 @@ int main()
     assert(cfg.gpu_timestamps == 0);
     assert(!cfg.Apply("gpu_timestamps", "2"));
     assert(!cfg.Apply("verbose", "yes"));
+    assert(cfg.follow_children == 0);
+    assert(cfg.target_executable[0] == '\0');
+    assert(cfg.Apply("follow_children", "1"));
+    assert(cfg.follow_children == 1);
+    assert(!cfg.Apply("follow_children", "2"));
+    assert(cfg.Apply("target_executable", "Game.exe"));
+    assert(strcmp(cfg.target_executable, "Game.exe") == 0);
+    assert(cfg.Valid());
     RuntimeConfig inconsistent;
     assert(inconsistent.Apply("ring_slots", "2"));
     assert(!inconsistent.Valid());

@@ -53,3 +53,50 @@ except KeyError:
     pass
 else:
     raise AssertionError("missing AppID was accepted")
+
+# bridge_command renders GPU profiles and the follow-children target into a
+# Steam launch option; spaced names are quoted so Steam parses one argument.
+rendered = steam_config.bridge_command(Path("/app"), "default", None)
+assert rendered.endswith("run -- %command%")
+rendered = steam_config.bridge_command(Path("/app"), "same-gpu", "Game.exe")
+assert rendered.endswith("run --profile same-gpu --follow-children Game.exe -- %command%")
+rendered = steam_config.bridge_command(Path("/app"), "default", "My Game.exe")
+assert '--follow-children "My Game.exe"' in rendered
+
+# Library discovery reads both libraryfolders.vdf schema generations, and
+# installed_games pairs AppIDs with names while skipping corrupt manifests.
+with tempfile.TemporaryDirectory() as temporary:
+    sandbox = Path(temporary)
+    first = sandbox / "lib"
+    second = sandbox / "extra"
+    (first / "steamapps").mkdir(parents=True)
+    (second / "steamapps").mkdir(parents=True)
+    third = sandbox / "third"
+    (third / "steamapps").mkdir(parents=True)
+    (third / "steamapps" / "appmanifest_50.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"50"\n\t"name"\t\t"Middle Game"\n}\n')
+    (first / "steamapps" / "libraryfolders.vdf").write_text(
+        '"libraryfolders"\n{\n'
+        '"TimeNextStatsReport"\t\t"1320000000"\n'
+        '"1"\t\t"' + str(second).replace("\\", "\\\\") + '"\n'
+        '"2"\n{\n\t\t"path"\t\t"' + str(third).replace("\\", "\\\\") + '"\n}\n'
+        '}\n')
+    (first / "steamapps" / "appmanifest_20.lcf").write_text("")
+    (first / "steamapps" / "appmanifest_20.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"20"\n\t"name"\t\t"Zebra Game"\n}\n')
+    (second / "steamapps" / "appmanifest_10.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"10"\n\t"name"\t\t"Alpha Game"\n'
+        '\t"Universe"\t\t"1"\n}\n')
+    (second / "steamapps" / "appmanifest_20.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"20"\n\t"name"\t\t"Zebra Duplicate"\n}\n')
+    (second / "steamapps" / "appmanifest_30.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"30"\n}\n')
+    (second / "steamapps" / "appmanifest_40.acf").write_text("{broken")
+    libraries = steam_config.library_folders(first)
+    assert libraries[0] == first.resolve()
+    assert second.resolve() in libraries
+    assert third.resolve() in libraries
+    assert steam_config.installed_games(libraries) == [
+        ("10", "Alpha Game"), ("50", "Middle Game"), ("20", "Zebra Game")]
+    assert steam_config.library_folders(sandbox / "missing") == []
+    assert steam_config.installed_games([]) == []

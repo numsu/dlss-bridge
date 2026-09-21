@@ -177,6 +177,121 @@ static bool Inject(HANDLE process, DWORD process_id, const std::wstring &dll)
     return ok && InitializeRemoteHook(process, process_id, dll);
 }
 
+// A launcher that spawns the real game exits long before the game does, but
+// the session directory (hook DLL, config, model) must survive until every
+// followed child is gone: cleanup deletes it. The follow target comes from
+// the same generated policy the hook DLL reads, so controller, hook, and
+// launcher cannot disagree about the name.
+static bool FollowTargetFromConfig(std::wstring &target)
+{
+    wchar_t config_path[32768];
+    if (GetEnvironmentVariableW(L"DLSS_BRIDGE_CONFIG", config_path, 32768) == 0) return false;
+    FILE *file = nullptr;
+    if (_wfopen_s(&file, config_path, L"r") != 0 || !file) return false;
+    bool follow = false;
+    wchar_t line[512];
+    while (fgetws(line, 512, file))
+    {
+        if (wcsncmp(line, L"follow_children=", 16) == 0)
+            follow = wcscmp(line + 16, L"1\n") == 0 || wcscmp(line + 16, L"1") == 0;
+        else if (wcsncmp(line, L"target_executable=", 18) == 0)
+        {
+            target.assign(line + 18);
+            while (!target.empty() && (target.back() == L'\n' || target.back() == L'\r'))
+                target.pop_back();
+        }
+    }
+    fclose(file);
+    return follow && !target.empty();
+}
+
+static bool FollowTargetRunning(const std::wstring &target)
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    bool running = false;
+    if (Process32FirstW(snapshot, &entry))
+        do {
+            if (_wcsicmp(entry.szExeFile, target.c_str()) == 0) { running = true; break; }
+        } while (Process32NextW(snapshot, &entry));
+    CloseHandle(snapshot);
+    return running;
+}
+
+// Lifetime monitor for the followed child, running while the launcher itself
+// is alive. Some launchers stay alive for the whole game session and exit
+// only after the game is gone; without observing the child during that time,
+// WaitForFollowedChildren could not tell "already finished" from "never
+// appeared" and would burn the full grace window.
+static LONG g_follow_monitor_stop = 0;
+static LONG g_follow_seen_running = 0;
+static HANDLE g_follow_monitor = nullptr;
+
+static DWORD WINAPI FollowMonitorThread(LPVOID param)
+{
+    const std::wstring *target = static_cast<const std::wstring *>(param);
+    while (g_follow_monitor_stop == 0)
+    {
+        if (FollowTargetRunning(*target))
+            InterlockedExchange(&g_follow_seen_running, 1);
+        Sleep(2000);
+    }
+    return 0;
+}
+
+// The target string must outlive the thread; callers pass a wmain-local that
+// is alive for the whole launcher lifetime.
+static bool StartFollowMonitor(std::wstring *target)
+{
+    g_follow_monitor = CreateThread(nullptr, 0, FollowMonitorThread,
+                                    static_cast<LPVOID>(target), 0, nullptr);
+    return g_follow_monitor != nullptr;
+}
+
+// After the directly launched process exits, retain the session while a
+// followed child is still alive. A child that never appears within the grace
+// window means the launch failed (or needs no follow); waiting forever would
+// pin a dead session.
+static void WaitForFollowedChildren()
+{
+    std::wstring target;
+    if (!FollowTargetFromConfig(target)) return;
+    // The lifetime monitor has done its job; poll directly from here on.
+    InterlockedExchange(&g_follow_monitor_stop, 1);
+    if (g_follow_monitor)
+    {
+        WaitForSingleObject(g_follow_monitor, 5000);
+        CloseHandle(g_follow_monitor);
+        g_follow_monitor = nullptr;
+    }
+    if (g_follow_seen_running && !FollowTargetRunning(target))
+    {
+        std::fwprintf(stderr, L"dlss-bridge-launcher: followed child %ls already exited; "
+                          L"releasing the session\n", target.c_str());
+        return;
+    }
+    std::fwprintf(stderr, L"dlss-bridge-launcher: waiting for followed child %ls\n", target.c_str());
+    const ULONGLONG grace_ms = 300000, poll_ms = 2000;
+    const ULONGLONG start = GetTickCount64();
+    bool seen = g_follow_seen_running != 0;
+    for (;;)
+    {
+        if (FollowTargetRunning(target)) { seen = true; }
+        else if (seen) break;
+        else if (GetTickCount64() - start >= grace_ms)
+        {
+            std::fwprintf(stderr, L"dlss-bridge-launcher: followed child %ls never appeared; "
+                          L"releasing the session\n", target.c_str());
+            return;
+        }
+        Sleep((DWORD)poll_ms);
+    }
+    std::fwprintf(stderr, L"dlss-bridge-launcher: followed child %ls exited; releasing the session\n",
+                  target.c_str());
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     if (argc < 5 || std::wcscmp(argv[1], L"--hook") != 0 ||
@@ -210,6 +325,13 @@ int wmain(int argc, wchar_t **argv)
     std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
     mutable_command.push_back(L'\0');
 
+    // Start observing the followed child now, not after the launcher exits:
+    // a launcher that outlives its game must not make cleanup wait out the
+    // full "never appeared" grace window.
+    std::wstring follow_target;
+    if (FollowTargetFromConfig(follow_target))
+        StartFollowMonitor(&follow_target);
+
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION child{};
@@ -239,6 +361,7 @@ int wmain(int argc, wchar_t **argv)
     }
     CloseHandle(child.hThread);
     WaitForSingleObject(child.hProcess, INFINITE);
+    WaitForFollowedChildren();
     DWORD exit_code = 1;
     if (!GetExitCodeProcess(child.hProcess, &exit_code)) PrintError(L"GetExitCodeProcess");
     CloseHandle(child.hProcess);

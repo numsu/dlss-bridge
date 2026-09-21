@@ -14,10 +14,13 @@ static const NVSDK_NGX_Result NGX_FAIL    = (NVSDK_NGX_Result)0xBAD00000;   // N
 static const NVSDK_NGX_Result NGX_FAIL_FEATURE_NOT_SUPPORTED
                                           = (NVSDK_NGX_Result)0xBAD00001;   // NVSDK_NGX_Result_FAIL_FeatureNotSupported
 
-// Public NGX feature identifier used at the feature-create boundary. Keep SDK
-// ABI declarations centralized here rather than scattering numeric IDs through
-// the interception policy.
+// Public NGX feature identifiers used at the feature-create boundary. Values
+// match nvsdk_ngx_defs.h (NVSDK_NGX_Feature_SuperSampling/_FrameGeneration/
+// _RayReconstruction). Keep SDK ABI declarations centralized here rather than
+// scattering numeric IDs through the interception policy.
+static const int NVSDK_NGX_FEATURE_SUPER_SAMPLING = 1;
 static const int NVSDK_NGX_FEATURE_FRAME_GENERATION = 11;
+static const int NVSDK_NGX_FEATURE_RAY_RECONSTRUCTION = 13;
 
 struct NVSDK_NGX_Handle { unsigned int Id; };
 
